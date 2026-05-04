@@ -58,13 +58,285 @@ def test_copy_event_for_main():
 
     result = copy_event_for_main(source, source_label="Client A (client@example.com)")
 
-    assert result["summary"].startswith(get_settings().managed_event_prefix)
-    assert "[Client A (client@example.com)]" in result["summary"]
-    assert result["summary"].endswith("Client Meeting")
+    assert result["summary"] == "Client Meeting"
     assert result["location"] == "Conference Room A"
-    assert "BusyBridge source: Client A (client@example.com)" in result["description"]
-    assert "client@example.com" in result["description"]
-    assert "attendees" not in result
+    desc = result["description"]
+    assert desc.startswith("Discuss project timeline")
+    assert "Source: Client A (client@example.com)" in desc
+    # New rich attendee block replaces the old "Original attendees:" line.
+    assert "Attendees (2):" in desc
+    assert "Emails: client@example.com, colleague@example.com" in desc
+    assert "Original attendees:" not in desc
+
+
+def _attendee_section(desc: str) -> str:
+    """Slice the description down to the attendee block for easier asserts."""
+    start = desc.find("Attendees (")
+    if start == -1:
+        return ""
+    # Section ends before the trailer (Source / Original event) or end of string.
+    for marker in ("\n\nSource:", "\n\nOriginal event:"):
+        idx = desc.find(marker, start)
+        if idx != -1:
+            return desc[start:idx]
+    return desc[start:]
+
+
+def test_attendee_block_basic_accepted():
+    """Single accepted attendee — icon only, no status word, name in list, email in Emails line."""
+    source = {
+        "summary": "Sync",
+        "start": {"dateTime": "2024-01-15T10:00:00Z"},
+        "end": {"dateTime": "2024-01-15T11:00:00Z"},
+        "attendees": [
+            {"email": "alice@acme.com", "displayName": "Alice Chen", "responseStatus": "accepted"},
+        ],
+    }
+    desc = copy_event_for_main(source)["description"]
+    section = _attendee_section(desc)
+    assert "Attendees (1): 1 yes, 0 no, 0 maybe, 0 pending" in section
+    assert "✅ Alice Chen" in section
+    assert "— accepted" not in section  # no status word for accepted
+    assert "Emails: alice@acme.com" in section
+
+
+def test_attendee_block_all_statuses():
+    """One of each responseStatus → all four icons + correct status words."""
+    source = {
+        "summary": "Mixed",
+        "start": {"dateTime": "2024-01-15T10:00:00Z"},
+        "end": {"dateTime": "2024-01-15T11:00:00Z"},
+        "attendees": [
+            {"email": "a@x.com", "displayName": "Alice", "responseStatus": "accepted"},
+            {"email": "b@x.com", "displayName": "Bob", "responseStatus": "declined"},
+            {"email": "c@x.com", "displayName": "Carol", "responseStatus": "tentative"},
+            {"email": "d@x.com", "displayName": "Dan", "responseStatus": "needsAction"},
+        ],
+    }
+    section = _attendee_section(copy_event_for_main(source)["description"])
+    assert "✅ Alice" in section
+    assert "❌ Bob — declined" in section
+    assert "❓ Carol — tentative" in section
+    assert "⏳ Dan — no response" in section
+
+
+def test_attendee_block_summary_counts():
+    """Summary line counts mixed statuses correctly."""
+    source = {
+        "summary": "Big",
+        "start": {"dateTime": "2024-01-15T10:00:00Z"},
+        "end": {"dateTime": "2024-01-15T11:00:00Z"},
+        "attendees": [
+            {"email": "a@x.com", "responseStatus": "accepted"},
+            {"email": "b@x.com", "responseStatus": "accepted"},
+            {"email": "c@x.com", "responseStatus": "accepted"},
+            {"email": "d@x.com", "responseStatus": "declined"},
+            {"email": "e@x.com", "responseStatus": "tentative"},
+            {"email": "f@x.com", "responseStatus": "tentative"},
+            {"email": "g@x.com", "responseStatus": "needsAction"},
+        ],
+    }
+    section = _attendee_section(copy_event_for_main(source)["description"])
+    assert "Attendees (7): 3 yes, 1 no, 2 maybe, 1 pending" in section
+
+
+def test_attendee_block_name_fallback():
+    """displayName missing → Title-Cased local-part in icon list, full email in Emails line."""
+    source = {
+        "summary": "List",
+        "start": {"dateTime": "2024-01-15T10:00:00Z"},
+        "end": {"dateTime": "2024-01-15T11:00:00Z"},
+        "attendees": [
+            {"email": "eng-team@acme.com", "responseStatus": "accepted"},
+            {"email": "john.doe@acme.com", "responseStatus": "tentative"},
+        ],
+    }
+    section = _attendee_section(copy_event_for_main(source)["description"])
+    assert "✅ Eng Team" in section
+    assert "❓ John Doe — tentative" in section
+    assert "Emails: eng-team@acme.com, john.doe@acme.com" in section
+
+
+def test_attendee_block_strips_self_email():
+    """Attendee whose email matches main_email (case-insensitive) is omitted."""
+    source = {
+        "summary": "Self",
+        "start": {"dateTime": "2024-01-15T10:00:00Z"},
+        "end": {"dateTime": "2024-01-15T11:00:00Z"},
+        "attendees": [
+            {"email": "Me@Home.com", "displayName": "Me", "responseStatus": "accepted"},
+            {"email": "alice@acme.com", "displayName": "Alice", "responseStatus": "accepted"},
+        ],
+    }
+    section = _attendee_section(
+        copy_event_for_main(source, main_email="me@home.com")["description"]
+    )
+    assert "Attendees (1):" in section
+    assert "Alice" in section
+    assert "Me@Home.com" not in section
+    assert "me@home.com" not in section
+
+
+def test_attendee_block_strips_self_flag():
+    """Attendee with self: true is omitted regardless of email match."""
+    source = {
+        "summary": "SelfFlag",
+        "start": {"dateTime": "2024-01-15T10:00:00Z"},
+        "end": {"dateTime": "2024-01-15T11:00:00Z"},
+        "attendees": [
+            {"email": "ghost@x.com", "self": True, "responseStatus": "accepted"},
+            {"email": "alice@acme.com", "displayName": "Alice", "responseStatus": "accepted"},
+        ],
+    }
+    section = _attendee_section(copy_event_for_main(source)["description"])
+    assert "Attendees (1):" in section
+    assert "ghost@x.com" not in section
+
+
+def test_attendee_block_strips_resource():
+    """Resource attendees (rooms/equipment) are omitted."""
+    source = {
+        "summary": "Resource",
+        "start": {"dateTime": "2024-01-15T10:00:00Z"},
+        "end": {"dateTime": "2024-01-15T11:00:00Z"},
+        "attendees": [
+            {"email": "room-7@acme.com", "displayName": "Room 7", "resource": True, "responseStatus": "accepted"},
+            {"email": "alice@acme.com", "displayName": "Alice", "responseStatus": "accepted"},
+        ],
+    }
+    section = _attendee_section(copy_event_for_main(source)["description"])
+    assert "Attendees (1):" in section
+    assert "Room 7" not in section
+    assert "room-7@acme.com" not in section
+
+
+def test_attendee_block_organizer_flag():
+    """organizer: true renders ' (organizer)' after the name."""
+    source = {
+        "summary": "Org",
+        "start": {"dateTime": "2024-01-15T10:00:00Z"},
+        "end": {"dateTime": "2024-01-15T11:00:00Z"},
+        "attendees": [
+            {"email": "alice@acme.com", "displayName": "Alice Chen", "organizer": True, "responseStatus": "accepted"},
+        ],
+    }
+    section = _attendee_section(copy_event_for_main(source)["description"])
+    assert "✅ Alice Chen (organizer)" in section
+
+
+def test_attendee_block_optional_flag():
+    """optional: true renders ' (optional)' at the end of the line."""
+    source = {
+        "summary": "Opt",
+        "start": {"dateTime": "2024-01-15T10:00:00Z"},
+        "end": {"dateTime": "2024-01-15T11:00:00Z"},
+        "attendees": [
+            {"email": "alice@acme.com", "displayName": "Alice", "optional": True, "responseStatus": "tentative"},
+        ],
+    }
+    section = _attendee_section(copy_event_for_main(source)["description"])
+    assert "❓ Alice — tentative (optional)" in section
+
+
+def test_attendee_block_organizer_plus_status():
+    """Organizer + non-accepted status: ' (organizer) — <status>'."""
+    source = {
+        "summary": "OrgT",
+        "start": {"dateTime": "2024-01-15T10:00:00Z"},
+        "end": {"dateTime": "2024-01-15T11:00:00Z"},
+        "attendees": [
+            {"email": "alice@acme.com", "displayName": "Alice", "organizer": True, "responseStatus": "tentative"},
+        ],
+    }
+    section = _attendee_section(copy_event_for_main(source)["description"])
+    assert "❓ Alice (organizer) — tentative" in section
+
+
+def test_attendee_block_long_list_truncation():
+    """20 attendees → icon list shows 15 + truncation note; Emails line shows all 20."""
+    attendees = [
+        {"email": f"user{i:02d}@acme.com", "displayName": f"User {i:02d}", "responseStatus": "accepted"}
+        for i in range(20)
+    ]
+    source = {
+        "summary": "Big",
+        "start": {"dateTime": "2024-01-15T10:00:00Z"},
+        "end": {"dateTime": "2024-01-15T11:00:00Z"},
+        "attendees": attendees,
+    }
+    section = _attendee_section(copy_event_for_main(source)["description"])
+    assert "Attendees (20):" in section
+    assert "✅ User 00" in section
+    assert "✅ User 14" in section
+    assert "✅ User 15" not in section  # truncated
+    assert "… and 5 more on the original event" in section
+    # Emails line lists all 20
+    for i in range(20):
+        assert f"user{i:02d}@acme.com" in section
+
+
+def test_attendee_block_no_attendees_omits_section():
+    """Source event with no attendees → no Attendees block, footer falls back."""
+    source = {
+        "summary": "Solo",
+        "start": {"dateTime": "2024-01-15T10:00:00Z"},
+        "end": {"dateTime": "2024-01-15T11:00:00Z"},
+    }
+    desc = copy_event_for_main(source, source_label="My Cal")["description"]
+    assert "Attendees (" not in desc
+    assert "Emails:" not in desc
+    assert "Source: My Cal" in desc
+
+
+def test_attendee_block_all_filtered_omits_section():
+    """Only attendee is self → after filtering, block is omitted."""
+    source = {
+        "summary": "OnlyMe",
+        "start": {"dateTime": "2024-01-15T10:00:00Z"},
+        "end": {"dateTime": "2024-01-15T11:00:00Z"},
+        "attendees": [
+            {"email": "me@home.com", "self": True, "responseStatus": "accepted"},
+        ],
+    }
+    desc = copy_event_for_main(source, main_email="me@home.com")["description"]
+    assert "Attendees (" not in desc
+    assert "Emails:" not in desc
+
+
+def test_attendee_block_missing_status_treated_as_pending():
+    """Attendee without responseStatus → counted as pending, ⏳, 'no response'."""
+    source = {
+        "summary": "Missing",
+        "start": {"dateTime": "2024-01-15T10:00:00Z"},
+        "end": {"dateTime": "2024-01-15T11:00:00Z"},
+        "attendees": [
+            {"email": "alice@acme.com", "displayName": "Alice"},
+        ],
+    }
+    section = _attendee_section(copy_event_for_main(source)["description"])
+    assert "Attendees (1): 0 yes, 0 no, 0 maybe, 1 pending" in section
+    assert "⏳ Alice — no response" in section
+
+
+def test_attendee_block_order_preserved():
+    """Emails line order matches icon list order (which matches source order)."""
+    source = {
+        "summary": "Order",
+        "start": {"dateTime": "2024-01-15T10:00:00Z"},
+        "end": {"dateTime": "2024-01-15T11:00:00Z"},
+        "attendees": [
+            {"email": "zach@x.com", "displayName": "Zach", "responseStatus": "accepted"},
+            {"email": "alice@x.com", "displayName": "Alice", "responseStatus": "accepted"},
+            {"email": "mike@x.com", "displayName": "Mike", "responseStatus": "accepted"},
+        ],
+    }
+    section = _attendee_section(copy_event_for_main(source)["description"])
+    assert "Emails: zach@x.com, alice@x.com, mike@x.com" in section
+    # Icon order matches: Zach appears before Alice appears before Mike
+    z_idx = section.find("✅ Zach")
+    a_idx = section.find("✅ Alice")
+    m_idx = section.find("✅ Mike")
+    assert 0 <= z_idx < a_idx < m_idx
 
 
 def test_copy_event_for_main_with_recurrence():

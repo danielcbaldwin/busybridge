@@ -697,6 +697,122 @@ def _set_bb_props(event: dict, props: Optional[dict]) -> None:
     priv.update(props)
 
 
+_RSVP_ICON = {
+    "accepted": "✅",
+    "declined": "❌",
+    "tentative": "❓",
+    "needsAction": "⏳",
+}
+
+_RSVP_WORD = {
+    "declined": "declined",
+    "tentative": "tentative",
+    "needsAction": "no response",
+}
+
+_ATTENDEE_LIST_LIMIT = 15
+
+
+def _attendee_display_name(attendee: dict) -> str:
+    """Display name for an attendee.
+
+    Falls back to a Title-Cased local-part of the email when displayName is
+    missing (e.g. mailing lists, distribution groups).  Returns "" only if
+    both displayName and email are absent.
+    """
+    name = (attendee.get("displayName") or "").strip()
+    if name:
+        return name
+    email = (attendee.get("email") or "").strip()
+    if not email:
+        return ""
+    local = email.split("@", 1)[0]
+    cleaned = local.replace("-", " ").replace("_", " ").replace(".", " ")
+    parts = [p for p in cleaned.split() if p]
+    if not parts:
+        return email
+    return " ".join(p.capitalize() for p in parts)
+
+
+def _format_attendee_block(
+    attendees: list,
+    main_email: Optional[str],
+) -> Optional[str]:
+    """Build the multi-line attendee block for the description footer.
+
+    Returns None when no attendees survive filtering — caller then omits the
+    block entirely and falls back to the prior footer shape.
+    """
+    if not attendees:
+        return None
+
+    me = (main_email or "").strip().lower()
+
+    filtered = []
+    for att in attendees:
+        if att.get("self"):
+            continue
+        if att.get("resource"):
+            continue
+        email = (att.get("email") or "").strip()
+        if me and email.lower() == me:
+            continue
+        if not email and not (att.get("displayName") or "").strip():
+            continue
+        filtered.append(att)
+
+    if not filtered:
+        return None
+
+    counts = {"accepted": 0, "declined": 0, "tentative": 0, "needsAction": 0}
+    for att in filtered:
+        status = att.get("responseStatus") or "needsAction"
+        if status not in counts:
+            status = "needsAction"
+        counts[status] += 1
+
+    summary = (
+        f"Attendees ({len(filtered)}): "
+        f"{counts['accepted']} yes, "
+        f"{counts['declined']} no, "
+        f"{counts['tentative']} maybe, "
+        f"{counts['needsAction']} pending"
+    )
+
+    visible = filtered[:_ATTENDEE_LIST_LIMIT]
+    overflow = len(filtered) - len(visible)
+
+    icon_lines = []
+    for att in visible:
+        status = att.get("responseStatus") or "needsAction"
+        if status not in _RSVP_ICON:
+            status = "needsAction"
+        icon = _RSVP_ICON[status]
+        name = _attendee_display_name(att) or (att.get("email") or "").strip()
+
+        line = f"{icon} {name}"
+        if att.get("organizer"):
+            line += " (organizer)"
+        word = _RSVP_WORD.get(status)
+        if word:
+            line += f" — {word}"
+        if att.get("optional"):
+            line += " (optional)"
+        icon_lines.append(line)
+
+    if overflow > 0:
+        icon_lines.append(f"… and {overflow} more on the original event")
+
+    emails = [(att.get("email") or "").strip() for att in filtered]
+    emails = [e for e in emails if e]
+
+    parts = [summary, "", *icon_lines]
+    if emails:
+        parts.extend(["", "Emails: " + ", ".join(emails)])
+
+    return "\n".join(parts)
+
+
 def create_busy_block(
     start: dict,
     end: dict,
@@ -849,26 +965,33 @@ def copy_event_for_main(
     # Append metadata to the END of the description so the actual content
     # stays front and center.  The managed_event_prefix tag is included so
     # events can still be bulk-found/deleted in an emergency.
-    footer_parts = []
-
     prefix = (settings.managed_event_prefix or "").strip()
-    if prefix:
-        footer_parts.append(f"Managed by {prefix}")
+    prefix_line = f"Managed by {prefix}" if prefix else None
 
-    if "attendees" in source_event:
-        attendee_list = [a.get("email", "") for a in source_event["attendees"]]
-        if attendee_list:
-            footer_parts.append(f"Original attendees: {', '.join(attendee_list)}")
+    attendee_block = _format_attendee_block(
+        source_event.get("attendees") or [],
+        main_email,
+    )
 
+    trailer_lines = []
     if source_display:
-        footer_parts.append(f"Source: {source_display}")
-
-    # Include a link to the original event so the user can RSVP there
+        trailer_lines.append(f"Source: {source_display}")
     if source_event.get("htmlLink"):
-        footer_parts.append(f"Original event: {source_event['htmlLink']}")
+        trailer_lines.append(f"Original event: {source_event['htmlLink']}")
 
-    if footer_parts:
-        footer = "\n".join(footer_parts)
+    sections = []
+    header_lines = []
+    if prefix_line:
+        header_lines.append(prefix_line)
+    if attendee_block:
+        header_lines.append(attendee_block)
+    if header_lines:
+        sections.append("\n".join(header_lines))
+    if trailer_lines:
+        sections.append("\n".join(trailer_lines))
+
+    if sections:
+        footer = "\n\n".join(sections)
         base_desc = event["description"]
         event["description"] = f"{base_desc}\n\n---\n{footer}".strip() if base_desc else footer
 
