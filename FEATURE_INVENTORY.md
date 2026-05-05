@@ -4,6 +4,22 @@
 
 ---
 
+## Features REMOVED in Phase 0 (intentional, not preserved)
+
+The following capabilities are **removed** as part of REWRITE_PLAN.md Phase 0 and are **not** acceptance criteria for the rewrite. Research established that the service account mode does not reliably deliver immovable events on the user's own calendar (calendar ownership trumps event-level `guestsCanModify=false`). The 🔒 emoji + revert-on-drift mechanism (already used for sa_tier=0, personal, webcal) becomes the uniform approach.
+
+- **Service account mode entirely.** `users.sa_tier` column reads removed; `app/auth/service_account.py` deleted; SA branches in `rules.py` / `engine.py` / `consistency.py` deleted.
+- **OOBE Step 5 (Service Account upload).** Wizard goes from 7 steps to 6.
+- **`SERVICE_ACCOUNT_KEY_FILE` env var and `service_account_key_file` config setting.**
+- **Admin endpoints:** `GET /api/admin/service-account`, `POST /api/admin/service-account/test/{userId}`, deactivate-SA endpoint.
+- **Admin UI:** SA status / SA test buttons on user-management page.
+- **SA fallback on 403:** the "SA access lost → reset sa_tier=0" logic in `consistency.py:99-107` becomes a no-op (no more SA path to fall back from).
+- **The "natively immovable in Google UI" claim** for non-editable events. Replaced by the existing 🔒 emoji + revert mechanism (post-hoc, not real-time).
+
+**Net change for users:** OOBE has one fewer step. Existing sa_tier=2 events stay where they are; new/updated non-editable events show 🔒 in title and snap back if moved. The `_revert_if_moved` mechanism, which today only covers personal/webcal blocks on main and busy blocks on clients, is **extended to non-editable client-event copies on main** — fixing a silent gap in current code.
+
+---
+
 ## 1. OAuth & Accounts
 
 ### Login Flows
@@ -34,13 +50,8 @@
 - [ ] User can switch main calendar via API without re-authenticating — `app/api/users.py:90-124`
 - [ ] Client calendars can be connected/disconnected independently — `app/api/calendars.py:102-256`
 
-### Service Account Mode (sa_tier 0 vs 2)
-- [ ] sa_tier=0: user token creates events; locked events revert to original time if moved — SPEC.md:244-253
-- [ ] sa_tier=2: SA creates events as organizer; non-editable events physically immovable — SPEC.md:242-253
-- [ ] SA configuration loaded from `SERVICE_ACCOUNT_KEY_FILE` env var — `app/config.py:60`
-- [ ] SA tested and activated via admin endpoint; sa_tier set to 2 on success — `app/api/admin.py`
-- [ ] SA access loss (403) automatically resets sa_tier to 0 — `app/sync/consistency.py:99-107`
-- [ ] SA shared with user's main calendar ("Make changes to events" permission) — SPEC.md:253
+### Service Account Mode
+**REMOVED in Phase 0** — see "Features REMOVED in Phase 0" section at top of this file.
 
 ### Session Management
 - [ ] Session token is JWT signed with secret derived from encryption key — `app/config.py:127-144`
@@ -53,9 +64,8 @@
 - [ ] Step 2 (Google Cloud Credentials): Client ID/Secret + Test Connection — SPEC.md:56-70
 - [ ] Step 3 (Admin Authentication): extracts home org domain from email — SPEC.md:71-79
 - [ ] Step 4 (Email Alerts): SMTP host, port, username, password, from, alert emails — SPEC.md:81-92
-- [ ] Step 5 (Service Account): drag-and-drop SA JSON upload, shows SA email — SPEC.md:94-100
-- [ ] Step 6 (Encryption Key): auto-generates 32-byte key, requires confirmation checkbox — SPEC.md:102-110
-- [ ] Step 7 (Complete): success message, next steps, link to dashboard — SPEC.md:112-119
+- [ ] Step 5 (Encryption Key): auto-generates 32-byte key, requires confirmation checkbox — SPEC.md:102-110 *(was Step 6)*
+- [ ] Step 6 (Complete): success message, next steps, link to dashboard — SPEC.md:112-119 *(was Step 7)*
 - [ ] OOBE only runs when organization table is empty — `app/database.py`, `app/ui/setup.py`
 - [ ] OOBE stores: OAuth credentials, home org domain, admin user, SMTP config, SA key — SPEC.md:121-130
 
@@ -200,9 +210,8 @@
 
 ### Lock Emoji (🔒) for Non-Editable Events
 - [ ] Lock emoji prepended to title — `app/sync/google_calendar.py:copy_event_for_main`
-- [ ] Retained regardless of sa_tier mode — SPEC.md:250
-- [ ] User can drag-and-drop with SA mode (guestsCanModify=true for non-editable) — SPEC.md:242-253
-- [ ] User cannot drag-and-drop in fallback mode (sa_tier=0); revert mechanism restores — README.md:130-133
+- [ ] Revert mechanism restores original time when user moves a non-editable event on main — `_revert_if_moved` (extended to client copies in Phase 0)
+- [ ] Same mechanism applies to: non-editable client copies on main, personal busy blocks on main, webcal events on main, busy blocks on client calendars
 
 ### "Managed by [BusyBridge]" Footer
 - [ ] Appended to descriptions of all synced copies
@@ -450,11 +459,7 @@
 - [ ] Confirmed with popup warning — SPEC.md:783-796
 
 ### Service Account Management
-- [ ] Admin uploads SA JSON in OOBE Step 5 — SPEC.md:94-100
-- [ ] Admin can test SA access to user's main calendar
-- [ ] Sets sa_tier=2 on success
-- [ ] Resets sa_tier=0 if SA loses access — `app/sync/consistency.py:99-107`
-- [ ] Shows SA email in settings
+**REMOVED in Phase 0** — see "Features REMOVED in Phase 0" section at top of this file.
 
 ### Sync Activity Feed
 - [ ] Real-time feed of recent sync events — `app/sync/engine.py:_log_activity`
@@ -589,8 +594,6 @@
 - [ ] `POST /api/admin/settings/test-email`
 - [ ] `POST /api/admin/factory-reset` (RESET)
 - [ ] `GET /api/admin/export`
-- [ ] `GET /api/admin/service-account`
-- [ ] `POST /api/admin/service-account/test/{userId}`
 
 ### Webhook Endpoint
 - [ ] `POST /api/webhooks/google-calendar`
@@ -850,18 +853,15 @@
 - [ ] Parent series remains intact
 
 ### Service Account Fallback
-- [ ] SA access lost (403) → sa_tier reset to 0
-- [ ] User token used for future event creation
-- [ ] Lock emoji + revert mechanism activates for non-editable events
+**REMOVED in Phase 0** — see top of this file. There is no SA mode after Phase 0, so no fallback.
 
-### Immovable Events (SA Mode)
-- [ ] SA-created non-editable events natively immovable
-- [ ] SA is organizer; user is attendee
-- [ ] Editable events still movable (guestsCanModify=true)
+### Immovable Events
+**REMOVED in Phase 0.** "Native immovability" was a SPEC.md claim that doesn't hold up — the calendar owner has implicit edit rights on their own calendar regardless of organizer or `guestsCanModify`. Replaced uniformly by 🔒 emoji + revert-on-drift.
 
-### Event Time Revert (Fallback Mode)
-- [ ] Move on non-editable event → reverts on next sync cycle
-- [ ] Within 5–25 minutes
+### Event Time Revert (uniform after Phase 0)
+- [ ] Move on non-editable event on main → reverts on next sync cycle
+- [ ] Within 5 seconds (webhook) to 5 minutes (periodic sync)
+- [ ] Applies to non-editable client copies (NEW in Phase 0), personal busy blocks, webcal events, and busy blocks on client calendars
 - [ ] Prevents accidental moves of read-only events
 
 ### Instance Event ID Derivation

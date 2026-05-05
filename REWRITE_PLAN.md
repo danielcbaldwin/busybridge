@@ -17,6 +17,7 @@
 - Replace string-prefix and extended-property heuristics for "is this our event?" with a precise lookup.
 - Reduce reconciler logic from ~10 entangled files to a single planner + outbox drainer.
 - Make adding a new event source (Apple, Outlook, Notion, Linear) a 1-day task instead of a 1-week task.
+- **Remove service-account (sa_tier) mode.** Research showed it does not reliably deliver immovable events on the user's own calendar — calendar ownership trumps event-level `guestsCanModify=false`. The 🔒 emoji + revert-on-drift mechanism (already used for sa_tier=0, personal, webcal) becomes the uniform approach for non-editable events. Done as Phase 0 to simplify the rest of the work.
 
 ### Non-Goals (this rewrite)
 - No change to the user-visible UI or URL routes.
@@ -98,7 +99,7 @@ Recurring instances inherit the parent's canonical_uid prefix; a per-instance su
 
 ## 4. Schema
 
-### New tables (added in Phase 0, alongside existing)
+### New tables (added in Phase 1, alongside existing)
 
 ```sql
 -- Canonical ledger: one row per logical event in the user's life.
@@ -238,7 +239,7 @@ CREATE TABLE reconcile_requests (
 );
 ```
 
-### Tables to retire (after Phase 5)
+### Tables to retire (after Phase 6)
 - `event_mappings` — superseded by `ledger_events` + `ledger_projections`
 - `busy_blocks` — superseded by `ledger_projections` (target_kind='client', desired_state='present_busy')
 
@@ -504,39 +505,35 @@ Preserved as `derive_instance_event_id(parent_google_event_id, original_start_ti
 
 ## 9. Special Modes
 
-### Service-account (sa_tier=2) projections on main
-Projection rendering is parametrized:
+SA mode is gone (Phase 0). The remaining modes are:
 
+### Projection rendering
 ```
 when target_kind='main' and source_type='client':
+  payload writer = user_token (always)
   if user_can_edit:
-    payload writer = user_token
-    payload includes attendees with user as accepted, no lock emoji
-  else if sa_tier == 2:
-    payload writer = service_account
-    payload.organizer = service_account_email
-    payload.attendees = [{email: user_email, responseStatus: accepted}]
-    payload.guestsCanModify = false  # immovable
-    summary = "🔒 " + summary  # informational
-  else (sa_tier=0, can_edit=false):
-    payload writer = user_token
-    summary = "🔒 " + summary  # informational, with revert tracking
+    summary = source_summary
+    attendees = [{email: user_email, responseStatus: stored_rsvp}]
+  else:
+    summary = "🔒 " + source_summary
+    attendees = [{email: user_email, responseStatus: stored_rsvp}]
+    # Revert-on-drift handles physical immovability post-hoc.
 ```
 
-The hash captures all of these decisions, so `sa_tier` transitions automatically trigger re-renders for affected projections.
+A single rendering path on main. The 🔒 emoji is informational; the **revert-on-drift mechanism (below) is what actually keeps non-editable events in place.**
 
-### Edit-on-main → propagate to client (RSVP, edits)
-Today's logic in `rules.py:1050-1099`. Under the new model, this is detected at main-calendar **ingest**: the event we observe on Google for a client-origin projection differs from `applied_payload_hash`, AND the difference is in fields the user is allowed to change (RSVP, time if user_can_edit). The reconciler:
+### Edit-on-main → propagate to client (RSVP, time if editable)
+Today's logic in `rules.py:1050-1099`. Under the new model, this is detected at main-calendar **ingest**: the event we observe on Google for a client-origin projection differs from `applied_payload_hash`, AND the difference is in fields the user is allowed to change (RSVP, time if `user_can_edit`). The reconciler:
 1. Updates the ledger row's `user_rsvp_status` (or `start_at`/`end_at`).
 2. Bumps version.
 3. Planner now wants the SOURCE projection (back on the client calendar) to reflect this change.
 
 So: source-client gets a "phantom projection" row of `target_kind='client', target_calendar_id=origin, desired_state='present_full_rsvp_only'`. The outbox writes the RSVP back to Google. Same observable behaviour as today, with stronger atomicity.
 
-### Edit-on-main when user can NOT edit (revert)
-Same detection path, but:
-- For sa_tier=2: doesn't happen (Google enforces immovability).
-- For sa_tier=0: planner sees the projection on main has drifted from `applied_payload_hash`. Outbox enqueues an `update` to restore the ledger's authoritative state. **Same observable behaviour as today's `_revert_if_moved`.**
+### Edit-on-main when user can NOT edit (revert-on-drift)
+Detection path: ingest sees the Google event for a non-editable projection has start/end different from `ledger.start_at`/`end_at`. The planner's `desired_payload_hash` no longer matches what's on Google. The outbox enqueues an `update` to restore the ledger's authoritative state. **Same observable behaviour as today's `_revert_if_moved` for personal/webcal events, now uniformly applied to client-event copies on main as well.**
+
+This **fixes a silent bug in the current code:** today, non-editable client copies on main have *no* revert mechanism (the original author assumed SA mode handled it; SA mode actually doesn't). After Phase 0 the gap is closed.
 
 ### user_intentionally_deleted
 When ingest detects the user deleted a synced event from main:
@@ -637,36 +634,51 @@ All today's failure handling is preserved or strengthened:
 
 ## 13. Migration Plan (Phased, Reversible)
 
-Each phase is a separate PR with observable rollback. Estimated total: **4–6 weeks** of focused work.
+Each phase is a separate PR with observable rollback. Estimated total: **4.5–6.5 weeks** of focused work.
 
-### Phase 0 — Foundation (1–2 days)
-- Create new tables alongside existing schema.
+### Phase 0 — SA removal & missing-revert fix (1–2 days)
+**Why first:** simplifies every subsequent phase by removing branching, and ships a real reliability fix for current users immediately.
+
+- Reset `users.sa_tier=0` for all users.
+- Delete `app/auth/service_account.py` (~100 lines).
+- Delete the SA branches in `app/sync/rules.py`, `app/sync/engine.py`, `app/sync/consistency.py` (~150 lines).
+- Delete the SA admin endpoints in `app/api/admin.py` (`get_service_account_status`, `test_service_account_access`, `deactivate_service_account`) and their UI surfaces.
+- Delete OOBE Step 5 (Service Account upload) from `app/ui/setup.py`; OOBE is now 6 steps. Step 6→5, Step 7→6.
+- Delete `service_account_key_file` from `app/config.py` and `SERVICE_ACCOUNT_KEY_FILE` env var.
+- Delete `sa_tier` column reads from queries; column itself stays in the schema for one release cycle, then dropped (no migration needed — SQLite ignores unread columns).
+- **Add `_revert_if_moved` for non-editable client-event copies on main.** Today's gap: `rules.py` has revert mechanisms for busy blocks on clients and personal/webcal blocks on main, but NONE for non-editable client copies on main. The original author assumed SA handled it; SA doesn't. Mirror the existing personal/webcal revert pattern.
+- Update README.md, SPEC.md, FEATURE_INVENTORY.md to remove SA references.
+- Tests: existing suite continues to pass. Add specific test for "user moves non-editable client copy on main → BB reverts within sync cycle."
+- **Rollback:** revert this PR. Pre-rewrite cleanup; minimal risk. SA users see no functional change (their non-editable events were probably already drag-movable; now they snap back).
+
+### Phase 1 — Foundation (1–2 days)
+- Create new tables alongside existing schema (`ledger_events`, `ledger_projections`, `outbox_operations`, `reconcile_requests`).
 - Add `app/ledger/` module skeleton (no callers).
 - Tests: schema migration up/down.
 - **Rollback:** drop the new tables. No behaviour change.
 
-### Phase 1 — Idempotent Google inserts (3–5 days)
+### Phase 2 — Idempotent Google inserts (3–5 days)
 - Modify `app/sync/google_calendar.py:create_event` to accept an optional `id` parameter, passed through to Google.
 - Existing `rules.py` callers don't yet pass it; behaviour unchanged.
 - New helper `client_supplied_id_for(scope: str)` derives a deterministic ID from any scope (mapping_id today, projection_id later).
 - Tests: idempotency property tests against the fake Google client.
 - **Rollback:** revert this PR. No production impact.
 
-### Phase 2 — Outbox shadowing (5–7 days)
+### Phase 3 — Outbox shadowing (5–7 days)
 - Every Google write the existing engine performs is also recorded in `outbox_operations` (status=`done`, retroactive). This populates the outbox with a faithful history.
 - Add outbox drain worker, gated by `OUTBOX_DRAIN=false` env var (disabled in production).
 - Daily reconciliation job: ledger view of "what should be on Google" matches `event_mappings` view; alert on divergence.
 - Tests: shadow writes match real writes 1:1.
 - **Rollback:** stop populating outbox; drop new code paths.
 
-### Phase 3 — Dual-write to ledger (5–7 days)
+### Phase 4 — Dual-write to ledger (5–7 days)
 - Every change to `event_mappings` is mirrored to `ledger_events`. Every change to `busy_blocks` is mirrored to `ledger_projections`.
 - Existing engine continues to be authoritative; ledger is shadow.
 - Daily diff job alerts on inconsistency.
 - Tests: ledger view stays equivalent to legacy view across full test suite.
 - **Rollback:** revert the mirror writes.
 
-### Phase 4 — Cut over reads (3–5 days)
+### Phase 5 — Cut over reads (3–5 days)
 - Read paths switch to ledger:
   - Dashboard counts (`/api/sync/status`)
   - Consistency check (`app/sync/consistency.py`)
@@ -676,7 +688,7 @@ Each phase is a separate PR with observable rollback. Estimated total: **4–6 w
 - Tests: integration tests assert reads from ledger match reads from legacy.
 - **Rollback:** revert read paths to legacy.
 
-### Phase 5 — Cut over writes (5–7 days)
+### Phase 6 — Cut over writes (5–7 days)
 - New reconciler becomes authoritative.
 - Webhooks and the periodic timer enqueue `reconcile_requests` instead of calling the old sync paths.
 - Outbox drain is enabled (`OUTBOX_DRAIN=true`).
@@ -687,9 +699,10 @@ Each phase is a separate PR with observable rollback. Estimated total: **4–6 w
 - Tests: full end-to-end suite passes; concurrency tests pass.
 - **Rollback:** revert this PR. The previous phase remains running. This is the biggest cutover; we'll bake at least 7 days in production behind a flag before deleting old code.
 
-### Phase 6 — Cleanup (2–3 days)
+### Phase 7 — Cleanup (2–3 days)
 - After 30 days of stable production, remove dual-write.
 - After 60 days, drop `event_mappings` and `busy_blocks` tables (post-retention).
+- Drop `users.sa_tier` column.
 - Update README, ANALYSIS.md, SPEC.md.
 - **Rollback:** N/A (bake period proves stability).
 
@@ -699,7 +712,7 @@ Each phase is a separate PR with observable rollback. Estimated total: **4–6 w
 
 The current test suite has 171 passing tests at 98% line coverage but ANALYSIS.md correctly notes the suite can't see concurrency, can't see what was actually written to Google, and never runs the full pipeline end-to-end. The rewrite ships with new test infrastructure first.
 
-### New test fakes (Phase 0)
+### New test fakes (Phase 1)
 
 1. **`tests/fakes/google_calendar.py`** — fake Google API
    - In-memory store keyed by (calendar_id, event_id).
@@ -734,7 +747,7 @@ The current test suite has 171 passing tests at 98% line coverage but ANALYSIS.m
    - Property test on RRULE expansion, EXDATE handling, modified-instance lifecycle.
 
 ### Existing tests
-All 171 existing tests (`tests/`, `e2e/`, `sidecar/tests/`) must continue to pass through every phase. Phase 5 may require updating tests that mock the old sync internals; their behaviour assertions stay the same.
+All 171 existing tests (`tests/`, `e2e/`, `sidecar/tests/`) must continue to pass through every phase. Phase 6 may require updating tests that mock the old sync internals; their behaviour assertions stay the same.
 
 ---
 
@@ -744,20 +757,20 @@ For each category in [`FEATURE_INVENTORY.md`](./FEATURE_INVENTORY.md), where the
 
 | Inventory Category | Where in new system | Notes |
 |---|---|---|
-| 1. OAuth & Accounts | Unchanged. `app/auth/*` untouched. | Ledger doesn't affect login flows, OOBE, or factory reset. |
+| 1. OAuth & Accounts | Unchanged for OAuth/sessions/OOBE. **SA mode REMOVED in Phase 0** (was unreliable; see §9). OOBE goes from 7 to 6 steps. | Ledger doesn't affect login flows or factory reset. |
 | 2. Calendar Connections | Unchanged at the API layer; storage tables (`client_calendars`, `webcal_subscriptions`) unchanged. | Disconnect implemented as ledger op (§10). |
-| 3. Sync Behaviours | New: §5 ingest + §6 planner + §6 outbox drain. Replaces `app/sync/rules.py`. | All 60+ specific rules (busy block creation, RSVP, edit rights, recurring, etc.) preserved as planner logic + payload renderers. See §8, §9, §10. |
+| 3. Sync Behaviours | New: §5 ingest + §6 planner + §6 outbox drain. Replaces `app/sync/rules.py`. | All specific rules (busy block creation, RSVP, edit rights, recurring, etc.) preserved as planner logic + payload renderers. **SA-mode immovability replaced by uniform 🔒+revert (Phase 0).** See §8, §9, §10. |
 | 4. Triggers | New: §11. `reconcile_requests` table. | Debounce/settling delays preserved. Verification re-fetch retired (§11) — its purpose is met by etag-gated updates. |
 | 5. Background Jobs | Schedule unchanged. Periodic sync internals replaced. | `app/jobs/scheduler.py` unchanged. Job bodies migrate to enqueuing reconcile_requests. |
 | 6. Failure Handling | §12. Strengthened. | Sync-token-preservation is stronger; poison-pill is new. |
-| 7. Admin Features | Unchanged. | `app/api/admin.py` unchanged. Cleanup operations are ledger ops (§10) but the API surface is identical. |
-| 8. UI Surfaces | Unchanged. Counts read from ledger after Phase 4. | Dashboard, settings, exports — no user-visible change. |
-| 9. API Surface | Unchanged. | All endpoints preserved. |
-| 10. Data Lifecycle & Retention | Unchanged. Retention rules apply to `ledger_events` instead of `event_mappings` (same fields). | `app/jobs/cleanup.py` updated in Phase 5. |
+| 7. Admin Features | Unchanged except **SA admin endpoints REMOVED in Phase 0** (`/api/admin/service-account` etc.). | `app/api/admin.py` shrinks slightly. Cleanup operations are ledger ops (§10) but the API surface is otherwise identical. |
+| 8. UI Surfaces | Unchanged. Counts read from ledger after Phase 5. | Dashboard, settings, exports — no user-visible change other than OOBE losing Step 5. |
+| 9. API Surface | Unchanged except SA endpoints (Phase 0). | All other endpoints preserved. |
+| 10. Data Lifecycle & Retention | Unchanged. Retention rules apply to `ledger_events` instead of `event_mappings` (same fields). | `app/jobs/cleanup.py` updated in Phase 6. |
 | 11. Security Controls | Unchanged. | Webhook auth, rate limits, SSRF, encryption — all untouched. |
 | 12. Email Alerts | Unchanged. New alert type added: `event_sync_poison_pill`. | Otherwise identical. |
 | 13. Backup & Export | Unchanged. New tables included in backup. ICS export reads from ledger. | Same retention. |
-| 14. Edge Cases | All preserved. See §8 (recurring), §9 (modes), §10 (cleanup). | Webcal-rename-creates-duplicate is fixed (§5.4). Concurrent-sync-creates-duplicate is fixed structurally. |
+| 14. Edge Cases | All preserved. See §8 (recurring), §9 (modes), §10 (cleanup). **SA-fallback edge cases removed in Phase 0.** Webcal-rename-creates-duplicate is fixed (§5.4). Concurrent-sync-creates-duplicate is fixed structurally. |
 
 ---
 
@@ -767,7 +780,7 @@ Behaviours that need explicit verification, with mitigation plan:
 
 1. **40-second verification re-fetch** — retired in favour of etag-gated updates. **Risk:** if Google's eventual-consistency lag exceeds what etag-gating handles, we'd see no observable issue (writes are idempotent), but might delay convergence. **Mitigation:** keep a low-frequency re-reconcile after webhooks (e.g., one extra ingest 60s later). Trivial to add.
 
-2. **Lock emoji + revert (sa_tier=0)** — mechanism changes from "compare DB to Google" to "compare ledger.applied_payload_hash to Google etag." **Risk:** edge case where user moves event multiple times in rapid succession could trigger ping-pong. **Mitigation:** the etag check + idempotent operation makes this provably converge. Add a specific concurrency test.
+2. **Lock emoji + revert (uniform after Phase 0)** — mechanism changes from "compare DB to Google" to "compare ledger.applied_payload_hash to Google etag." **Risk:** edge case where user moves event multiple times in rapid succession could trigger ping-pong. **Mitigation:** the etag check + idempotent operation makes this provably converge. Add a specific concurrency test. **NEW in Phase 0:** also applies to non-editable client copies on main, fixing today's silent gap.
 
 3. **String-prefix `_event_has_managed_prefix` heuristic** — replaced by precise lookup in projections. **Risk:** legacy events created on a previous system version might lack `bb_proj_id`. **Mitigation:** orphan scan keeps prefix-matching as a secondary criterion for the first 30 days post-cutover; we re-link rather than delete.
 
@@ -794,9 +807,15 @@ Behaviours that need explicit verification, with mitigation plan:
 
 ## 17. What Changes for Users
 
-**Zero observable changes for normal operation.** Same UI, same URLs, same API, same email alerts, same backups, same OOBE.
+**Almost zero observable changes for normal operation.** Same UI, same URLs, same API, same email alerts, same backups.
 
-**Visible improvements:**
+**Phase 0 (SA removal) — minor visible changes:**
+- **OOBE wizard goes from 7 steps to 6.** Step 5 (Service Account) is gone; Step 6 (Encryption Key) becomes Step 5; Step 7 (Complete) becomes Step 6. The wizard already worked when users skipped Step 5; this just removes the option.
+- **Existing sa_tier=2 users:** their `sa_tier` column is reset to 0. Existing SA-organized events stay where they are (we don't rewrite them). New/updated non-editable events use the lock-emoji + revert mechanism (which is what sa_tier=0 already used). Net effect: events that were "natively immovable" (or appeared so) become "snap back if moved" — same correctness, slightly different UX.
+- **Non-editable client-event copies on main now revert if moved.** This is a *fix*, not a regression — today's code silently lets these drift.
+- **The `service-account` admin page disappears.** SMTP, alerts, factory reset all stay.
+
+**Phase 1–7 — visible improvements:**
 - Fewer duplicate events.
 - Fewer missing busy blocks.
 - Faster post-edit convergence (etag-gated updates avoid the 40s verification window).
@@ -810,7 +829,7 @@ Behaviours that need explicit verification, with mitigation plan:
 
 Before I start coding, please confirm or steer:
 
-1. **Length of bake period at Phase 5 cutover:** I propose 7 days behind a feature flag with old code still present. Acceptable, or longer?
+1. **Length of bake period at Phase 6 cutover:** I propose 7 days behind a feature flag with old code still present. Acceptable, or longer?
 2. **Outbox concurrency model:** I'm proposing one drain coroutine per active user. With ~50 users this is fine; if you expect 1000+ users we'd want a worker pool. What's the upper bound?
 3. **Webcal canonical UID for unstable feeds:** today's hash uses `(summary, start, end)`. I'm proposing `(start, end, normalized_summary)` *only when summary stays the same*, to avoid the rename-creates-duplicate bug. Is it acceptable that an event's title changing AND its time changing simultaneously creates a new ledger row? (Same behaviour as today, but worth flagging.)
 4. **Schema-level cascade deletes:** I have `ON DELETE CASCADE` on `ledger_events → ledger_projections` and `ledger_projections → outbox_operations`. This means a force-delete of a ledger row drops outbox without writing the deletion to Google. We should never force-delete in the new model — `status='cancelled'` is the correct path. Want to add a DB trigger to refuse `DELETE FROM ledger_events`? I lean yes.
@@ -823,16 +842,17 @@ Before I start coding, please confirm or steer:
 
 | Phase | Effort | Risk |
 |---|---|---|
-| 0. Foundation | 1–2 days | Trivial |
-| 1. Idempotent inserts | 3–5 days | Low (additive change) |
-| 2. Outbox shadowing | 5–7 days | Low (shadow only) |
-| 3. Dual-write ledger | 5–7 days | Medium (correctness checks needed) |
-| 4. Cut over reads | 3–5 days | Medium (UI must stay correct) |
-| 5. Cut over writes | 5–7 days | High (the actual swap) |
-| 6. Cleanup | 2–3 days | Low (bake period proves stability) |
-| **Total** | **24–36 days (4–6 weeks)** | |
+| 0. SA removal & revert fix | 1–2 days | Low (additive bug fix) |
+| 1. Foundation | 1–2 days | Trivial |
+| 2. Idempotent inserts | 3–5 days | Low (additive change) |
+| 3. Outbox shadowing | 5–7 days | Low (shadow only) |
+| 4. Dual-write ledger | 5–7 days | Medium (correctness checks needed) |
+| 5. Cut over reads | 3–5 days | Medium (UI must stay correct) |
+| 6. Cut over writes | 5–7 days | High (the actual swap) |
+| 7. Cleanup | 2–3 days | Low (bake period proves stability) |
+| **Total** | **25–38 days (5–7.5 weeks)** | |
 
-Bake periods between phases add another 1–2 weeks of calendar time. Expect **6–8 weeks calendar time** for the full migration.
+Bake periods between phases add another 1–2 weeks of calendar time. Expect **6–9 weeks calendar time** for the full migration.
 
 ---
 
@@ -841,6 +861,6 @@ Bake periods between phases add another 1–2 weeks of calendar time. Expect **6
 This plan is ready for review. Specifically asking for:
 - Confirmation that no inventory item is missed (or call out which).
 - Direction on the open questions in §18.
-- Approval to begin Phase 0.
+- Approval to begin Phase 0 (SA removal).
 
 No code changes have been made.
