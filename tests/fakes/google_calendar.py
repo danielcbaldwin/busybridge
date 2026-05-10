@@ -192,6 +192,24 @@ class _SyncTokenState:
     issued_at: datetime
 
 
+@dataclass
+class _PageTokenState:
+    """Per-token bookkeeping for in-progress pagination.
+
+    Pagination snapshots are server-side: we record the full list of
+    event IDs that the request would return, then drip them out one
+    page at a time.  The eventual ``nextSyncToken`` reflects the
+    snapshot's cursor, not the cursor at the moment the last page is
+    served.  This matches Google's documented "consistent snapshot
+    across pages" guarantee.
+    """
+
+    calendar_id: str
+    remaining_event_ids: list[str]
+    sync_cursor_at_snapshot: int
+    page_size: int
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -286,6 +304,7 @@ class FakeGoogleCalendar:
         self._sync_token_ttl = sync_token_ttl
         self._calendars: dict[str, _Calendar] = {}
         self._sync_tokens: dict[str, _SyncTokenState] = {}
+        self._page_tokens: dict[str, _PageTokenState] = {}
 
     # ------------------------------------------------------------------
     # Calendar lifecycle
@@ -538,3 +557,314 @@ class FakeGoogleCalendar:
             raise _precondition_failed(
                 f"etag {if_match} does not match stored {ev.etag}"
             )
+
+    # ------------------------------------------------------------------
+    # events.list
+    # ------------------------------------------------------------------
+    def list_events(
+        self,
+        calendar_id: str,
+        sync_token: Optional[str] = None,
+        time_min: Optional[datetime | str] = None,
+        time_max: Optional[datetime | str] = None,
+        max_results: int = 250,
+        single_events: bool = False,
+        page_token: Optional[str] = None,
+        show_deleted: bool = False,
+    ) -> dict:
+        """List events on a calendar.
+
+        Three modes:
+
+        * **Full sync** (no ``sync_token``): returns events in
+          ``[time_min, time_max]``.  Cancelled rows are filtered out
+          unless ``show_deleted=True``; in particular, **cancelled
+          instance exceptions of recurring series are omitted from
+          full sync** when ``show_deleted=False``.  This is the
+          documented quirk that the rewrite plan calls out as the
+          source of recurring-cancellation amnesia (§13 Stage 1).
+        * **Incremental sync** (``sync_token`` set): returns every
+          event whose change cursor is strictly greater than the
+          token's recorded cursor, regardless of status — cancelled
+          events are always included.
+        * **Pagination continuation** (``page_token`` set): returns
+          the next chunk of a previous request's snapshot.
+
+        Returns a dict with keys:
+
+        * ``items`` — list of event dicts (same shape as ``get_event``)
+        * ``nextPageToken`` — present only if there are more pages
+        * ``nextSyncToken`` — present only on the final page
+        """
+        cal = self._require_calendar(calendar_id)
+
+        # --- Pagination continuation ------------------------------------
+        if page_token is not None:
+            return self._continue_pagination(page_token)
+
+        # --- Mutual exclusion sanity check ------------------------------
+        if sync_token is not None and (time_min is not None or time_max is not None):
+            raise _bad_request("syncToken cannot be combined with timeMin/timeMax")
+
+        # --- Build the snapshot ----------------------------------------
+        if sync_token is not None:
+            ev_ids, snapshot_cursor = self._snapshot_incremental(cal, sync_token)
+        else:
+            tmin = _coerce_datetime(time_min) if time_min is not None else None
+            tmax = _coerce_datetime(time_max) if time_max is not None else None
+            ev_ids, snapshot_cursor = self._snapshot_full(
+                cal, tmin, tmax, single_events, show_deleted,
+            )
+
+        return self._serve_page(cal, ev_ids, snapshot_cursor, max_results, sync_token)
+
+    def _snapshot_incremental(
+        self, cal: _Calendar, sync_token: str,
+    ) -> tuple[list[str], int]:
+        """Materialise the event-ID list for an incremental sync."""
+        state = self._sync_tokens.get(sync_token)
+        if state is None or state.calendar_id != cal.id:
+            raise _gone(f"unknown sync token {sync_token}")
+        # Realistic expiry — older than TTL, the token is dead.
+        if (self._clock.now() - state.issued_at) > self._sync_token_ttl:
+            # Per Google: invalid token is reported as 410 Gone, and
+            # the client must fall back to a full sync.
+            raise _gone(
+                f"sync token issued at {state.issued_at.isoformat()} "
+                f"is older than the {self._sync_token_ttl} TTL"
+            )
+        snapshot_cursor = cal.change_counter
+        ids = [
+            eid for eid, ev in cal.events.items()
+            if ev.change_seq > state.cursor
+        ]
+        # Deterministic order: by change_seq, then by id, so callers
+        # see changes in roughly chronological order.
+        ids.sort(key=lambda eid: (cal.events[eid].change_seq, eid))
+        return ids, snapshot_cursor
+
+    def _snapshot_full(
+        self,
+        cal: _Calendar,
+        time_min: Optional[datetime],
+        time_max: Optional[datetime],
+        single_events: bool,
+        show_deleted: bool,
+    ) -> tuple[list[str], int]:
+        """Materialise the event-ID list for a full sync.
+
+        ``single_events=True`` (instance expansion) is not yet
+        implemented; raise so tests that need it fail loudly rather
+        than silently returning incorrect data.
+        """
+        if single_events:
+            raise NotImplementedError(
+                "singleEvents=True instance expansion is not yet wired "
+                "into the fake; pending recurring-event support."
+            )
+        snapshot_cursor = cal.change_counter
+        ids: list[str] = []
+        for eid, ev in cal.events.items():
+            if ev.status == "cancelled" and not show_deleted:
+                continue
+            if not _matches_window(ev, time_min, time_max):
+                continue
+            ids.append(eid)
+        # Stable order: by start time then ID, so the snapshot is
+        # reproducible across runs.
+        ids.sort(key=lambda eid: (_event_sort_key(cal.events[eid]), eid))
+        return ids, snapshot_cursor
+
+    def _serve_page(
+        self,
+        cal: _Calendar,
+        ev_ids: list[str],
+        snapshot_cursor: int,
+        max_results: int,
+        original_sync_token: Optional[str],
+    ) -> dict:
+        """Return the first page of ``ev_ids`` and stash the rest."""
+        if max_results <= 0:
+            raise _bad_request("maxResults must be positive")
+
+        page = ev_ids[:max_results]
+        rest = ev_ids[max_results:]
+
+        items = [cal.events[eid].to_api_dict() for eid in page]
+        out: dict = {
+            "kind": "calendar#events",
+            "items": items,
+        }
+
+        if rest:
+            page_token = self._issue_page_token(
+                cal.id, rest, snapshot_cursor, max_results,
+            )
+            out["nextPageToken"] = page_token
+        else:
+            out["nextSyncToken"] = self._issue_sync_token(cal.id, snapshot_cursor)
+
+        # Consume the original sync token so a replay would 410
+        # rather than silently double-process.  Real Google does NOT
+        # invalidate the prior token on use, but the rewrite design
+        # does not rely on that, and invalidating eagerly is a
+        # cheap way to surface bugs.  Keep behaviour configurable;
+        # for now, leave the prior token intact (closer to real Google).
+        del original_sync_token
+
+        return out
+
+    def _continue_pagination(self, page_token: str) -> dict:
+        """Serve the next page from a previously-stashed snapshot."""
+        state = self._page_tokens.pop(page_token, None)
+        if state is None:
+            raise _gone(f"unknown page token {page_token}")
+        cal = self._calendars.get(state.calendar_id)
+        if cal is None:
+            raise _gone(f"calendar {state.calendar_id} no longer exists")
+
+        page_ids = state.remaining_event_ids[: state.page_size]
+        rest = state.remaining_event_ids[state.page_size :]
+
+        # Note: events that have been mutated since the snapshot
+        # still surface here (we re-render their CURRENT state).
+        # Real Google's behaviour here is undefined; we render
+        # latest content, which matches the documented "consistent
+        # snapshot of identities, latest content" interpretation.
+        items: list[dict] = []
+        for eid in page_ids:
+            ev = cal.events.get(eid)
+            if ev is None:
+                continue  # event was hard-deleted between pages — skip
+            items.append(ev.to_api_dict())
+
+        out: dict = {"kind": "calendar#events", "items": items}
+        if rest:
+            new_token = self._issue_page_token(
+                cal.id, rest, state.sync_cursor_at_snapshot, state.page_size,
+            )
+            out["nextPageToken"] = new_token
+        else:
+            out["nextSyncToken"] = self._issue_sync_token(
+                cal.id, state.sync_cursor_at_snapshot,
+            )
+        return out
+
+    def _issue_sync_token(self, calendar_id: str, cursor: int) -> str:
+        token = f"sync-{uuid.uuid4().hex}"
+        self._sync_tokens[token] = _SyncTokenState(
+            calendar_id=calendar_id,
+            cursor=cursor,
+            issued_at=self._clock.now(),
+        )
+        return token
+
+    def _issue_page_token(
+        self, calendar_id: str, remaining: list[str],
+        cursor: int, page_size: int,
+    ) -> str:
+        token = f"page-{uuid.uuid4().hex}"
+        self._page_tokens[token] = _PageTokenState(
+            calendar_id=calendar_id,
+            remaining_event_ids=remaining,
+            sync_cursor_at_snapshot=cursor,
+            page_size=page_size,
+        )
+        return token
+
+    # ------------------------------------------------------------------
+    # Test introspection (NOT part of the Google API surface)
+    # ------------------------------------------------------------------
+    def all_event_ids(self, calendar_id: str, *, include_cancelled: bool = True) -> list[str]:
+        cal = self._require_calendar(calendar_id)
+        return [
+            eid for eid, ev in cal.events.items()
+            if include_cancelled or ev.status != "cancelled"
+        ]
+
+    def event_count(self, calendar_id: str, *, include_cancelled: bool = False) -> int:
+        return len(self.all_event_ids(calendar_id, include_cancelled=include_cancelled))
+
+    def expire_sync_token(self, sync_token: str) -> None:
+        """Force a sync token to be considered expired on next use.
+
+        Useful for tests that want to exercise the 410 Gone path
+        without advancing the clock by 30 days.
+        """
+        state = self._sync_tokens.get(sync_token)
+        if state is None:
+            raise KeyError(sync_token)
+        state.issued_at = self._clock.now() - self._sync_token_ttl - timedelta(seconds=1)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers used by list_events
+# ---------------------------------------------------------------------------
+def _coerce_datetime(value: datetime | str) -> datetime:
+    """Accept either a datetime or an ISO-8601 string."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, str):
+        # Tolerate trailing Z, which fromisoformat refuses pre-3.11.
+        s = value[:-1] + "+00:00" if value.endswith("Z") else value
+        return isoparse(s)
+    raise TypeError(f"unsupported time value: {value!r}")
+
+
+def _event_start_dt(ev: _StoredEvent) -> Optional[datetime]:
+    """Return the event's start as an aware UTC datetime, or None."""
+    if not ev.start:
+        return None
+    if "dateTime" in ev.start:
+        return _coerce_datetime(ev.start["dateTime"]).astimezone(UTC)
+    if "date" in ev.start:
+        d = date.fromisoformat(ev.start["date"])
+        return datetime(d.year, d.month, d.day, tzinfo=UTC)
+    return None
+
+
+def _event_end_dt(ev: _StoredEvent) -> Optional[datetime]:
+    if not ev.end:
+        return None
+    if "dateTime" in ev.end:
+        return _coerce_datetime(ev.end["dateTime"]).astimezone(UTC)
+    if "date" in ev.end:
+        d = date.fromisoformat(ev.end["date"])
+        return datetime(d.year, d.month, d.day, tzinfo=UTC)
+    return None
+
+
+def _matches_window(
+    ev: _StoredEvent,
+    time_min: Optional[datetime],
+    time_max: Optional[datetime],
+) -> bool:
+    """Decide whether an event falls inside ``[time_min, time_max]``.
+
+    Recurring parents are always included; the planner / consumer
+    is responsible for expanding RRULEs into instance windows.
+    Standalone and modified-instance events are filtered on their
+    start time.  An event with no start at all (a stub) is always
+    included so misbehaving inputs don't silently disappear.
+    """
+    if ev.recurrence:
+        return True
+    start = _event_start_dt(ev)
+    if start is None:
+        return True
+    if time_min is not None and start < time_min:
+        # Event ends before the window — exclude only if the END is
+        # also before the window, so an event that straddles the
+        # boundary still appears.
+        end = _event_end_dt(ev) or start
+        if end < time_min:
+            return False
+    if time_max is not None and start >= time_max:
+        return False
+    return True
+
+
+def _event_sort_key(ev: _StoredEvent) -> tuple:
+    """Stable ordering key for snapshot determinism."""
+    start = _event_start_dt(ev)
+    return (start.timestamp() if start else 0.0,)
