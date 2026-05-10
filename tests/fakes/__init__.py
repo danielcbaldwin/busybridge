@@ -11,6 +11,7 @@ for the full list of behaviours covered.
 """
 
 from tests.fakes.clock import SimulatedClock
+from tests.fakes.failures import FailureInjector, NetworkError
 from tests.fakes.google_calendar import (
     FakeGoogleCalendar,
     GoogleApiError,
@@ -19,6 +20,8 @@ from tests.fakes.google_calendar import (
 
 __all__ = [
     "SimulatedClock",
+    "FailureInjector",
+    "NetworkError",
     "FakeGoogleCalendar",
     "GoogleApiError",
     "derive_instance_event_id",

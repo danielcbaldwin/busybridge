@@ -299,12 +299,29 @@ class FakeGoogleCalendar:
         self,
         clock: Optional[SimulatedClock] = None,
         sync_token_ttl: timedelta = DEFAULT_SYNC_TOKEN_TTL,
+        failure_injector: Optional["FailureInjector"] = None,
     ):
         self._clock = clock or SimulatedClock()
         self._sync_token_ttl = sync_token_ttl
         self._calendars: dict[str, _Calendar] = {}
         self._sync_tokens: dict[str, _SyncTokenState] = {}
         self._page_tokens: dict[str, _PageTokenState] = {}
+        self._failures = failure_injector
+
+    def _check_failures(self, operation: str, *, has_sync_token: bool = False) -> None:
+        """Roll the failure injector for a pre-operation failure.
+
+        No-op if no injector is configured.  Kept as a single
+        chokepoint so each API method has one consistent injection
+        point.
+        """
+        if self._failures is not None:
+            self._failures.maybe_fail(operation, has_sync_token=has_sync_token)
+
+    def _check_post_write(self, operation: str) -> None:
+        """Roll the failure injector for a post-write crash."""
+        if self._failures is not None:
+            self._failures.maybe_crash_after_write(operation)
 
     # ------------------------------------------------------------------
     # Calendar lifecycle
@@ -323,12 +340,14 @@ class FakeGoogleCalendar:
         return self._calendar_to_api(cal)
 
     def list_calendars(self) -> dict:
+        self._check_failures("list_calendars")
         return {
             "kind": "calendar#calendarList",
             "items": [self._calendar_to_api(c) for c in self._calendars.values()],
         }
 
     def get_calendar(self, calendar_id: str) -> dict:
+        self._check_failures("get_calendar")
         cal = self._calendars.get(calendar_id)
         if cal is None:
             raise _not_found(f"calendar {calendar_id} not found")
@@ -356,6 +375,7 @@ class FakeGoogleCalendar:
 
         On success, returns the freshly-stored event as a dict.
         """
+        self._check_failures("insert")
         cal = self._require_calendar(calendar_id)
 
         # Resolve ID
@@ -403,6 +423,7 @@ class FakeGoogleCalendar:
             change_seq=cal.change_counter,
         )
         cal.events[event_id] = ev
+        self._check_post_write("insert")
         return ev.to_api_dict()
 
     def get_event(self, calendar_id: str, event_id: str) -> dict:
@@ -414,6 +435,7 @@ class FakeGoogleCalendar:
         which lets clients GET an instance by its derived ID even
         before any modification has been made.
         """
+        self._check_failures("get")
         cal = self._require_calendar(calendar_id)
         ev = cal.events.get(event_id)
         if ev is not None:
@@ -441,6 +463,7 @@ class FakeGoogleCalendar:
         on the fly (matching real Google: ``events.update`` on an
         instance ID creates an exception entry transparently).
         """
+        self._check_failures("update")
         cal = self._require_calendar(calendar_id)
         ev = cal.events.get(event_id)
         if ev is None:
@@ -477,6 +500,7 @@ class FakeGoogleCalendar:
         ev.sequence += 1
         ev.etag = _new_etag()
         ev.change_seq = cal.change_counter
+        self._check_post_write("update")
         return ev.to_api_dict()
 
     def patch_event(
@@ -491,6 +515,7 @@ class FakeGoogleCalendar:
         Like ``update_event``, this materialises an instance override
         on the fly when called with a derived recurring-instance ID.
         """
+        self._check_failures("patch")
         cal = self._require_calendar(calendar_id)
         ev = cal.events.get(event_id)
         if ev is None:
@@ -542,6 +567,7 @@ class FakeGoogleCalendar:
         ev.sequence += 1
         ev.etag = _new_etag()
         ev.change_seq = cal.change_counter
+        self._check_post_write("patch")
         return ev.to_api_dict()
 
     def delete_event(
@@ -565,6 +591,7 @@ class FakeGoogleCalendar:
         Raises 404 if the event id is unknown and is not a derived
         instance ID of any series.
         """
+        self._check_failures("delete")
         cal = self._require_calendar(calendar_id)
         ev = cal.events.get(event_id)
         if ev is None:
@@ -582,6 +609,7 @@ class FakeGoogleCalendar:
         ev.sequence += 1
         ev.etag = _new_etag()
         ev.change_seq = cal.change_counter
+        self._check_post_write("delete")
 
     # ------------------------------------------------------------------
     # Helpers
@@ -639,6 +667,9 @@ class FakeGoogleCalendar:
         * ``nextPageToken`` — present only if there are more pages
         * ``nextSyncToken`` — present only on the final page
         """
+        # Failure injection: rolls before any work. The
+        # sync_token_expiry mode only fires when a token is in play.
+        self._check_failures("list", has_sync_token=sync_token is not None)
         cal = self._require_calendar(calendar_id)
 
         # --- Pagination continuation ------------------------------------
@@ -931,6 +962,7 @@ class FakeGoogleCalendar:
         Default time window: ``[parent.start, parent.start + 2y]`` —
         enough to catch normal weekly/monthly series in tests.
         """
+        self._check_failures("instances")
         cal = self._require_calendar(calendar_id)
         parent = cal.events.get(event_id)
         if parent is None:
