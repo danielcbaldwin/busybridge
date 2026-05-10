@@ -119,6 +119,7 @@ class _StoredEvent:
     recurrence: Optional[list[str]]
     recurring_event_id: Optional[str]
     original_start_time: Optional[dict]
+    guests_can_modify: Optional[bool]
     created: str
     updated: str
     sequence: int
@@ -164,6 +165,8 @@ class _StoredEvent:
             out["recurringEventId"] = self.recurring_event_id
         if self.original_start_time is not None:
             out["originalStartTime"] = copy.deepcopy(self.original_start_time)
+        if self.guests_can_modify is not None:
+            out["guestsCanModify"] = self.guests_can_modify
         return out
 
 
@@ -417,6 +420,7 @@ class FakeGoogleCalendar:
             recurrence=list(body["recurrence"]) if body.get("recurrence") else None,
             recurring_event_id=body.get("recurringEventId"),
             original_start_time=copy.deepcopy(body.get("originalStartTime")),
+            guests_can_modify=body.get("guestsCanModify"),
             created=now_iso,
             updated=now_iso,
             sequence=int(body.get("sequence", 0) or 0),
@@ -496,6 +500,7 @@ class FakeGoogleCalendar:
             ev.recurring_event_id = body["recurringEventId"]
         if "originalStartTime" in body:
             ev.original_start_time = copy.deepcopy(body["originalStartTime"])
+        ev.guests_can_modify = body.get("guestsCanModify")
         ev.updated = now_iso
         ev.sequence += 1
         ev.etag = _new_etag()
@@ -563,6 +568,8 @@ class FakeGoogleCalendar:
             ev.extended_properties = merged
         if "recurrence" in body:
             ev.recurrence = list(body["recurrence"]) if body["recurrence"] else None
+        if "guestsCanModify" in body:
+            ev.guests_can_modify = body["guestsCanModify"]
         ev.updated = now_iso
         ev.sequence += 1
         ev.etag = _new_etag()
@@ -1075,6 +1082,7 @@ class FakeGoogleCalendar:
             recurrence=list(new_body["recurrence"]) if new_body.get("recurrence") else None,
             recurring_event_id=None,
             original_start_time=None,
+            guests_can_modify=new_body.get("guestsCanModify"),
             created=now_iso,
             updated=now_iso,
             sequence=0,
@@ -1126,6 +1134,7 @@ class FakeGoogleCalendar:
             recurrence=None,
             recurring_event_id=parent_id,
             original_start_time=copy.deepcopy(synth.get("originalStartTime")),
+            guests_can_modify=synth.get("guestsCanModify"),
             created=now_iso,
             updated=now_iso,
             sequence=0,

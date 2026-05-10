@@ -1,0 +1,141 @@
+"""Canonical identity helpers for the ledger architecture.
+
+Two ID schemes live here:
+
+* **canonical_uid** — opaque per-user key for one logical event,
+  derived from the source.  Stable across syncs, used for
+  ``ledger_events.canonical_uid``.
+* **deterministic Google ID** — the ``id`` we send to Google on
+  ``events.insert`` so retries hit the unique-id constraint and
+  return 409 Conflict instead of duplicating.  Derived from
+  ``ledger_projections.id``.
+
+Both schemes are described in REWRITE_PLAN.md §3 and §7.
+
+Google's ID alphabet for client-supplied IDs is base32hex
+(lowercase ``a-v`` plus ``0-9``), 5–1024 chars.  The encoder
+below produces conforming IDs by base-32-hex-encoding the
+projection ID and prefixing it with ``bb`` for traceability.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import re
+import struct
+from typing import Optional
+
+# Stamp that marks a deterministic Google ID as ours.  Three
+# letters keeps the per-id overhead small while making greps
+# unambiguous.  See ``derive_google_event_id``.
+_BB_PREFIX = "bb"
+
+# Google's accepted alphabet for client-supplied event IDs.
+_GOOGLE_ID_RE = re.compile(r"^[a-v0-9]{5,1024}$")
+
+
+# ---------------------------------------------------------------------------
+# canonical_uid
+# ---------------------------------------------------------------------------
+def canonical_uid_main_native(user_id: int, google_event_id: str) -> str:
+    """Native main-calendar event (not a projection of any source)."""
+    return f"main_native:{user_id}:{google_event_id}"
+
+
+def canonical_uid_client(client_calendar_id: int, google_event_id: str) -> str:
+    """Event sourced from an OAuth client calendar."""
+    return f"client:{client_calendar_id}:{google_event_id}"
+
+
+def canonical_uid_personal(personal_calendar_id: int, google_event_id: str) -> str:
+    """Event sourced from a personal (read-only) calendar."""
+    return f"personal:{personal_calendar_id}:{google_event_id}"
+
+
+def canonical_uid_webcal_stable(subscription_id: int, ics_uid: str) -> str:
+    """Event from a webcal feed whose UIDs survive across polls."""
+    return f"webcal:{subscription_id}:{ics_uid}"
+
+
+def canonical_uid_webcal_unstable(
+    subscription_id: int,
+    start_at: str,
+    end_at: str,
+) -> str:
+    """Event from a webcal feed whose UIDs change every poll.
+
+    The hash deliberately omits the summary, so an upstream rename
+    of an event whose start/end stay the same does NOT generate a
+    new canonical_uid (and therefore not a duplicate ledger row).
+    This is the fix for today's "Eventbrite renames event → BB
+    creates duplicate" bug — REWRITE_PLAN.md §5.4.
+    """
+    raw = f"{start_at}|{end_at}".encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
+    return f"webcal:{subscription_id}:hash:{digest}"
+
+
+def canonical_uid_for_instance(
+    parent_canonical_uid: str,
+    original_start: str,
+) -> str:
+    """Canonical UID for a *modified* recurring instance.
+
+    The parent series stores its own canonical_uid; modified
+    instances get a per-occurrence UID derived from the parent +
+    the original start time, so they survive parent re-keying
+    (the `_R` reschedule case) by being re-parented rather than
+    deleted.
+    """
+    return f"{parent_canonical_uid}:inst:{original_start}"
+
+
+# ---------------------------------------------------------------------------
+# Deterministic Google event IDs
+# ---------------------------------------------------------------------------
+def derive_google_event_id(projection_id: int) -> str:
+    """Encode a projection ID as a Google-acceptable event ID.
+
+    Used as ``body['id']`` on ``events.insert``: the same input
+    yields the same output, so a retried insert hits the per-
+    calendar uniqueness constraint and returns 409 Conflict, which
+    the outbox treats as success after a confirming GET.
+
+    Result: ``bb`` + base32hex(64-bit-big-endian projection_id),
+    lowercase, padding stripped.  ~15 chars total — well within
+    Google's 5–1024 limit.
+    """
+    if projection_id <= 0:
+        raise ValueError(f"projection_id must be positive, got {projection_id}")
+    if projection_id >= (1 << 64):
+        raise ValueError(f"projection_id exceeds 64 bits: {projection_id}")
+    encoded = (
+        base64.b32hexencode(struct.pack(">Q", projection_id))
+        .decode("ascii")
+        .lower()
+        .rstrip("=")
+    )
+    out = f"{_BB_PREFIX}{encoded}"
+    # Defence in depth: prove the id is well-formed.
+    if not _GOOGLE_ID_RE.match(out):
+        raise AssertionError(
+            f"derive_google_event_id produced invalid id {out!r} "
+            f"for projection_id={projection_id}"
+        )
+    return out
+
+
+def is_managed_google_event_id(event_id: Optional[str]) -> bool:
+    """True if ``event_id`` looks like a deterministic ID we issued.
+
+    Used by the discovery / orphan scan to recognise our writes
+    without hitting the database.  This is "is it ours?" by
+    construction rather than by extended-property lookup.
+    """
+    if not event_id:
+        return False
+    if not event_id.startswith(_BB_PREFIX):
+        return False
+    rest = event_id[len(_BB_PREFIX) :]
+    return bool(re.fullmatch(r"[a-v0-9]{1,1022}", rest))

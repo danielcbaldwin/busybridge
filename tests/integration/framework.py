@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
+import aiosqlite
+
 from tests.fakes.clock import SimulatedClock
 from tests.fakes.failures import FailureInjector
 from tests.fakes.google_calendar import (
@@ -88,6 +90,8 @@ class Scenario:
 
     _calendars_by_nick: dict[str, str] = field(init=False, default_factory=dict)
     _nicks_by_calendar: dict[str, str] = field(init=False, default_factory=dict)
+    _users_by_nick: dict[str, "_LedgerUser"] = field(init=False, default_factory=dict)
+    _db: Optional[aiosqlite.Connection] = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.clock = SimulatedClock(start=self.clock_start)
@@ -483,3 +487,226 @@ def _coerce_iso(value: datetime | str) -> str:
     if isinstance(value, str):
         return value
     raise TypeError(f"unsupported time input: {value!r}")
+
+
+# ---------------------------------------------------------------------------
+# Ledger integration (REWRITE_PLAN.md Stage 2)
+# ---------------------------------------------------------------------------
+@dataclass
+class _LedgerUser:
+    """One user registered with the ledger system in a Scenario."""
+    user_id: int
+    email: str
+    main_nick: str
+    main_google_calendar_id: str
+    client_calendar_ids: dict[str, int] = field(default_factory=dict)
+    """Maps client *nickname* → client_calendars.id (the integer FK)."""
+
+
+# Patch helper methods onto Scenario so the file's main class
+# definition stays compact while keeping the ledger glue here.
+async def _scenario_setup_db(self: Scenario) -> aiosqlite.Connection:
+    """Lazy-initialise an in-memory SQLite + load minimal app schema
+    + ledger schema.  Idempotent."""
+    if self._db is not None:
+        return self._db
+    # Late imports so importing the framework does not pull in
+    # the entire app (and therefore is safe before app.config is
+    # configured for tests).
+    from app.ledger.schema import init_ledger_schema
+
+    db = await aiosqlite.connect(":memory:", isolation_level=None)
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA foreign_keys = ON")
+
+    # Minimal app tables the ledger refers to via FK.  We don't need
+    # the whole production schema — just users, client_calendars,
+    # calendar_sync_state, main_calendar_sync_state.
+    await db.executescript(
+        """
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            display_name TEXT
+        );
+        CREATE TABLE client_calendars (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            google_calendar_id TEXT NOT NULL,
+            display_name TEXT,
+            color_id TEXT,
+            is_active BOOLEAN DEFAULT TRUE
+        );
+        CREATE TABLE calendar_sync_state (
+            id INTEGER PRIMARY KEY,
+            client_calendar_id INTEGER NOT NULL
+                REFERENCES client_calendars(id) ON DELETE CASCADE,
+            sync_token TEXT,
+            last_full_sync TIMESTAMP,
+            last_incremental_sync TIMESTAMP,
+            consecutive_failures INTEGER DEFAULT 0,
+            last_error TEXT,
+            UNIQUE(client_calendar_id)
+        );
+        CREATE TABLE main_calendar_sync_state (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            sync_token TEXT,
+            last_full_sync TIMESTAMP,
+            last_incremental_sync TIMESTAMP,
+            consecutive_failures INTEGER DEFAULT 0,
+            last_error TEXT,
+            UNIQUE(user_id)
+        );
+        """
+    )
+    await init_ledger_schema(db)
+    await db.commit()
+    self._db = db
+    return db
+
+
+async def _scenario_given_user(
+    self: Scenario,
+    nickname: str,
+    *,
+    email: Optional[str] = None,
+    main: str,
+    clients: Iterable[str] = (),
+) -> _LedgerUser:
+    """Register a user with the ledger system and bind them to
+    previously-registered calendar nicknames.
+
+    Args:
+        nickname: short test handle for the user (``"alice"``).
+        email: defaults to ``f"{nickname}@example.com"``.
+        main: nickname of the user's main calendar.
+        clients: nicknames of the user's client calendars.
+    """
+    if nickname in self._users_by_nick:
+        raise ValueError(f"user nickname already in use: {nickname!r}")
+    db = await _scenario_setup_db(self)
+
+    cursor = await db.execute(
+        "INSERT INTO users (email) VALUES (?)",
+        (email or f"{nickname}@example.com",),
+    )
+    user_id = int(cursor.lastrowid)
+
+    main_id = self.cal(main)
+    client_ids: dict[str, int] = {}
+    for client_nick in clients:
+        google_id = self.cal(client_nick)
+        cur = await db.execute(
+            """INSERT INTO client_calendars
+                  (user_id, google_calendar_id, display_name, is_active)
+               VALUES (?, ?, ?, 1)""",
+            (user_id, google_id, client_nick),
+        )
+        client_ids[client_nick] = int(cur.lastrowid)
+    await db.commit()
+
+    user = _LedgerUser(
+        user_id=user_id,
+        email=email or f"{nickname}@example.com",
+        main_nick=main,
+        main_google_calendar_id=main_id,
+        client_calendar_ids=client_ids,
+    )
+    self._users_by_nick[nickname] = user
+    return user
+
+
+async def _scenario_run_reconciler(
+    self: Scenario,
+    user_nick: str,
+    *,
+    include_main: bool = True,
+    drain: bool = True,
+) -> dict:
+    """Drive one ingest → plan → diff → drain pass for a user.
+
+    Returns the counters dict from the reconciler; tests can assert
+    on it (``out['drain']['succeeded'] == 3`` etc.) or just rely
+    on the observable Google state via ``find_events``.
+    """
+    from app.ledger.reconciler import reconcile_user
+
+    user = self.user(user_nick)
+    db = await _scenario_setup_db(self)
+    return await reconcile_user(
+        db, self.google,
+        user_id=user.user_id,
+        user_email=user.email,
+        main_google_calendar_id=user.main_google_calendar_id,
+        client_calendars=[
+            {"id": cid, "google_calendar_id": self.cal(nick)}
+            for nick, cid in user.client_calendar_ids.items()
+        ],
+        include_main=include_main,
+        drain=drain,
+    )
+
+
+async def _scenario_run_reconciler_until_quiescent(
+    self: Scenario,
+    user_nick: str,
+    *,
+    max_passes: int = 5,
+    advance_between_passes: timedelta | float = 1.0,
+) -> list[dict]:
+    """Run reconciliation until the outbox drains to zero.
+
+    Useful when retries (post-write crash, rate limit, transient
+    5xx) leave pending ops that the next pass should pick up.
+    Advances the clock between passes so retry timers fire.
+    """
+    out: list[dict] = []
+    for _ in range(max_passes):
+        result = await _scenario_run_reconciler(self, user_nick)
+        out.append(result)
+        # Stop when no pending outbox ops remain for this user.
+        db = await _scenario_setup_db(self)
+        user = self.user(user_nick)
+        row = await (await db.execute(
+            """SELECT COUNT(*) AS n FROM outbox_operations
+                WHERE user_id = ? AND status = 'pending'""",
+            (user.user_id,),
+        )).fetchone()
+        if int(row["n"]) == 0:
+            break
+        # Advance past the longest backoff so the next pass picks up.
+        self.advance(advance_between_passes)
+    return out
+
+
+def _scenario_user(self: Scenario, nickname: str) -> _LedgerUser:
+    try:
+        return self._users_by_nick[nickname]
+    except KeyError:
+        raise KeyError(
+            f"unknown user nickname: {nickname!r}; "
+            f"known: {sorted(self._users_by_nick)}"
+        ) from None
+
+
+async def _scenario_close(self: Scenario) -> None:
+    """Tear down the in-memory DB.  Not strictly required —
+    ``:memory:`` databases are reclaimed when the connection drops
+    — but explicit cleanup keeps async-resource warnings quiet."""
+    if self._db is not None:
+        await self._db.close()
+        self._db = None
+
+
+# Bind the helpers onto the dataclass.  Doing it here rather than
+# inline in the @dataclass body keeps the class definition compact
+# and lets the ledger code be lazy-imported.
+Scenario.setup_db = _scenario_setup_db  # type: ignore[attr-defined]
+Scenario.given_user = _scenario_given_user  # type: ignore[attr-defined]
+Scenario.run_reconciler = _scenario_run_reconciler  # type: ignore[attr-defined]
+Scenario.run_reconciler_until_quiescent = (  # type: ignore[attr-defined]
+    _scenario_run_reconciler_until_quiescent
+)
+Scenario.user = _scenario_user  # type: ignore[attr-defined]
+Scenario.close = _scenario_close  # type: ignore[attr-defined]

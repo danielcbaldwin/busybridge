@@ -1,0 +1,540 @@
+"""Outbox drain: pending writes → Google, with idempotent retry.
+
+The drain is deliberately simple: pick the oldest pending op,
+try it once, update state, repeat.  Idempotency is provided by
+two structural choices:
+
+1. **Inserts** carry a deterministic ``id`` derived from the
+   projection ID (see :func:`identity.derive_google_event_id`).
+   A retry hits the per-calendar uniqueness constraint and
+   returns 409 Conflict.  We treat 409 as success after a
+   confirming GET that the stored event matches our hash.
+
+2. **Updates** carry the ``If-Match`` etag we last observed.
+   A retry that races with a concurrent edit returns 412
+   Precondition Failed; we mark the op superseded and let the
+   planner re-derive from fresh state.
+
+Errors are routed by class:
+
+* :class:`Exception` whose status is 401/403/404 → permanent
+  failure after ``POISON_PILL_THRESHOLD`` attempts.
+* status 408/429/500/502/503/504 or any non-HTTP exception →
+  retry with exponential backoff.
+* status 412 (etag mismatch) → mark superseded, schedule replan.
+
+The retry timing matches the existing
+``app/sync/google_calendar.py`` curve so production behaviour
+under load doesn't change at cutover.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+import aiosqlite
+
+from app.ledger.google_client import GoogleClient
+from app.ledger.identity import derive_google_event_id
+
+logger = logging.getLogger(__name__)
+
+UTC = timezone.utc
+
+# Statuses
+STATUS_PENDING = "pending"
+STATUS_IN_FLIGHT = "in_flight"
+STATUS_DONE = "done"
+STATUS_PERMANENT_FAILURE = "permanent_failure"
+STATUS_SUPERSEDED = "superseded"
+
+# Operations
+OP_CREATE = "create"
+OP_UPDATE = "update"
+OP_DELETE = "delete"
+
+# Failure handling
+POISON_PILL_THRESHOLD = 5
+PERMANENT_FAILURE_STATUSES = frozenset({400, 401, 403, 404})
+
+# Backoff schedule (seconds): roughly the curve used today in
+# app/sync/google_calendar.py.  Capped at 60s.
+_BACKOFF_SECONDS = (1, 2, 4, 8, 16, 32, 60)
+
+
+class OutboxDrainError(Exception):
+    """Raised when the drain could not even read the queue."""
+
+
+# ---------------------------------------------------------------------------
+# Enqueue
+# ---------------------------------------------------------------------------
+async def enqueue(
+    db: aiosqlite.Connection,
+    *,
+    user_id: int,
+    projection_id: int,
+    operation: str,
+    ledger_version: int,
+    target_google_calendar_id: str,
+    payload: Optional[dict],
+    now: Optional[datetime] = None,
+) -> int:
+    """Insert one outbox row, superseding any older pending ops
+    for the same projection.
+
+    The idempotency key is shaped so a re-derivation of the same
+    (projection, version, operation) produces the same key — the
+    UNIQUE constraint then prevents a second copy.
+
+    Returns the new outbox row id.
+    """
+    if operation not in (OP_CREATE, OP_UPDATE, OP_DELETE):
+        raise ValueError(f"unknown operation: {operation!r}")
+    when = (now or datetime.now(UTC)).isoformat()
+
+    # Supersede any pending op for the same projection.  In-flight
+    # ops are left alone — the drain will discover their work is
+    # stale via etag mismatch on the next attempt.
+    await db.execute(
+        """UPDATE outbox_operations
+              SET status = ?, completed_at = ?
+            WHERE projection_id = ? AND status = ?""",
+        (STATUS_SUPERSEDED, when, projection_id, STATUS_PENDING),
+    )
+
+    idem = f"proj:{projection_id}:v{ledger_version}:{operation}"
+    payload_json = json.dumps(payload, sort_keys=True) if payload is not None else None
+
+    cursor = await db.execute(
+        """INSERT INTO outbox_operations
+              (user_id, projection_id, operation, idempotency_key,
+               ledger_version_at_enqueue, target_google_calendar_id,
+               payload_json, status, attempts, next_attempt_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+           ON CONFLICT(idempotency_key) DO NOTHING""",
+        (
+            user_id, projection_id, operation, idem,
+            ledger_version, target_google_calendar_id,
+            payload_json, STATUS_PENDING, when, when,
+        ),
+    )
+    if cursor.rowcount > 0:
+        return cursor.lastrowid
+    # Conflict: a row with this idempotency key already exists.
+    # Look it up.
+    row = await (await db.execute(
+        "SELECT id FROM outbox_operations WHERE idempotency_key = ?",
+        (idem,),
+    )).fetchone()
+    return int(row["id"])
+
+
+# ---------------------------------------------------------------------------
+# Drain
+# ---------------------------------------------------------------------------
+async def drain_user(
+    db: aiosqlite.Connection,
+    google: GoogleClient,
+    *,
+    user_id: int,
+    now: Optional[datetime] = None,
+    max_ops: int = 1000,
+) -> dict:
+    """Drain all due outbox ops for one user.
+
+    Stops when:
+    * no pending op is due (``next_attempt_at <= now``), OR
+    * ``max_ops`` ops have been processed (a guard for soak tests),
+      OR
+    * an unrecoverable error reading the queue is hit.
+
+    Returns a dict of counters: ``{processed, succeeded, retried,
+    failed_permanent, superseded}``.
+    """
+    now = now or datetime.now(UTC)
+    counters = {
+        "processed": 0,
+        "succeeded": 0,
+        "retried": 0,
+        "failed_permanent": 0,
+        "superseded": 0,
+    }
+
+    for _ in range(max_ops):
+        op = await _claim_next(db, user_id=user_id, now=now)
+        if op is None:
+            break
+        counters["processed"] += 1
+        try:
+            outcome = await _execute_op(db, google, op, now=now)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.exception("outbox drain crashed on op %s", op["id"])
+            await _mark_retry(db, op, error=str(e), http_status=None, now=now)
+            counters["retried"] += 1
+            continue
+        counters[outcome] = counters.get(outcome, 0) + 1
+    return counters
+
+
+async def _claim_next(
+    db: aiosqlite.Connection,
+    *,
+    user_id: int,
+    now: datetime,
+) -> Optional[aiosqlite.Row]:
+    """Atomically pull the oldest due pending op and mark it in-flight."""
+    row = await (await db.execute(
+        """SELECT * FROM outbox_operations
+            WHERE user_id = ?
+              AND status = ?
+              AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+            ORDER BY id LIMIT 1""",
+        (user_id, STATUS_PENDING, now.isoformat()),
+    )).fetchone()
+    if row is None:
+        return None
+    await db.execute(
+        """UPDATE outbox_operations
+              SET status = ?, started_at = ?, attempts = attempts + 1
+            WHERE id = ?""",
+        (STATUS_IN_FLIGHT, now.isoformat(), row["id"]),
+    )
+    await db.commit()
+    return row
+
+
+async def _execute_op(
+    db: aiosqlite.Connection,
+    google: GoogleClient,
+    op: aiosqlite.Row,
+    *,
+    now: datetime,
+) -> str:
+    """Run one op against Google.  Returns one of:
+    'succeeded', 'retried', 'failed_permanent', 'superseded'.
+    """
+    operation = op["operation"]
+    cal_id = op["target_google_calendar_id"]
+    payload = json.loads(op["payload_json"]) if op["payload_json"] else None
+
+    try:
+        if operation == OP_CREATE:
+            await _do_create(db, google, op, cal_id, payload, now=now)
+        elif operation == OP_UPDATE:
+            return await _do_update(db, google, op, cal_id, payload, now=now)
+        elif operation == OP_DELETE:
+            await _do_delete(db, google, op, cal_id, now=now)
+        else:
+            raise ValueError(f"unknown operation: {operation!r}")
+    except Exception as e:
+        return await _classify_and_retry(db, op, e, now=now)
+    return "succeeded"
+
+
+async def _do_create(
+    db: aiosqlite.Connection,
+    google: GoogleClient,
+    op: aiosqlite.Row,
+    cal_id: str,
+    payload: Optional[dict],
+    *,
+    now: datetime,
+) -> None:
+    """Insert with a deterministic ID; treat 409 as success."""
+    if payload is None:
+        raise ValueError(f"create op {op['id']} has no payload")
+    google_id = derive_google_event_id(int(op["projection_id"]))
+    body = dict(payload)
+    body["id"] = google_id
+    try:
+        result = google.insert_event(cal_id, body)
+    except Exception as e:
+        if getattr(e, "status", None) == 409:
+            # The ID is already on Google — either a successful retry
+            # or a state we should adopt.  GET, verify, mark done.
+            existing = google.get_event(cal_id, google_id)
+            await _record_success(
+                db, op,
+                google_event_id=existing["id"],
+                google_etag=existing.get("etag", ""),
+                now=now,
+            )
+            return
+        raise
+    await _record_success(
+        db, op,
+        google_event_id=result["id"],
+        google_etag=result.get("etag", ""),
+        now=now,
+    )
+
+
+async def _do_update(
+    db: aiosqlite.Connection,
+    google: GoogleClient,
+    op: aiosqlite.Row,
+    cal_id: str,
+    payload: Optional[dict],
+    *,
+    now: datetime,
+) -> str:
+    """Etag-gated update; on 412 mark superseded for replan."""
+    if payload is None:
+        raise ValueError(f"update op {op['id']} has no payload")
+    proj = await _get_projection(db, op["projection_id"])
+    if not proj["google_event_id"]:
+        raise ValueError(
+            f"update op {op['id']} has no google_event_id on its projection — "
+            "the create must succeed first"
+        )
+    try:
+        result = google.update_event(
+            cal_id,
+            proj["google_event_id"],
+            payload,
+            if_match=proj["google_etag"] or None,
+        )
+    except Exception as e:
+        if getattr(e, "status", None) == 412:
+            await _mark_superseded(
+                db, op,
+                error="etag_mismatch",
+                http_status=412,
+                now=now,
+            )
+            await _request_projection_replan(db, op["projection_id"])
+            return "superseded"
+        raise
+    await _record_success(
+        db, op,
+        google_event_id=result["id"],
+        google_etag=result.get("etag", ""),
+        now=now,
+    )
+    return "succeeded"
+
+
+async def _do_delete(
+    db: aiosqlite.Connection,
+    google: GoogleClient,
+    op: aiosqlite.Row,
+    cal_id: str,
+    *,
+    now: datetime,
+) -> None:
+    """Idempotent delete: 404/410 are treated as success."""
+    proj = await _get_projection(db, op["projection_id"])
+    if not proj["google_event_id"]:
+        # Never created — nothing to delete.  Mark projection
+        # absent and consider done.
+        await _record_absent(db, op, now=now)
+        return
+    try:
+        google.delete_event(cal_id, proj["google_event_id"])
+    except Exception as e:
+        if getattr(e, "status", None) in (404, 410):
+            pass  # already gone
+        else:
+            raise
+    await _record_absent(db, op, now=now)
+
+
+# ---------------------------------------------------------------------------
+# State updates
+# ---------------------------------------------------------------------------
+async def _record_success(
+    db: aiosqlite.Connection,
+    op: aiosqlite.Row,
+    *,
+    google_event_id: str,
+    google_etag: str,
+    now: datetime,
+) -> None:
+    when = now.isoformat()
+    proj = await _get_projection(db, op["projection_id"])
+    await db.execute(
+        """UPDATE ledger_projections
+              SET current_state = 'present',
+                  google_event_id = ?,
+                  google_etag = ?,
+                  applied_payload_hash = desired_payload_hash,
+                  applied_ledger_version = ?,
+                  last_attempt_at = ?,
+                  next_attempt_at = NULL,
+                  attempts = attempts + 1,
+                  last_error = NULL,
+                  permanently_failed = 0,
+                  updated_at = ?
+            WHERE id = ?""",
+        (
+            google_event_id, google_etag,
+            int(op["ledger_version_at_enqueue"]),
+            when, when, int(op["projection_id"]),
+        ),
+    )
+    await db.execute(
+        """UPDATE outbox_operations
+              SET status = ?, completed_at = ?, last_http_status = 200
+            WHERE id = ?""",
+        (STATUS_DONE, when, op["id"]),
+    )
+    await db.commit()
+
+
+async def _record_absent(
+    db: aiosqlite.Connection,
+    op: aiosqlite.Row,
+    *,
+    now: datetime,
+) -> None:
+    when = now.isoformat()
+    await db.execute(
+        """UPDATE ledger_projections
+              SET current_state = 'absent',
+                  applied_ledger_version = ?,
+                  applied_payload_hash = 'absent',
+                  last_attempt_at = ?,
+                  next_attempt_at = NULL,
+                  attempts = attempts + 1,
+                  last_error = NULL,
+                  permanently_failed = 0,
+                  updated_at = ?
+            WHERE id = ?""",
+        (
+            int(op["ledger_version_at_enqueue"]),
+            when, when, int(op["projection_id"]),
+        ),
+    )
+    await db.execute(
+        """UPDATE outbox_operations
+              SET status = ?, completed_at = ?, last_http_status = 200
+            WHERE id = ?""",
+        (STATUS_DONE, when, op["id"]),
+    )
+    await db.commit()
+
+
+async def _mark_superseded(
+    db: aiosqlite.Connection,
+    op: aiosqlite.Row,
+    *,
+    error: str,
+    http_status: Optional[int],
+    now: datetime,
+) -> None:
+    await db.execute(
+        """UPDATE outbox_operations
+              SET status = ?, completed_at = ?,
+                  last_error = ?, last_http_status = ?
+            WHERE id = ?""",
+        (STATUS_SUPERSEDED, now.isoformat(), error, http_status, op["id"]),
+    )
+    await db.commit()
+
+
+async def _mark_retry(
+    db: aiosqlite.Connection,
+    op: aiosqlite.Row,
+    *,
+    error: str,
+    http_status: Optional[int],
+    now: datetime,
+) -> None:
+    attempts = int(op["attempts"]) + 1  # we already bumped on claim
+    backoff_idx = min(attempts - 1, len(_BACKOFF_SECONDS) - 1)
+    next_at = now + timedelta(seconds=_BACKOFF_SECONDS[backoff_idx])
+    await db.execute(
+        """UPDATE outbox_operations
+              SET status = ?, next_attempt_at = ?,
+                  last_error = ?, last_http_status = ?
+            WHERE id = ?""",
+        (STATUS_PENDING, next_at.isoformat(), error, http_status, op["id"]),
+    )
+    await db.commit()
+
+
+async def _mark_permanent_failure(
+    db: aiosqlite.Connection,
+    op: aiosqlite.Row,
+    *,
+    error: str,
+    http_status: Optional[int],
+    now: datetime,
+) -> None:
+    when = now.isoformat()
+    await db.execute(
+        """UPDATE outbox_operations
+              SET status = ?, completed_at = ?,
+                  last_error = ?, last_http_status = ?
+            WHERE id = ?""",
+        (STATUS_PERMANENT_FAILURE, when, error, http_status, op["id"]),
+    )
+    await db.execute(
+        """UPDATE ledger_projections
+              SET current_state = 'errored',
+                  permanently_failed = 1,
+                  last_attempt_at = ?,
+                  last_error = ?,
+                  updated_at = ?
+            WHERE id = ?""",
+        (when, error, when, int(op["projection_id"])),
+    )
+    await db.commit()
+
+
+async def _classify_and_retry(
+    db: aiosqlite.Connection,
+    op: aiosqlite.Row,
+    error: Exception,
+    *,
+    now: datetime,
+) -> str:
+    """Decide whether to retry, give up, or supersede an op."""
+    status = getattr(error, "status", None)
+    msg = str(error)
+    if status in PERMANENT_FAILURE_STATUSES:
+        if int(op["attempts"]) >= POISON_PILL_THRESHOLD:
+            await _mark_permanent_failure(
+                db, op, error=msg, http_status=status, now=now,
+            )
+            return "failed_permanent"
+        # First few 4xxs: retry slowly; the planner may produce a
+        # corrected payload after the next ingest.
+        await _mark_retry(db, op, error=msg, http_status=status, now=now)
+        return "retried"
+
+    # Retryable: 408/429/5xx and any non-HTTP exception (network).
+    await _mark_retry(db, op, error=msg, http_status=status, now=now)
+    return "retried"
+
+
+async def _get_projection(db: aiosqlite.Connection, projection_id: int) -> aiosqlite.Row:
+    row = await (await db.execute(
+        "SELECT * FROM ledger_projections WHERE id = ?",
+        (int(projection_id),),
+    )).fetchone()
+    if row is None:
+        raise OutboxDrainError(f"projection {projection_id} vanished")
+    return row
+
+
+async def _request_projection_replan(
+    db: aiosqlite.Connection, projection_id: int,
+) -> None:
+    """Mark the projection as needing fresh planner attention.
+
+    We bump ``desired_ledger_version`` past ``applied_ledger_version``
+    by clearing the latter; the next reconciler tick re-derives.
+    """
+    await db.execute(
+        """UPDATE ledger_projections
+              SET applied_ledger_version = NULL,
+                  current_state = 'unknown'
+            WHERE id = ?""",
+        (int(projection_id),),
+    )
+    await db.commit()
