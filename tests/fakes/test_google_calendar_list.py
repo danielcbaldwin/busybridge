@@ -305,9 +305,12 @@ def test_unknown_calendar_404_on_list(fake):
     assert exc_info.value.status == 404
 
 
-def test_single_events_true_not_yet_implemented(fake):
-    """Recurring expansion lands in the next commit; tests using it
-    should fail loudly until then."""
-    fake.insert_event("primary", _ev("2026-02-01T09:00:00Z"))
-    with pytest.raises(NotImplementedError):
-        fake.list_events("primary", single_events=True)
+def test_single_events_true_passthrough_for_non_recurring(fake):
+    """With no recurring events, single_events=True is a no-op
+    relative to single_events=False; both return the standalone
+    events unchanged."""
+    out = fake.insert_event("primary", _ev("2026-02-01T09:00:00Z"))
+    expanded = fake.list_events("primary", single_events=True)
+    flat = fake.list_events("primary", single_events=False)
+    assert {e["id"] for e in expanded["items"]} == {out["id"]}
+    assert {e["id"] for e in flat["items"]} == {out["id"]}
