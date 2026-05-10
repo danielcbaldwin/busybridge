@@ -11,5 +11,15 @@ for the full list of behaviours covered.
 """
 
 from tests.fakes.clock import SimulatedClock
+from tests.fakes.google_calendar import (
+    FakeGoogleCalendar,
+    GoogleApiError,
+    derive_instance_event_id,
+)
 
-__all__ = ["SimulatedClock"]
+__all__ = [
+    "SimulatedClock",
+    "FakeGoogleCalendar",
+    "GoogleApiError",
+    "derive_instance_event_id",
+]
