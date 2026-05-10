@@ -25,14 +25,14 @@ Three structural properties make this fix reliability across the board, not just
 
 These compose: each closes a different class of bug; together they make today's main failure modes structurally impossible rather than merely mitigated.
 
-**The migration is phased**, not all-at-once. Eight phases over 6.5–10 weeks of calendar time, each with a one-commit rollback. Most phases run as parallel shadows of the existing system before becoming load-bearing, so by the time the new system is authoritative we have months of data showing it's correct. The hardest phase (the actual write cutover) comes sixth, after the most validation.
+**The migration is clean-cut**, not phased. Build the complete new system in isolation on this branch; validate exhaustively via soak tests against a faithful fake Google; observe for a week against real test-Google accounts; then cut over production via the existing "Cleanup & Pause" feature — which already produces a known-clean state every time it runs. This trades the phased-migration approach's complexity (dual-write, shadow ledger, gated cutover) for a much simpler implementation path. The transition is briefly visible (~5–15 minutes during which calendars look empty before the new system populates them from scratch), but the failure mode is "run cleanup-and-resync again," not data loss. About 30–50% less total work than a phased migration, and a cleaner end-state codebase with no legacy compatibility carryover.
 
 **Honest caveats:**
 - Some genuinely hard problems remain — Google's eventual-consistency lag, recurring-event semantics, ill-behaved external feeds. The new architecture isolates these to the ingest layer; it does not make them disappear.
-- The phased approach takes longer in calendar time than a big-bang rewrite would. We accept that because the cost of getting a calendar-sync rewrite wrong is high — real meetings, real consultancy hours.
-- A meaningful chunk of the work (Phase 1's soak-test harness) is investment in test infrastructure, not new product features. This is deliberate: today's test suite has 98% coverage and 171 passing tests but cannot see the bugs that hurt users. We will not ship the rewrite until tests can.
+- The clean-cut approach trades validation-against-production for simplicity. We rely on the soak harness plus a real-Google validation week to give us confidence; if the soak misses something subtle, it surfaces in production rather than in shadow mode. The compensating advantage is much less code and a faster timeline.
+- A meaningful chunk of the work (the soak-test harness) is investment in test infrastructure, not new product features. This is deliberate: today's test suite has 98% coverage and 171 passing tests but cannot see the bugs that hurt users. We will not ship the rewrite until tests can.
 
-The rest of this document is the engineering plan. §1–§3 describe goals and architecture. §4–§12 describe the new system in detail. §13 lays out the eight phases. §14 describes the test strategy including the soak-test harness. §15–§17 map every feature in the inventory to its new home and call out risks.
+The rest of this document is the engineering plan. §1–§3 describe goals and architecture. §4–§12 describe the new system in detail. §13 lays out the five clean-cut migration stages. §14 describes the test strategy including the soak-test harness. §15–§17 map every feature in the inventory to its new home and call out risks.
 
 ---
 
@@ -46,7 +46,7 @@ The rest of this document is the engineering plan. §1–§3 describe goals and 
 - Replace string-prefix and extended-property heuristics for "is this our event?" with a precise lookup.
 - Reduce reconciler logic from ~10 entangled files to a single planner + outbox drainer.
 - Make adding a new event source (Apple, Outlook, Notion, Linear) a 1-day task instead of a 1-week task.
-- **Remove service-account (sa_tier) mode.** Research showed it does not reliably deliver immovable events on the user's own calendar — calendar ownership trumps event-level `guestsCanModify=false`. The 🔒 emoji + revert-on-drift mechanism (already used for sa_tier=0, personal, webcal) becomes the uniform approach for non-editable events. Done as Phase 0 to simplify the rest of the work.
+- **Remove service-account (sa_tier) mode.** Research showed it does not reliably deliver immovable events on the user's own calendar — calendar ownership trumps event-level `guestsCanModify=false`. The 🔒 emoji + revert-on-drift mechanism (already used for sa_tier=0, personal, webcal) becomes the uniform approach for non-editable events. SA code is simply not carried over into the new system.
 
 ### Non-Goals (this rewrite)
 - No change to the user-visible UI or URL routes.
@@ -128,7 +128,7 @@ Recurring instances inherit the parent's canonical_uid prefix; a per-instance su
 
 ## 4. Schema
 
-### New tables (added in Phase 1, alongside existing)
+### New tables (created on the new branch)
 
 ```sql
 -- Canonical ledger: one row per logical event in the user's life.
@@ -268,7 +268,7 @@ CREATE TABLE reconcile_requests (
 );
 ```
 
-### Tables to retire (after Phase 6)
+### Tables to retire (at production cutover, Stage 5)
 - `event_mappings` — superseded by `ledger_events` + `ledger_projections`
 - `busy_blocks` — superseded by `ledger_projections` (target_kind='client', desired_state='present_busy')
 
@@ -534,7 +534,7 @@ Preserved as `derive_instance_event_id(parent_google_event_id, original_start_ti
 
 ## 9. Special Modes
 
-SA mode is gone (Phase 0). The remaining modes are:
+SA mode is not implemented in the new system. The remaining modes are:
 
 ### Projection rendering
 ```
@@ -562,7 +562,7 @@ So: source-client gets a "phantom projection" row of `target_kind='client', targ
 ### Edit-on-main when user can NOT edit (revert-on-drift)
 Detection path: ingest sees the Google event for a non-editable projection has start/end different from `ledger.start_at`/`end_at`. The planner's `desired_payload_hash` no longer matches what's on Google. The outbox enqueues an `update` to restore the ledger's authoritative state. **Same observable behaviour as today's `_revert_if_moved` for personal/webcal events, now uniformly applied to client-event copies on main as well.**
 
-This **fixes a silent bug in the current code:** today, non-editable client copies on main have *no* revert mechanism (the original author assumed SA mode handled it; SA mode actually doesn't). After Phase 0 the gap is closed.
+This **fixes a silent bug in the current code:** today, non-editable client copies on main have *no* revert mechanism (the original author assumed SA mode handled it; SA mode actually doesn't). The new system closes the gap by applying the revert mechanism uniformly to all non-editable events on all targets.
 
 ### user_intentionally_deleted
 When ingest detects the user deleted a synced event from main:
@@ -661,119 +661,115 @@ All today's failure handling is preserved or strengthened:
 
 ---
 
-## 13. Migration Plan (Phased, Reversible)
+## 13. Migration Plan (Clean-Cut)
 
-Each phase is a separate PR with observable rollback. Estimated total: **4.5–6.5 weeks** of focused work.
+The migration is a single coordinated cutover, not a phased one. Build the complete new system in isolation on this branch, validate exhaustively, then swap over production via the existing "Cleanup & Pause" feature.
 
-### Phase 0 — SA removal, missing-revert fix, recurring-cancellation patches (2–4 days)
-**Why first:** simplifies every subsequent phase by removing branching, *and* ships three real reliability fixes for current users immediately.
+**Why clean-cut fits this project:**
 
-**0.a — SA removal**
-- Reset `users.sa_tier=0` for all users.
-- Delete `app/auth/service_account.py` (~100 lines).
-- Delete the SA branches in `app/sync/rules.py`, `app/sync/engine.py`, `app/sync/consistency.py` (~150 lines).
-- Delete the SA admin endpoints in `app/api/admin.py` (`get_service_account_status`, `test_service_account_access`, `deactivate_service_account`) and their UI surfaces.
-- Delete OOBE Step 5 (Service Account upload) from `app/ui/setup.py`; OOBE is now 6 steps. Step 6→5, Step 7→6.
-- Delete `service_account_key_file` from `app/config.py` and `SERVICE_ACCOUNT_KEY_FILE` env var.
-- Delete `sa_tier` column reads from queries; column itself stays in the schema for one release cycle, then dropped (no migration needed — SQLite ignores unread columns).
-- Update README.md, SPEC.md, FEATURE_INVENTORY.md to remove SA references.
+- One user (you), so the coordination cost of "calendars look briefly empty during cutover" is small.
+- The "Cleanup & Pause" feature already exists and is well-tested: it deletes every BusyBridge-managed event from every calendar, clears sync tokens, and pauses sync. After it runs, the system is in a known-clean state by construction.
+- The new system is idempotent and self-recovering. Once it starts on a clean slate it converges to correct state without intervention.
+- The soak harness gives strong correctness confidence before any real-Google contact.
+- Skipping phased-migration scaffolding (dual-write, shadow ledger, flag-gated cutover) saves ~30–50% of total work, and the end-state codebase has no legacy compatibility carryover.
 
-**0.b — Missing-revert fix for non-editable client copies on main**
-- **Add `_revert_if_moved` for non-editable client-event copies on main.** Today's gap: `rules.py` has revert mechanisms for busy blocks on clients and personal/webcal blocks on main, but NONE for non-editable client copies on main. The original author assumed SA handled it; SA doesn't. Mirror the existing personal/webcal revert pattern.
-- Add specific test: "user moves non-editable client copy on main → BB reverts within sync cycle."
+The trade-off is concentrated risk at the cutover moment. We mitigate that with a faithful fake Google + extensive soak tests + a 7-day real-Google validation period before touching production.
 
-**0.c — Recurring-cancellation reliability patches** *(targets the user's reported "constant problem")*
+**Stages and order:**
 
-These three small patches relieve the recurring-cancellation pain *before* the full rewrite. The rewrite makes them obsolete-by-design, but they ship value in week 1.
+### Stage 1 — Test infrastructure (5–8 days)
 
-- **0.c.i — Retry queue for failed instance-cancellations.** Today, when an instance-delete fails (`rules.py:776, 800` and others), the failure is logged and forgotten. Add a `pending_instance_cancellations(user_id, target_calendar_id, target_event_id, original_start_time, attempts, last_attempt)` table. On every sync cycle, drain it with bounded retries. Closes the "ghost instance" failure mode where a single transient delete failure leaves a phantom busy block forever.
-- **0.c.ii — Replay cancellations after full sync.** Today, when a sync token expires and BusyBridge falls back to a full sync, Google's response does not include cancelled instances of recurring series. The system therefore has no signal to re-cancel them on busy blocks. After any full sync of a calendar, iterate every event_mapping for that calendar's series, call Google to list cancelled instances of each series, and queue cancellation operations for any that don't already match. Closes the "sync-token-expiry amnesia" failure mode.
-- **0.c.iii — Reliable re-cancellation after recurring busy-block recreation.** `_propagate_cancelled_instances` exists (`rules.py:461`) but is only called in two places and silently swallows failures. Make it (a) called after every recurring busy-block create or update, (b) feed failures into the retry queue from 0.c.i instead of swallowing them. Closes the "race-with-the-recurring-rewrite" failure mode.
+Build before any rewrite work begins. Without this we'd be developing the new system blind.
 
-**Tests for Phase 0:** existing suite plus four new tests — (1) revert on non-editable client copy moved on main, (2) ghost-instance retry on transient delete failure, (3) full-sync amnesia recovery, (4) cancelled-instance survival across recurring rewrite.
+- **Fake Google Calendar API** with faithful semantics: in-memory event store; client-supplied `id` parameter with conflict semantics; ETag support with `If-Match` (412 on mismatch); incremental sync tokens with realistic expiry; recurring-event instance derivation; the `_R` reschedule quirk; **specifically reproduce the bug that full-sync responses omit cancelled instances of recurring series** (this is the source of one of the recurring-cancellation problems and must be modelled).
+- **Simulated clock** (1 sim-day per real second; settable).
+- **Failure injection knobs**: configurable rate of network errors, rate limits, 5xx errors, sync-token expiry, process crashes between Google call and DB commit.
+- **Basic integration test infrastructure**: a small framework that lets us write tests of the shape "given calendar state X, run sequence Y, assert state Z" against the fake Google.
 
-**Rollback:** revert this PR. Pre-rewrite cleanup; minimal risk. SA users see no functional change (their non-editable events were probably already drag-movable; now they snap back). Recurring-cancellation behaviour can only improve.
+**Deliverable:** a test harness sufficient to validate ledger code as we build it. Lives under `tests/fakes/` and `tests/integration/`. The fake Google is also what the soak harness (Stage 3) sits on top of.
 
-### Phase 1 — Foundation & soak-test harness (11–17 days)
+### Stage 2 — Build the complete new system (20–30 days)
 
-Two parallel workstreams. The schema work is small; the test infrastructure is most of the time.
+Implement everything described in §3–§12 of this document. The old code is removed as new modules go in; no dual-write, no compatibility shims, no flag-gated cutover.
 
-**1.a — Schema foundation (1–2 days)**
-- Create new tables alongside existing schema (`ledger_events`, `ledger_projections`, `outbox_operations`, `reconcile_requests`).
-- Add `app/ledger/` module skeleton (no callers).
-- Schema migration up/down tests.
-- **Rollback:** drop the new tables. No behaviour change.
+**Scope (all naturally subsumed by the new architecture, no separate Phase-0-style patches needed):**
 
-**1.b — Soak-test harness (10–15 days)**
+- New tables: `ledger_events`, `ledger_projections`, `outbox_operations`, `reconcile_requests`.
+- The five ingest paths (client OAuth, main OAuth, personal OAuth, webcal/ICS, discovery/orphan-scan).
+- The reconciler (planner + diff + outbox drain).
+- Idempotency scheme (deterministic Google IDs, etag-gated updates).
+- Recurring-event handling (parent and instance ledger rows; cancellations as first-class sticky rows that survive sync-token expiry — closes today's recurring-cancellation pain).
+- Revert-on-drift for all non-editable events, uniform across sources (closes today's silent gap on non-editable client copies on main).
+- Cleanup, disconnect, and pause as ledger operations.
+- Per-user reconciler queue replacing per-calendar locks (closes today's concurrent-sync duplicate class).
+- Outbox drain worker.
+- All UI / API surfaces ported to read from the ledger.
+- Service-account mode is not implemented; `sa_tier` column is dropped. The 🔒 emoji + revert mechanism handles all non-editable events uniformly.
 
-This is the most under-appreciated investment in the rewrite. Today's test suite has 171 passing tests and 98% line coverage but **cannot see** concurrency bugs, race conditions, eventual-consistency violations, slow-drift duplicates, or recurring-cancellation regressions over long simulated periods. Without a soak harness, we cannot tell whether the new architecture actually delivers the reliability we claim it does. With one, we can prove it phase by phase.
+**Old code is deleted as we go.** `app/sync/engine.py`, `app/sync/rules.py`, `app/sync/consistency.py` all shrink dramatically; what remains is mostly pure payload-rendering helpers. `app/auth/service_account.py` is deleted. OOBE wizard goes from 7 steps to 6.
 
-Build the following before Phase 2 begins:
+**Tests during development:** every new component has unit tests; the fake Google enables full pipeline integration tests; a continuously-running mini-soak (90 simulated days) runs in CI to catch regressions as the system grows.
 
-- **Simulated clock** — replaces real time with a fake clock the test controls; 1 simulated day per real second. Every component that asks "what time is it?" (webhook debounce, periodic sync, retention cleanup, sync-token expiry, backup schedule) uses the simulated clock.
-- **Faithful fake Google Calendar API** — in-memory event store; supports incremental sync tokens with realistic expiry; supports ETags and If-Match preconditions (returns 412 on mismatch); configurable read-after-write lag; configurable rate-limit and 5xx injection; full recurring-event semantics including parent/instance derivation, cancelled-instance representation, and the `_R` suffix for "this-and-following" reschedules; specifically reproduces the Google quirk where full-sync responses omit cancelled instances.
-- **Failure injection knobs** — network errors at configurable rate (default 1%), rate limits (default 0.1%), 5xx errors (default 0.01%), sync-token expiry on a schedule (every simulated 30 days plus random), process crash between Google call and DB commit (low rate), calendar permission revocation (rare).
-- **Simulated user persona** — 1 main + 3 client + 1 personal + 2 webcal calendars; ~5 new events / sim day, ~1 edit, ~0.5 cancellation; 30% of events recurring weekly; 10% of those with monthly instance cancellations; 5% involve a "this-and-following" reschedule; occasional bursts (50 events in an hour); occasional adversarial patterns (event created-cancelled-recreated-moved within 30 sim minutes).
-- **Ground-truth oracle** — the harness maintains its own model of what events should exist where, updated as the simulated user takes actions. The oracle is the ledger of what *should* be true, independent of what BusyBridge thinks is true.
-- **Invariant checker** — runs after every reconciliation cycle. Asserts: for every active ledger event, projections exist on the expected calendars and only those; for every projection with current_state='present', the corresponding Google event exists; for every Google event with our extended properties, a corresponding projection exists (no orphans); no two projections share a Google event ID; no two ledger events share a canonical UID; full-detail-copy and busy-block counts match the oracle; outbox eventually drains; reconcile latency bounded; database size grows sub-linearly in event count.
-- **Targeted recurring-cancellation simulation** — generates 100 weekly recurring meetings, schedules cancellations at varied positions (near-future, mid-stream, post-`_R`-reschedule), forces sync-token expiry mid-stream, runs 365 simulated days, asserts after every cycle that no ghost instances exist on any client calendar. Today's system fails this within a simulated week.
-- **Reproducibility & shrinking** — every soak run takes a random seed; failed seeds saved and replayed for debugging; on a failure, the harness binary-searches for the minimal trace that triggers the bug.
-- **Output** — pass/fail; divergence time-series (invariant violations per tick, whether each self-healed or persisted); performance time-series (reconcile latency, ledger size, outbox throughput); scenario coverage report; minimal reproduction for any failure.
+### Stage 3 — Soak harness (5–7 days; can overlap end of Stage 2)
 
-The harness costs effort; in return every later phase can be validated against months of simulated load in minutes, including the specific scenarios that hurt today's system. We will not advance past any phase without the soak run going green.
+Build the heavyweight long-running validation layer on top of the Stage 1 fake Google.
 
-**Tests:** the harness itself has unit tests (fake Google API, oracle correctness). The harness runs on every CI build; release gates on a 90-sim-day clean run.
+- **Simulated user persona** with realistic event patterns (mix of single-instance, recurring weekly, recurring-with-cancellations, rescheduled series, manual edits, RSVP changes, calendar disconnect/reconnect).
+- **Ground-truth oracle**: the harness maintains its own model of what events should exist where, updated as the simulated user takes actions.
+- **Invariant checker** (the 11 assertions in §14).
+- **Targeted recurring-cancellation soak** (365 sim days; today's system would fail this in a week).
+- **Adversarial scenarios**: crash mid-write recovery, rapid back-and-forth edits, sync-token expiry races, calendar permission revocation.
+- **Reproducibility**: random seeds, automatic shrinking of failed traces, captured-failure regression tests.
 
-**Rollback:** the harness is additive; can be removed. The schema half rolls back by dropping tables.
+**Release gate to advance to Stage 4:** soak harness runs 90 simulated days on three different random seeds with full failure injection enabled, all invariants stay green throughout.
 
-### Phase 2 — Idempotent Google inserts (3–5 days)
-- Modify `app/sync/google_calendar.py:create_event` to accept an optional `id` parameter, passed through to Google.
-- Existing `rules.py` callers don't yet pass it; behaviour unchanged.
-- New helper `client_supplied_id_for(scope: str)` derives a deterministic ID from any scope (mapping_id today, projection_id later).
-- Tests: idempotency property tests against the fake Google client.
-- **Rollback:** revert this PR. No production impact.
+### Stage 4 — Real-Google validation (7 calendar days)
 
-### Phase 3 — Outbox shadowing (5–7 days)
-- Every Google write the existing engine performs is also recorded in `outbox_operations` (status=`done`, retroactive). This populates the outbox with a faithful history.
-- Add outbox drain worker, gated by `OUTBOX_DRAIN=false` env var (disabled in production).
-- Daily reconciliation job: ledger view of "what should be on Google" matches `event_mappings` view; alert on divergence.
-- Tests: shadow writes match real writes 1:1.
-- **Rollback:** stop populating outbox; drop new code paths.
+Deploy the new code to a development environment pointing at your test Google Workspace accounts. Run for one real week.
 
-### Phase 4 — Dual-write to ledger (5–7 days)
-- Every change to `event_mappings` is mirrored to `ledger_events`. Every change to `busy_blocks` is mirrored to `ledger_projections`.
-- Existing engine continues to be authoritative; ledger is shadow.
-- Daily diff job alerts on inconsistency.
-- Tests: ledger view stays equivalent to legacy view across full test suite.
-- **Rollback:** revert the mirror writes.
+- Create realistic event patterns by hand: recurring meetings with cancellations, rescheduled series, webcal subscriptions, manual edits on main, bursts of new events.
+- Observe convergence after each operation.
+- Specifically exercise the recurring-cancellation scenarios that hurt today.
+- Watch for any drift or unexpected behaviour.
 
-### Phase 5 — Cut over reads (3–5 days)
-- Read paths switch to ledger:
-  - Dashboard counts (`/api/sync/status`)
-  - Consistency check (`app/sync/consistency.py`)
-  - Orphan scan
-  - Retry-missing-busy-blocks logic
-- Old write path is still authoritative.
-- Tests: integration tests assert reads from ledger match reads from legacy.
-- **Rollback:** revert read paths to legacy.
+**Why this stage exists:** soak tests give confidence that the architecture is correct under simulated load. They cannot give confidence that the fake Google is fully faithful to real Google. Real Google has quirks (delivery timing, webhook semantics, eventual consistency exact behaviour) that we won't anticipate. One week of real-world use against test accounts surfaces any gap before it hits production.
 
-### Phase 6 — Cut over writes (5–7 days)
-- New reconciler becomes authoritative.
-- Webhooks and the periodic timer enqueue `reconcile_requests` instead of calling the old sync paths.
-- Outbox drain is enabled (`OUTBOX_DRAIN=true`).
-- `app/sync/rules.py` shrinks to pure payload-renderer functions; its DB-mutation paths are deleted.
-- `_sync_client_calendar`, `_sync_main_calendar`, `_sync_personal_calendar`, `trigger_sync_for_*` are deleted.
-- Per-calendar locks deleted (replaced by per-user reconciler).
-- Verification re-fetch deleted (replaced by etag-gated updates).
-- Tests: full end-to-end suite passes; concurrency tests pass.
-- **Rollback:** revert this PR. The previous phase remains running. This is the biggest cutover; we'll bake at least 7 days in production behind a flag before deleting old code.
+**Release gate to advance to Stage 5:** 7 days with zero unresolved divergences between observed state and expected state.
 
-### Phase 7 — Cleanup (2–3 days)
-- After 30 days of stable production, remove dual-write.
-- After 60 days, drop `event_mappings` and `busy_blocks` tables (post-retention).
-- Drop `users.sa_tier` column.
-- Update README, ANALYSIS.md, SPEC.md.
-- **Rollback:** N/A (bake period proves stability).
+### Stage 5 — Production cutover (1 day)
+
+Choose a quiet time (weekend morning is ideal).
+
+1. **Take a careful backup** of the production database and encryption key, copied off-server (procedure described in deployment guide).
+2. **On production, run "Cleanup & Pause"** from the admin UI. Every BusyBridge-managed event is deleted from every calendar; sync tokens are cleared; sync is paused. The system is now in a known-clean state.
+3. **Stop the container.**
+4. **Git fetch and checkout the new branch.** Schema migration runs automatically on next startup (additive only — new tables created, existing tables untouched).
+5. **Start the container** with the new code. Watch logs for clean startup.
+6. **Resume sync** from the admin UI. The new system populates from scratch — every calendar's events are re-ingested, every projection is computed, every busy block is created idempotently.
+7. **Observe for the first few hours.** Run a manual sync, check the activity feed, verify no errors accumulate.
+
+**Total downtime visible to free/busy consumers:** ~5–15 minutes between cleanup and the new system catching up. Schedule for a low-traffic window.
+
+**Rollback procedure** (in case anything goes catastrophically wrong post-cutover):
+
+1. Stop container.
+2. `git checkout` the previous main branch.
+3. Restore production database from the pre-cutover backup.
+4. Restart container.
+5. Run "Cleanup & Pause" again, then resume sync. Old code re-populates from scratch.
+
+The "Cleanup & Resync" effect is recoverable. The data is recoverable from backup. Worst case: spend a Saturday morning recovering. No permanent damage possible.
+
+### What is NOT in scope for the rewrite
+
+For completeness, what's deliberately deferred to follow-up work:
+
+- OAuth scope reduction (from full `calendar` to `calendar.events` where possible).
+- Multi-organization support.
+- Migration from SQLite to a server database.
+- Horizontal scaling beyond single-Docker-container.
+- Apple/Outlook/Notion calendar sources (the architecture supports them; we just don't build them now).
+
 
 ---
 
@@ -815,7 +811,7 @@ These catch the race conditions that produce most current duplicates. Tests asse
 
 ### Layer 5 — Soak tests (the hardest class, the most valuable)
 
-This layer is what catches the bugs the user currently lives with: slow drift, accumulating ghosts, sync-token-expiry effects, memory leaks, compounding failures, and the recurring-cancellation regressions that need *time* to manifest. The harness is described in detail in Phase 1.b; this section summarises the contract.
+This layer is what catches the bugs the user currently lives with: slow drift, accumulating ghosts, sync-token-expiry effects, memory leaks, compounding failures, and the recurring-cancellation regressions that need *time* to manifest. The harness is described in detail in Stage 3 (§13); this section summarises the contract.
 
 **What soak tests check that lower layers cannot:**
 
@@ -843,12 +839,12 @@ This layer is what catches the bugs the user currently lives with: slow drift, a
 Generate 100 weekly recurring meetings. Schedule cancellations at varied positions: some on the next instance, some mid-series, some after a `_R` reschedule has moved the parent. Force sync-token expiry partway through. Run 365 simulated days. Assert after every cycle that no ghost instances exist on any client calendar. Today's system fails this within a simulated week; the goal post-rewrite is zero failures across all seeds.
 
 **Release gates:**
-- No phase advances without a green 90-simulated-day run.
-- Phase 6 (write cutover) requires a green 365-simulated-day run with all failure injection enabled.
+- No stage advances without a green 90-simulated-day run.
+- Stage 4 (real-Google validation) requires a green 365-simulated-day run with all failure injection enabled.
 - A failed soak seed is automatically saved as a regression test and added to CI permanently.
 
 ### Existing tests
-All 171 existing tests (`tests/`, `e2e/`, `sidecar/tests/`) must continue to pass through every phase. Phase 6 may require updating tests that mock the old sync internals; their behaviour assertions stay the same.
+The current test suite (`tests/`, `e2e/`, `sidecar/tests/`) depends heavily on internals (`event_mappings`, `busy_blocks`, the old engine functions). Since the new system replaces these wholesale, the test suite is also replaced — old tests are deleted alongside the old code. The new test suite (built in Stage 1) covers the new system's behaviour, with the soak harness providing the long-running validation that the old suite couldn't.
 
 ---
 
@@ -858,20 +854,20 @@ For each category in [`FEATURE_INVENTORY.md`](./FEATURE_INVENTORY.md), where the
 
 | Inventory Category | Where in new system | Notes |
 |---|---|---|
-| 1. OAuth & Accounts | Unchanged for OAuth/sessions/OOBE. **SA mode REMOVED in Phase 0** (was unreliable; see §9). OOBE goes from 7 to 6 steps. | Ledger doesn't affect login flows or factory reset. |
+| 1. OAuth & Accounts | Unchanged for OAuth/sessions/OOBE. **SA mode not carried over** (was unreliable; see §9). OOBE goes from 7 to 6 steps. | Ledger doesn't affect login flows or factory reset. |
 | 2. Calendar Connections | Unchanged at the API layer; storage tables (`client_calendars`, `webcal_subscriptions`) unchanged. | Disconnect implemented as ledger op (§10). |
-| 3. Sync Behaviours | New: §5 ingest + §6 planner + §6 outbox drain. Replaces `app/sync/rules.py`. | All specific rules (busy block creation, RSVP, edit rights, recurring, etc.) preserved as planner logic + payload renderers. **SA-mode immovability replaced by uniform 🔒+revert (Phase 0).** See §8, §9, §10. |
+| 3. Sync Behaviours | New: §5 ingest + §6 planner + §6 outbox drain. Replaces `app/sync/rules.py`. | All specific rules (busy block creation, RSVP, edit rights, recurring, etc.) preserved as planner logic + payload renderers. **SA-mode immovability replaced by uniform 🔒+revert.** See §8, §9, §10. |
 | 4. Triggers | New: §11. `reconcile_requests` table. | Debounce/settling delays preserved. Verification re-fetch retired (§11) — its purpose is met by etag-gated updates. |
 | 5. Background Jobs | Schedule unchanged. Periodic sync internals replaced. | `app/jobs/scheduler.py` unchanged. Job bodies migrate to enqueuing reconcile_requests. |
 | 6. Failure Handling | §12. Strengthened. | Sync-token-preservation is stronger; poison-pill is new. |
-| 7. Admin Features | Unchanged except **SA admin endpoints REMOVED in Phase 0** (`/api/admin/service-account` etc.). | `app/api/admin.py` shrinks slightly. Cleanup operations are ledger ops (§10) but the API surface is otherwise identical. |
-| 8. UI Surfaces | Unchanged. Counts read from ledger after Phase 5. | Dashboard, settings, exports — no user-visible change other than OOBE losing Step 5. |
-| 9. API Surface | Unchanged except SA endpoints (Phase 0). | All other endpoints preserved. |
-| 10. Data Lifecycle & Retention | Unchanged. Retention rules apply to `ledger_events` instead of `event_mappings` (same fields). | `app/jobs/cleanup.py` updated in Phase 6. |
+| 7. Admin Features | Unchanged except **SA admin endpoints removed** (`/api/admin/service-account` etc.). | `app/api/admin.py` shrinks slightly. Cleanup operations are ledger ops (§10) but the API surface is otherwise identical. |
+| 8. UI Surfaces | Unchanged. Counts read from the new ledger after cutover. | Dashboard, settings, exports — no user-visible change other than OOBE losing Step 5. |
+| 9. API Surface | Unchanged except SA endpoints (removed). | All other endpoints preserved. |
+| 10. Data Lifecycle & Retention | Unchanged. Retention rules apply to `ledger_events` instead of `event_mappings` (same fields). | `app/jobs/cleanup.py` rewritten in Stage 2. |
 | 11. Security Controls | Unchanged. | Webhook auth, rate limits, SSRF, encryption — all untouched. |
 | 12. Email Alerts | Unchanged. New alert type added: `event_sync_poison_pill`. | Otherwise identical. |
 | 13. Backup & Export | Unchanged. New tables included in backup. ICS export reads from ledger. | Same retention. |
-| 14. Edge Cases | All preserved. See §8 (recurring), §9 (modes), §10 (cleanup). **SA-fallback edge cases removed in Phase 0.** Webcal-rename-creates-duplicate is fixed (§5.4). Concurrent-sync-creates-duplicate is fixed structurally. |
+| 14. Edge Cases | All preserved. See §8 (recurring), §9 (modes), §10 (cleanup). **SA-fallback edge cases gone.** Webcal-rename-creates-duplicate is fixed (§5.4). Concurrent-sync-creates-duplicate is fixed structurally. Recurring-cancellation amnesia fixed by sticky cancellation ledger rows. |
 
 ---
 
@@ -881,7 +877,7 @@ Behaviours that need explicit verification, with mitigation plan:
 
 1. **40-second verification re-fetch** — retired in favour of etag-gated updates. **Risk:** if Google's eventual-consistency lag exceeds what etag-gating handles, we'd see no observable issue (writes are idempotent), but might delay convergence. **Mitigation:** keep a low-frequency re-reconcile after webhooks (e.g., one extra ingest 60s later). Trivial to add.
 
-2. **Lock emoji + revert (uniform after Phase 0)** — mechanism changes from "compare DB to Google" to "compare ledger.applied_payload_hash to Google etag." **Risk:** edge case where user moves event multiple times in rapid succession could trigger ping-pong. **Mitigation:** the etag check + idempotent operation makes this provably converge. Add a specific concurrency test. **NEW in Phase 0:** also applies to non-editable client copies on main, fixing today's silent gap.
+2. **Lock emoji + revert (uniform in new system)** — mechanism changes from "compare DB to Google" to "compare ledger.applied_payload_hash to Google etag." **Risk:** edge case where user moves event multiple times in rapid succession could trigger ping-pong. **Mitigation:** the etag check + idempotent operation makes this provably converge. Add a specific concurrency test. **NEW behaviour:** uniform across non-editable client copies on main, personal, webcal, and busy blocks on clients, fixing today's silent gap on non-editable client copies on main.
 
 3. **String-prefix `_event_has_managed_prefix` heuristic** — replaced by precise lookup in projections. **Risk:** legacy events created on a previous system version might lack `bb_proj_id`. **Mitigation:** orphan scan keeps prefix-matching as a secondary criterion for the first 30 days post-cutover; we re-link rather than delete.
 
@@ -910,17 +906,30 @@ Behaviours that need explicit verification, with mitigation plan:
 
 **Almost zero observable changes for normal operation.** Same UI, same URLs, same API, same email alerts, same backups.
 
-**Phase 0 (SA removal) — minor visible changes:**
-- **OOBE wizard goes from 7 steps to 6.** Step 5 (Service Account) is gone; Step 6 (Encryption Key) becomes Step 5; Step 7 (Complete) becomes Step 6. The wizard already worked when users skipped Step 5; this just removes the option.
-- **Existing sa_tier=2 users:** their `sa_tier` column is reset to 0. Existing SA-organized events stay where they are (we don't rewrite them). New/updated non-editable events use the lock-emoji + revert mechanism (which is what sa_tier=0 already used). Net effect: events that were "natively immovable" (or appeared so) become "snap back if moved" — same correctness, slightly different UX.
-- **Non-editable client-event copies on main now revert if moved.** This is a *fix*, not a regression — today's code silently lets these drift.
-- **The `service-account` admin page disappears.** SMTP, alerts, factory reset all stay.
+### One brief observable transition at cutover (~5–15 minutes)
 
-**Phase 1–7 — visible improvements:**
-- Fewer duplicate events.
-- Fewer missing busy blocks.
-- Faster post-edit convergence (etag-gated updates avoid the 40s verification window).
-- A single bad event no longer freezes a calendar's sync.
+When the cutover happens (Stage 5):
+- You run "Cleanup & Pause" from the admin UI. All BusyBridge-managed events disappear from all calendars (busy blocks on clients, synced copies on main).
+- The old container stops; the new container starts on the new code.
+- You resume sync. The new system populates from scratch.
+- During this window (typically 5–15 minutes depending on calendar count and event count), anyone with free/busy access to your calendar sees you as fully free. As the new system catches up, events re-populate.
+
+Schedule for a quiet time (weekend morning is ideal). The downtime window is recoverable from backup; no permanent data loss possible.
+
+### Post-cutover differences
+
+**Removed features** (gone forever, not coming back):
+- Service account mode (was unreliable; see §9). Existing SA-organized events are cleaned up at cutover.
+- OOBE Step 5 (Service Account upload). Wizard goes from 7 steps to 6.
+- `/api/admin/service-account` endpoints and the SA admin page.
+
+**Added behaviours** (improvements):
+- **Non-editable events on your main calendar revert if moved.** Today's code has a silent gap here; the new system closes it.
+- **Cancelled instances of recurring meetings reliably stay deleted.** This is the area you flagged as a constant problem. The new architecture (sticky cancellation ledger rows + outbox retry of failed instance-deletes + reliable re-cancellation after recurring rewrites) makes this structurally correct.
+- **Fewer duplicate events** (idempotent inserts + single per-user reconciler).
+- **Fewer missing busy blocks** (sync token only advances after every projection is queued in the outbox).
+- **Faster post-edit convergence** (etag-gated updates avoid today's 40-second verification window; eliminates the "verification overwrites fresher data" bug).
+- **A single bad event no longer freezes a calendar.** Today, a poison-pill event blocks sync token advancement indefinitely. New system flags per-projection failure and advances past it with an admin alert.
 
 **One new admin-visible alert type:** `event_sync_poison_pill` — fires when a specific event has failed sync 5 times. Tells the admin the event needs manual review.
 
@@ -930,7 +939,7 @@ Behaviours that need explicit verification, with mitigation plan:
 
 Before I start coding, please confirm or steer:
 
-1. **Length of bake period at Phase 6 cutover:** I propose 7 days behind a feature flag with old code still present. Acceptable, or longer?
+1. **Length of real-Google validation period (Stage 4):** I propose 7 calendar days against test accounts before production cutover. Acceptable, or longer? (Already answered earlier: 14 days is the conservative choice.)
 2. **Outbox concurrency model:** I'm proposing one drain coroutine per active user. With ~50 users this is fine; if you expect 1000+ users we'd want a worker pool. What's the upper bound?
 3. **Webcal canonical UID for unstable feeds:** today's hash uses `(summary, start, end)`. I'm proposing `(start, end, normalized_summary)` *only when summary stays the same*, to avoid the rename-creates-duplicate bug. Is it acceptable that an event's title changing AND its time changing simultaneously creates a new ledger row? (Same behaviour as today, but worth flagging.)
 4. **Schema-level cascade deletes:** I have `ON DELETE CASCADE` on `ledger_events → ledger_projections` and `ledger_projections → outbox_operations`. This means a force-delete of a ledger row drops outbox without writing the deletion to Google. We should never force-delete in the new model — `status='cancelled'` is the correct path. Want to add a DB trigger to refuse `DELETE FROM ledger_events`? I lean yes.
@@ -941,23 +950,20 @@ Before I start coding, please confirm or steer:
 
 ## 19. Estimated Effort
 
-| Phase | Effort | Risk | What it ships |
-|---|---|---|---|
-| 0. SA removal + revert fix + recurring-cancel patches | 2–4 days | Low | Real bug fixes; immediate user relief |
-| 1. Foundation + soak-test harness | 11–17 days | Low | Test infrastructure for all later phases |
-| 2. Idempotent inserts | 3–5 days | Low | Closes retry-duplicate class today |
-| 3. Outbox shadowing | 5–7 days | Low | Validates new bookkeeping against reality |
-| 4. Dual-write ledger | 5–7 days | Medium | Ledger becomes consistent shadow |
-| 5. Cut over reads | 3–5 days | Medium | Read paths use ledger; old writes still authoritative |
-| 6. Cut over writes | 5–7 days | High | The actual architectural swap |
-| 7. Cleanup | 2–3 days | Low | Remove parallel structures |
-| **Total** | **36–55 days (7–11 weeks)** | | |
+| Stage | Effort | Calendar time | Risk | What it produces |
+|---|---|---|---|---|
+| 1. Test infrastructure (fake Google + clock) | 5–8 days | 1–2 weeks | Low | Foundation for integration & soak tests |
+| 2. Complete new system | 20–30 days | 4–6 weeks | Medium | The rewrite itself, validated via integration tests as it grows |
+| 3. Soak harness (overlaps end of Stage 2) | 5–7 days | (included) | Low | 365-sim-day adversarial validation |
+| 4. Real-Google validation | passive observation | 1–2 weeks | Medium | Evidence the architecture works against real Google quirks |
+| 5. Production cutover | 1 day | 1 day | High (concentrated) | Live on new system |
+| **Total** | **31–46 days work** | **7–10 calendar weeks** | | |
 
-Bake periods between phases (especially after Phase 4 and Phase 6) add another 2–3 weeks of calendar time. Expect **9–14 weeks calendar time** for the full migration.
+**Significantly less work than the phased migration originally proposed** (which was 36–55 days work and 9–14 calendar weeks). The savings come from skipping dual-write, shadow ledger, and gated cutover scaffolding.
 
-**The harness in Phase 1.b is the biggest single line item and the most valuable.** Without it, we cannot prove the rewrite delivers the reliability it claims to. With it, every later phase ships with empirical evidence — not just code review — that it converges correctly under adversarial conditions. It also persists as a regression safety net long after the rewrite ends.
+**The soak harness in Stage 3 is the most underappreciated investment.** Without it we cannot prove the rewrite delivers the reliability it claims. With it, we can validate against months of simulated adversarial load before any real-Google contact. It also persists as a permanent regression safety net.
 
-**Phase 0 is independently valuable.** Even if you decided to stop after Phase 0, you would get: SA mode removed (less complexity), the missing-revert bug fixed, and three targeted patches that should meaningfully reduce your reported recurring-cancellation pain. Phase 0 alone takes one engineer one week.
+**Stage 4 is what makes clean-cut safe.** The soak harness validates that the architecture is correct under simulated load; the real-Google week validates that our fake Google is faithful enough to catch real-world quirks. Both are needed; neither substitutes for the other.
 
 ---
 
@@ -966,6 +972,6 @@ Bake periods between phases (especially after Phase 4 and Phase 6) add another 2
 This plan is ready for review. Specifically asking for:
 - Confirmation that no inventory item is missed (or call out which).
 - Direction on the open questions in §18.
-- Approval to begin Phase 0 (SA removal).
+- Approval to begin Stage 1 (test infrastructure: fake Google + clock + integration test framework).
 
 No code changes have been made.
