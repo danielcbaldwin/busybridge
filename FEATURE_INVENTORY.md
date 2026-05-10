@@ -851,6 +851,10 @@ The following capabilities are **removed** as part of REWRITE_PLAN.md Phase 0 an
 - [ ] Main copy instance cancelled
 - [ ] Busy block instances cancelled
 - [ ] Parent series remains intact
+- [ ] **NEW (Phase 0.c.i):** Failed instance-cancellation API calls are queued in a retry table and re-attempted on each sync cycle until they succeed or hit a bounded retry limit
+- [ ] **NEW (Phase 0.c.ii):** After a full sync (sync token expired), cancellation state for known-cancelled instances is replayed onto busy blocks — Google's full-sync response does not include cancelled-instance markers, so the system must remember
+- [ ] **NEW (Phase 0.c.iii):** After recreating a recurring busy block (e.g. because the series time changed), all previously-cancelled instances of the source series are re-cancelled on the new busy block — `_propagate_cancelled_instances` is called reliably with retry-on-failure
+- [ ] **NEW (post-rewrite):** Soak-test invariant — across 365 simulated days with periodic sync-token expiry, cancelled instances never resurrect on any client busy block
 
 ### Service Account Fallback
 **REMOVED in Phase 0** — see top of this file. There is no SA mode after Phase 0, so no fallback.

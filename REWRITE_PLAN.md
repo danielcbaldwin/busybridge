@@ -1,9 +1,38 @@
 # BusyBridge Rewrite Plan: Canonical Ledger Architecture
 
-> **Status:** Draft for review — no code changes yet.
+> **Status:** Draft for review — no architectural code changes yet.
 > **Branch:** `claude/improve-reliability-hKbKZ`
-> **Companion document:** [`FEATURE_INVENTORY.md`](./FEATURE_INVENTORY.md) — 350+ item acceptance checklist.
+> **Companion document:** [`FEATURE_INVENTORY.md`](./FEATURE_INVENTORY.md) — ~330 item acceptance checklist.
 > **Hard requirement:** zero feature loss. Every checkbox in the inventory must work identically (or better) post-rewrite.
+
+---
+
+## Executive Summary
+
+Calendar synchronization is, at heart, a problem about *who has the authority to say what is true.*
+
+**Today**, BusyBridge functions like a translator at a meeting where everyone is talking at once. Each calendar — your main one, your client calendars, your personal Gmail, any conference subscriptions — has its own ongoing record of "what's happening to you." BusyBridge listens to all of these conversations simultaneously and tries to keep them informed about each other. There is no umpire. There is no single authority that can say, definitively, "this is what is on your schedule."
+
+The result is a confederation of equal calendars with no federal record-keeper. When two calendars disagree, there is no higher authority to resolve it. Duplicate events happen because two listening processes can hear the same change and both act. Missing events happen because a process can complete its "read what changed" step before successfully writing all the consequences. Reliability mechanisms patched on top (per-calendar locks, hourly consistency checks, orphan scans, verification re-fetches) cannot fix this; the architecture is the problem.
+
+**The rewrite introduces a registrar.** BusyBridge becomes the central, authoritative record of your schedule. Inside its database lives one canonical entry per event (the *ledger*), regardless of which calendar originated it. Each Google calendar — including your main one — becomes a *view* of that record, not a participant in deciding what's true. The relationship is one-way: changes flow into the record first, then the record is rendered out to the views.
+
+Three structural properties make this fix reliability across the board, not just patch over symptoms:
+
+1. **Single point of truth.** "What should be on your calendar?" becomes a single database query with a single answer. Any divergence from that answer is wrong by definition. Detection and correction become mechanical rather than heuristic.
+2. **Deterministic operation identities.** Every instruction sent to Google carries a unique fingerprint we choose ourselves. If the same instruction goes to Google twice (network retry, process restart, anything), Google recognises the fingerprint and refuses the second attempt. Duplicates from retries become structurally impossible.
+3. **One author at a time per user.** Today's three concurrent sync paths (webhook, periodic, verification re-fetch) feed into a single queue per user, drained by one worker in order. Two reconciliations cannot be in flight at the same time for the same person. The race conditions that produce most current duplicates become impossible.
+
+These compose: each closes a different class of bug; together they make today's main failure modes structurally impossible rather than merely mitigated.
+
+**The migration is phased**, not all-at-once. Eight phases over 6.5–10 weeks of calendar time, each with a one-commit rollback. Most phases run as parallel shadows of the existing system before becoming load-bearing, so by the time the new system is authoritative we have months of data showing it's correct. The hardest phase (the actual write cutover) comes sixth, after the most validation.
+
+**Honest caveats:**
+- Some genuinely hard problems remain — Google's eventual-consistency lag, recurring-event semantics, ill-behaved external feeds. The new architecture isolates these to the ingest layer; it does not make them disappear.
+- The phased approach takes longer in calendar time than a big-bang rewrite would. We accept that because the cost of getting a calendar-sync rewrite wrong is high — real meetings, real consultancy hours.
+- A meaningful chunk of the work (Phase 1's soak-test harness) is investment in test infrastructure, not new product features. This is deliberate: today's test suite has 98% coverage and 171 passing tests but cannot see the bugs that hurt users. We will not ship the rewrite until tests can.
+
+The rest of this document is the engineering plan. §1–§3 describe goals and architecture. §4–§12 describe the new system in detail. §13 lays out the eight phases. §14 describes the test strategy including the soak-test harness. §15–§17 map every feature in the inventory to its new home and call out risks.
 
 ---
 
@@ -636,9 +665,10 @@ All today's failure handling is preserved or strengthened:
 
 Each phase is a separate PR with observable rollback. Estimated total: **4.5–6.5 weeks** of focused work.
 
-### Phase 0 — SA removal & missing-revert fix (1–2 days)
-**Why first:** simplifies every subsequent phase by removing branching, and ships a real reliability fix for current users immediately.
+### Phase 0 — SA removal, missing-revert fix, recurring-cancellation patches (2–4 days)
+**Why first:** simplifies every subsequent phase by removing branching, *and* ships three real reliability fixes for current users immediately.
 
+**0.a — SA removal**
 - Reset `users.sa_tier=0` for all users.
 - Delete `app/auth/service_account.py` (~100 lines).
 - Delete the SA branches in `app/sync/rules.py`, `app/sync/engine.py`, `app/sync/consistency.py` (~150 lines).
@@ -646,16 +676,55 @@ Each phase is a separate PR with observable rollback. Estimated total: **4.5–6
 - Delete OOBE Step 5 (Service Account upload) from `app/ui/setup.py`; OOBE is now 6 steps. Step 6→5, Step 7→6.
 - Delete `service_account_key_file` from `app/config.py` and `SERVICE_ACCOUNT_KEY_FILE` env var.
 - Delete `sa_tier` column reads from queries; column itself stays in the schema for one release cycle, then dropped (no migration needed — SQLite ignores unread columns).
-- **Add `_revert_if_moved` for non-editable client-event copies on main.** Today's gap: `rules.py` has revert mechanisms for busy blocks on clients and personal/webcal blocks on main, but NONE for non-editable client copies on main. The original author assumed SA handled it; SA doesn't. Mirror the existing personal/webcal revert pattern.
 - Update README.md, SPEC.md, FEATURE_INVENTORY.md to remove SA references.
-- Tests: existing suite continues to pass. Add specific test for "user moves non-editable client copy on main → BB reverts within sync cycle."
-- **Rollback:** revert this PR. Pre-rewrite cleanup; minimal risk. SA users see no functional change (their non-editable events were probably already drag-movable; now they snap back).
 
-### Phase 1 — Foundation (1–2 days)
+**0.b — Missing-revert fix for non-editable client copies on main**
+- **Add `_revert_if_moved` for non-editable client-event copies on main.** Today's gap: `rules.py` has revert mechanisms for busy blocks on clients and personal/webcal blocks on main, but NONE for non-editable client copies on main. The original author assumed SA handled it; SA doesn't. Mirror the existing personal/webcal revert pattern.
+- Add specific test: "user moves non-editable client copy on main → BB reverts within sync cycle."
+
+**0.c — Recurring-cancellation reliability patches** *(targets the user's reported "constant problem")*
+
+These three small patches relieve the recurring-cancellation pain *before* the full rewrite. The rewrite makes them obsolete-by-design, but they ship value in week 1.
+
+- **0.c.i — Retry queue for failed instance-cancellations.** Today, when an instance-delete fails (`rules.py:776, 800` and others), the failure is logged and forgotten. Add a `pending_instance_cancellations(user_id, target_calendar_id, target_event_id, original_start_time, attempts, last_attempt)` table. On every sync cycle, drain it with bounded retries. Closes the "ghost instance" failure mode where a single transient delete failure leaves a phantom busy block forever.
+- **0.c.ii — Replay cancellations after full sync.** Today, when a sync token expires and BusyBridge falls back to a full sync, Google's response does not include cancelled instances of recurring series. The system therefore has no signal to re-cancel them on busy blocks. After any full sync of a calendar, iterate every event_mapping for that calendar's series, call Google to list cancelled instances of each series, and queue cancellation operations for any that don't already match. Closes the "sync-token-expiry amnesia" failure mode.
+- **0.c.iii — Reliable re-cancellation after recurring busy-block recreation.** `_propagate_cancelled_instances` exists (`rules.py:461`) but is only called in two places and silently swallows failures. Make it (a) called after every recurring busy-block create or update, (b) feed failures into the retry queue from 0.c.i instead of swallowing them. Closes the "race-with-the-recurring-rewrite" failure mode.
+
+**Tests for Phase 0:** existing suite plus four new tests — (1) revert on non-editable client copy moved on main, (2) ghost-instance retry on transient delete failure, (3) full-sync amnesia recovery, (4) cancelled-instance survival across recurring rewrite.
+
+**Rollback:** revert this PR. Pre-rewrite cleanup; minimal risk. SA users see no functional change (their non-editable events were probably already drag-movable; now they snap back). Recurring-cancellation behaviour can only improve.
+
+### Phase 1 — Foundation & soak-test harness (11–17 days)
+
+Two parallel workstreams. The schema work is small; the test infrastructure is most of the time.
+
+**1.a — Schema foundation (1–2 days)**
 - Create new tables alongside existing schema (`ledger_events`, `ledger_projections`, `outbox_operations`, `reconcile_requests`).
 - Add `app/ledger/` module skeleton (no callers).
-- Tests: schema migration up/down.
+- Schema migration up/down tests.
 - **Rollback:** drop the new tables. No behaviour change.
+
+**1.b — Soak-test harness (10–15 days)**
+
+This is the most under-appreciated investment in the rewrite. Today's test suite has 171 passing tests and 98% line coverage but **cannot see** concurrency bugs, race conditions, eventual-consistency violations, slow-drift duplicates, or recurring-cancellation regressions over long simulated periods. Without a soak harness, we cannot tell whether the new architecture actually delivers the reliability we claim it does. With one, we can prove it phase by phase.
+
+Build the following before Phase 2 begins:
+
+- **Simulated clock** — replaces real time with a fake clock the test controls; 1 simulated day per real second. Every component that asks "what time is it?" (webhook debounce, periodic sync, retention cleanup, sync-token expiry, backup schedule) uses the simulated clock.
+- **Faithful fake Google Calendar API** — in-memory event store; supports incremental sync tokens with realistic expiry; supports ETags and If-Match preconditions (returns 412 on mismatch); configurable read-after-write lag; configurable rate-limit and 5xx injection; full recurring-event semantics including parent/instance derivation, cancelled-instance representation, and the `_R` suffix for "this-and-following" reschedules; specifically reproduces the Google quirk where full-sync responses omit cancelled instances.
+- **Failure injection knobs** — network errors at configurable rate (default 1%), rate limits (default 0.1%), 5xx errors (default 0.01%), sync-token expiry on a schedule (every simulated 30 days plus random), process crash between Google call and DB commit (low rate), calendar permission revocation (rare).
+- **Simulated user persona** — 1 main + 3 client + 1 personal + 2 webcal calendars; ~5 new events / sim day, ~1 edit, ~0.5 cancellation; 30% of events recurring weekly; 10% of those with monthly instance cancellations; 5% involve a "this-and-following" reschedule; occasional bursts (50 events in an hour); occasional adversarial patterns (event created-cancelled-recreated-moved within 30 sim minutes).
+- **Ground-truth oracle** — the harness maintains its own model of what events should exist where, updated as the simulated user takes actions. The oracle is the ledger of what *should* be true, independent of what BusyBridge thinks is true.
+- **Invariant checker** — runs after every reconciliation cycle. Asserts: for every active ledger event, projections exist on the expected calendars and only those; for every projection with current_state='present', the corresponding Google event exists; for every Google event with our extended properties, a corresponding projection exists (no orphans); no two projections share a Google event ID; no two ledger events share a canonical UID; full-detail-copy and busy-block counts match the oracle; outbox eventually drains; reconcile latency bounded; database size grows sub-linearly in event count.
+- **Targeted recurring-cancellation simulation** — generates 100 weekly recurring meetings, schedules cancellations at varied positions (near-future, mid-stream, post-`_R`-reschedule), forces sync-token expiry mid-stream, runs 365 simulated days, asserts after every cycle that no ghost instances exist on any client calendar. Today's system fails this within a simulated week.
+- **Reproducibility & shrinking** — every soak run takes a random seed; failed seeds saved and replayed for debugging; on a failure, the harness binary-searches for the minimal trace that triggers the bug.
+- **Output** — pass/fail; divergence time-series (invariant violations per tick, whether each self-healed or persisted); performance time-series (reconcile latency, ledger size, outbox throughput); scenario coverage report; minimal reproduction for any failure.
+
+The harness costs effort; in return every later phase can be validated against months of simulated load in minutes, including the specific scenarios that hurt today's system. We will not advance past any phase without the soak run going green.
+
+**Tests:** the harness itself has unit tests (fake Google API, oracle correctness). The harness runs on every CI build; release gates on a 90-sim-day clean run.
+
+**Rollback:** the harness is additive; can be removed. The schema half rolls back by dropping tables.
 
 ### Phase 2 — Idempotent Google inserts (3–5 days)
 - Modify `app/sync/google_calendar.py:create_event` to accept an optional `id` parameter, passed through to Google.
@@ -712,39 +781,71 @@ Each phase is a separate PR with observable rollback. Estimated total: **4.5–6
 
 The current test suite has 171 passing tests at 98% line coverage but ANALYSIS.md correctly notes the suite can't see concurrency, can't see what was actually written to Google, and never runs the full pipeline end-to-end. The rewrite ships with new test infrastructure first.
 
-### New test fakes (Phase 1)
+A system like this cannot be tested with unit tests alone. The bugs that hurt users aren't local — they're emergent properties of three concurrent processes interacting with an eventually-consistent external service. The strategy is **five layers**, each catching a class of failure the others cannot:
 
-1. **`tests/fakes/google_calendar.py`** — fake Google API
-   - In-memory store keyed by (calendar_id, event_id).
-   - Supports `id` parameter on insert with 409 conflict semantics.
-   - Supports etags and `If-Match` (412 on mismatch).
-   - Records every call with full payload for body-assertion tests.
-   - Configurable read-after-write lag for eventual-consistency simulation.
-   - Configurable per-call failure injection (timeout, 5xx, 4xx, rate-limit).
+### Layer 1 — Unit tests
+For pure functions only: canonical UID generation, payload rendering, ICS parsing, hash computation. Fast and exhaustive. Catches logic mistakes inside individual transformations.
 
-2. **`tests/fakes/clock.py`** — controllable clock
-   - `freeze_time`, `advance(seconds)`.
-   - Used to test backoff schedules, debounce, retention windows.
+### Layer 2 — Property tests (Hypothesis)
+For invariants that should hold over large random inputs. Examples:
+- Ingesting the same event twice produces the same ledger state, regardless of order.
+- Rendering a payload from a ledger row and then ingesting that payload back produces the same ledger row (round-trip property).
+- For any sequence of operations, replaying the operations against an empty system produces the same final state (idempotency property).
+- For any RRULE + EXDATE + modified-instance set, the expanded instance set matches the expected count after each operation.
 
-### New test categories
+Catches logic mistakes that unit tests miss because the unit tester only thought of three cases.
 
-3. **`tests/concurrency/test_concurrent_ingest.py`**
-   - Two ingests of the same source running simultaneously must produce no duplicates.
-   - Webhook + periodic interleave must converge to identical state.
+### Layer 3 — Integration tests
+Full pipeline scenarios run against the fake Google. Each test is a story with a starting state, a sequence of events, and an assertion about the final observable state. Examples:
+- "User creates event on client A; assert that within N reconciliation cycles, a full-detail copy exists on main and busy blocks exist on B and C."
+- "User cancels one instance of a recurring meeting; assert that the cancelled instance is absent from every busy block within N cycles."
+- "Webhook arrives → reconcile_request enqueued → ingest runs → planner runs → outbox drains → fake Google reflects expected state → next ingest sees no drift."
 
-4. **`tests/integration/test_full_pipeline.py`**
-   - Webhook arrives → reconcile_request enqueued → ingest runs → planner runs → outbox drains → fake Google reflects expected state → next ingest sees no drift.
-   - Asserts on the actual payload sent to Google, not just the return value.
+Asserts on the actual payload sent to Google, not just the return value. Catches wiring mistakes between components.
 
-5. **`tests/integration/test_eventual_consistency.py`**
-   - Configures fake Google with 30s read-after-write lag.
-   - Verifies idempotent inserts and etag-gated updates handle stale reads correctly.
+### Layer 4 — Concurrency / chaos tests
+Deliberately adversarial timing. Examples:
+- Two webhooks arrive simultaneously for the same calendar.
+- The periodic timer fires during a webhook sync.
+- The network drops a response mid-write.
+- The process crashes between a Google call and a database commit (kill -9 the simulated worker).
+- Two simulated users perform overlapping operations.
 
-6. **`tests/properties/test_idempotency.py`**
-   - Property test: any sequence of operations followed by re-ingestion of the same data produces identical state.
+These catch the race conditions that produce most current duplicates. Tests assert that any interleaving produces the same final state.
 
-7. **`tests/properties/test_recurring.py`**
-   - Property test on RRULE expansion, EXDATE handling, modified-instance lifecycle.
+### Layer 5 — Soak tests (the hardest class, the most valuable)
+
+This layer is what catches the bugs the user currently lives with: slow drift, accumulating ghosts, sync-token-expiry effects, memory leaks, compounding failures, and the recurring-cancellation regressions that need *time* to manifest. The harness is described in detail in Phase 1.b; this section summarises the contract.
+
+**What soak tests check that lower layers cannot:**
+
+- **Slow accumulation.** A 0.1% per-event duplicate rate is invisible in a 100-event integration test. It produces ten duplicates a year for a real user. A 90-sim-day soak with several thousand events makes it obvious.
+- **Long-cycle bugs.** Anything triggered by sync-token expiry (monthly), retention cleanup (daily), webhook channel renewal (every 6 hours), or month-boundary recurrence. Tests that don't simulate months cannot see these. The recurring-cancellation amnesia is exactly this kind of bug.
+- **Compounding failures.** Bugs where a small initial error produces state that makes the next error more likely. These have an exponential signature in the divergence time-series; a soak test sees the curve curl upward over simulated days.
+- **Resource leaks.** Ledger or outbox tables that grow without bound; reconciler memory that doesn't release.
+
+**Invariants checked after every soak reconciliation cycle:**
+
+1. For every active ledger event, projections exist on exactly the expected calendars (no missing, no spurious).
+2. For every projection with `current_state='present'`, the corresponding event exists on Google.
+3. For every Google event carrying our extended properties, a corresponding projection exists (no orphans on Google's side).
+4. No two projections share a Google event ID, ever.
+5. No two ledger events share a canonical UID.
+6. Count of full-detail copies on main matches the oracle (ground-truth model).
+7. Count of busy blocks on each client matches the oracle, excluding self-origin events.
+8. Outbox queue eventually drains to zero between event bursts.
+9. Reconcile latency stays bounded as event count grows (no exponential blowup).
+10. Database size grows sub-linearly in event count (no unbounded growth).
+11. After any failure injection, the system reaches a clean state within a bounded number of cycles.
+
+**Targeted recurring-cancellation soak** (specific to the user's reported pain):
+
+Generate 100 weekly recurring meetings. Schedule cancellations at varied positions: some on the next instance, some mid-series, some after a `_R` reschedule has moved the parent. Force sync-token expiry partway through. Run 365 simulated days. Assert after every cycle that no ghost instances exist on any client calendar. Today's system fails this within a simulated week; the goal post-rewrite is zero failures across all seeds.
+
+**Release gates:**
+- No phase advances without a green 90-simulated-day run.
+- Phase 6 (write cutover) requires a green 365-simulated-day run with all failure injection enabled.
+- A failed soak seed is automatically saved as a regression test and added to CI permanently.
 
 ### Existing tests
 All 171 existing tests (`tests/`, `e2e/`, `sidecar/tests/`) must continue to pass through every phase. Phase 6 may require updating tests that mock the old sync internals; their behaviour assertions stay the same.
@@ -840,19 +941,23 @@ Before I start coding, please confirm or steer:
 
 ## 19. Estimated Effort
 
-| Phase | Effort | Risk |
-|---|---|---|
-| 0. SA removal & revert fix | 1–2 days | Low (additive bug fix) |
-| 1. Foundation | 1–2 days | Trivial |
-| 2. Idempotent inserts | 3–5 days | Low (additive change) |
-| 3. Outbox shadowing | 5–7 days | Low (shadow only) |
-| 4. Dual-write ledger | 5–7 days | Medium (correctness checks needed) |
-| 5. Cut over reads | 3–5 days | Medium (UI must stay correct) |
-| 6. Cut over writes | 5–7 days | High (the actual swap) |
-| 7. Cleanup | 2–3 days | Low (bake period proves stability) |
-| **Total** | **25–38 days (5–7.5 weeks)** | |
+| Phase | Effort | Risk | What it ships |
+|---|---|---|---|
+| 0. SA removal + revert fix + recurring-cancel patches | 2–4 days | Low | Real bug fixes; immediate user relief |
+| 1. Foundation + soak-test harness | 11–17 days | Low | Test infrastructure for all later phases |
+| 2. Idempotent inserts | 3–5 days | Low | Closes retry-duplicate class today |
+| 3. Outbox shadowing | 5–7 days | Low | Validates new bookkeeping against reality |
+| 4. Dual-write ledger | 5–7 days | Medium | Ledger becomes consistent shadow |
+| 5. Cut over reads | 3–5 days | Medium | Read paths use ledger; old writes still authoritative |
+| 6. Cut over writes | 5–7 days | High | The actual architectural swap |
+| 7. Cleanup | 2–3 days | Low | Remove parallel structures |
+| **Total** | **36–55 days (7–11 weeks)** | | |
 
-Bake periods between phases add another 1–2 weeks of calendar time. Expect **6–9 weeks calendar time** for the full migration.
+Bake periods between phases (especially after Phase 4 and Phase 6) add another 2–3 weeks of calendar time. Expect **9–14 weeks calendar time** for the full migration.
+
+**The harness in Phase 1.b is the biggest single line item and the most valuable.** Without it, we cannot prove the rewrite delivers the reliability it claims to. With it, every later phase ships with empirical evidence — not just code review — that it converges correctly under adversarial conditions. It also persists as a regression safety net long after the rewrite ends.
+
+**Phase 0 is independently valuable.** Even if you decided to stop after Phase 0, you would get: SA mode removed (less complexity), the missing-revert bug fixed, and three targeted patches that should meaningfully reduce your reported recurring-cancellation pain. Phase 0 alone takes one engineer one week.
 
 ---
 
