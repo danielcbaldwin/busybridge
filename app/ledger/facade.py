@@ -98,6 +98,55 @@ async def count_main_copies(
     return int(row["n"]) if row else 0
 
 
+async def count_active_ledger_events(
+    db: aiosqlite.Connection, *, user_id: int,
+) -> int:
+    """Total active (non-cancelled, non-user-deleted) ledger rows."""
+    row = await (await db.execute(
+        """SELECT COUNT(*) AS n FROM ledger_events
+            WHERE user_id = ? AND status = 'active'
+              AND user_intentionally_deleted = 0""",
+        (user_id,),
+    )).fetchone()
+    return int(row["n"]) if row else 0
+
+
+async def count_active_events_per_source_calendar(
+    db: aiosqlite.Connection, *, user_id: int,
+) -> dict[int, int]:
+    """``{client_calendars.id: count}`` of active ledger rows
+    sourced from each client or personal calendar."""
+    rows = await (await db.execute(
+        """SELECT source_calendar_id, COUNT(*) AS n
+             FROM ledger_events
+            WHERE user_id = ? AND status = 'active'
+              AND user_intentionally_deleted = 0
+              AND source_type IN ('client', 'personal')
+              AND source_calendar_id IS NOT NULL
+            GROUP BY source_calendar_id""",
+        (user_id,),
+    )).fetchall()
+    return {int(r["source_calendar_id"]): int(r["n"]) for r in rows}
+
+
+async def count_active_events_per_webcal_subscription(
+    db: aiosqlite.Connection, *, user_id: int,
+) -> dict[int, int]:
+    """``{webcal_subscriptions.id: count}`` of active ledger rows
+    sourced from each webcal subscription."""
+    rows = await (await db.execute(
+        """SELECT source_calendar_id, COUNT(*) AS n
+             FROM ledger_events
+            WHERE user_id = ? AND status = 'active'
+              AND user_intentionally_deleted = 0
+              AND source_type = 'webcal'
+              AND source_calendar_id IS NOT NULL
+            GROUP BY source_calendar_id""",
+        (user_id,),
+    )).fetchall()
+    return {int(r["source_calendar_id"]): int(r["n"]) for r in rows}
+
+
 # ---------------------------------------------------------------------------
 # Operational health
 # ---------------------------------------------------------------------------

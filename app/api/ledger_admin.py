@@ -208,3 +208,20 @@ async def sync_now(
     db = await get_database()
     await enqueue_manual(db, user_id=user_id, source_hint=source_hint)
     return {"status": "enqueued"}
+
+
+@router.post("/users/{user_id}/reconcile-now")
+async def reconcile_now(
+    user_id: int,
+    _: User = Depends(require_admin),
+) -> dict:
+    """Run one full reconciliation pass synchronously and return
+    the counters.
+
+    Equivalent to ``sync-now`` + waiting for the drain to fire,
+    but without the 25-second settling delay or scheduler latency.
+    Useful for tests and admin "I want this NOW" buttons.
+    """
+    from app.ledger.runtime import reconcile_user_by_id
+    out = await reconcile_user_by_id(user_id)
+    return {"status": "done", "result": out}

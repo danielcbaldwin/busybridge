@@ -125,11 +125,25 @@ async def test_index_dashboard_and_login_page_paths(test_db, monkeypatch):
         "INSERT INTO calendar_sync_state (client_calendar_id, consecutive_failures) VALUES (?, ?)",
         (cal_id, 0),
     )
+    # Legacy event_mappings row, kept for any code path that still
+    # reads it during the parallel-run period.
     await db.execute(
         """INSERT INTO event_mappings
            (user_id, origin_type, origin_calendar_id, origin_event_id, main_event_id, is_recurring, user_can_edit)
            VALUES (?, 'client', ?, 'e1', 'm1', FALSE, TRUE)""",
         (user_id, cal_id),
+    )
+    # Ledger row that the dashboard now reads from (REWRITE_PLAN.md §4):
+    # event_count on the dashboard is sourced from ledger_events.
+    await db.execute(
+        """INSERT INTO ledger_events
+              (user_id, canonical_uid, source_type, source_calendar_id,
+               source_event_id, summary, start_at, end_at,
+               status, version)
+           VALUES (?, ?, 'client', ?, 'e1', 'UI test event',
+                   '2026-03-02T09:00:00Z', '2026-03-02T09:30:00Z',
+                   'active', 1)""",
+        (user_id, f"client:{cal_id}:e1", cal_id),
     )
     await db.execute(
         "INSERT INTO organization (google_workspace_domain, google_client_id_encrypted, google_client_secret_encrypted) VALUES (?, ?, ?)",

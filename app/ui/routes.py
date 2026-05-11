@@ -39,14 +39,26 @@ async def dashboard(request: Request, error: Optional[str] = None):
 
     db = await get_database()
 
-    # Get connected client calendars
+    # Per-calendar event + busy-block counts are sourced from the
+    # ledger (REWRITE_PLAN.md §4) — the source-of-truth post-rewrite.
+    from app.ledger.facade import (
+        count_active_events_per_source_calendar,
+        count_active_events_per_webcal_subscription,
+        count_active_ledger_events,
+        count_busy_blocks_per_calendar,
+    )
+    events_per_calendar = await count_active_events_per_source_calendar(
+        db, user_id=user.id,
+    )
+    busy_per_calendar = await count_busy_blocks_per_calendar(db, user_id=user.id)
+    events_per_webcal = await count_active_events_per_webcal_subscription(
+        db, user_id=user.id,
+    )
+
+    # Get connected client calendars (rows; counts merged in below).
     cursor = await db.execute(
         """SELECT cc.*, ot.google_account_email, css.last_incremental_sync,
-                  css.last_full_sync, css.consecutive_failures, css.last_error,
-                  (SELECT COUNT(*) FROM event_mappings em
-                   WHERE em.origin_calendar_id = cc.id AND em.deleted_at IS NULL) as event_count,
-                  (SELECT COUNT(*) FROM busy_blocks bb
-                   WHERE bb.client_calendar_id = cc.id) as busy_block_count
+                  css.last_full_sync, css.consecutive_failures, css.last_error
            FROM client_calendars cc
            JOIN oauth_tokens ot ON cc.oauth_token_id = ot.id
            LEFT JOIN calendar_sync_state css ON cc.id = css.client_calendar_id
@@ -54,14 +66,16 @@ async def dashboard(request: Request, error: Optional[str] = None):
            ORDER BY cc.created_at DESC""",
         (user.id,)
     )
-    calendars = await cursor.fetchall()
+    calendar_rows = await cursor.fetchall()
+    calendars = [
+        _merge_counts(row, events_per_calendar, busy_per_calendar)
+        for row in calendar_rows
+    ]
 
     # Get connected personal calendars
     cursor = await db.execute(
         """SELECT cc.*, ot.google_account_email, css.last_incremental_sync,
-                  css.last_full_sync, css.consecutive_failures, css.last_error,
-                  (SELECT COUNT(*) FROM busy_blocks bb
-                   WHERE bb.client_calendar_id = cc.id) as busy_block_count
+                  css.last_full_sync, css.consecutive_failures, css.last_error
            FROM client_calendars cc
            JOIN oauth_tokens ot ON cc.oauth_token_id = ot.id
            LEFT JOIN calendar_sync_state css ON cc.id = css.client_calendar_id
@@ -69,9 +83,13 @@ async def dashboard(request: Request, error: Optional[str] = None):
            ORDER BY cc.created_at DESC""",
         (user.id,)
     )
-    personal_calendars = await cursor.fetchall()
+    personal_rows = await cursor.fetchall()
+    personal_calendars = [
+        _merge_counts(row, events_per_calendar, busy_per_calendar)
+        for row in personal_rows
+    ]
 
-    # Get sync status
+    # Sync-failure status — straight from calendar_sync_state.
     cursor = await db.execute(
         """SELECT COUNT(*) as total,
                   SUM(CASE WHEN css.consecutive_failures >= 5 THEN 1 ELSE 0 END) as errors,
@@ -83,12 +101,8 @@ async def dashboard(request: Request, error: Optional[str] = None):
     )
     status_row = await cursor.fetchone()
 
-    # Get event count
-    cursor = await db.execute(
-        "SELECT COUNT(*) FROM event_mappings WHERE user_id = ? AND deleted_at IS NULL",
-        (user.id,)
-    )
-    event_count = (await cursor.fetchone())[0]
+    # Total event count via the ledger.
+    event_count = await count_active_ledger_events(db, user_id=user.id)
     managed_event_prefix = (get_settings().managed_event_prefix or "").strip()
 
     paused_setting = await get_setting("sync_paused")
@@ -114,17 +128,19 @@ async def dashboard(request: Request, error: Optional[str] = None):
             "consecutive_check_failures": integrity_row["consecutive_check_failures"] or 0,
         }
 
-    # Get webcal subscriptions
+    # Get webcal subscriptions (event counts merged in from the
+    # ledger).
     cursor = await db.execute(
-        """SELECT ws.*,
-                  (SELECT COUNT(*) FROM event_mappings em
-                   WHERE em.webcal_subscription_id = ws.id AND em.deleted_at IS NULL) as event_count
+        """SELECT ws.*
            FROM webcal_subscriptions ws
            WHERE ws.user_id = ? AND ws.is_active = TRUE
            ORDER BY ws.created_at DESC""",
         (user.id,)
     )
-    webcal_subscriptions = await cursor.fetchall()
+    webcal_rows = await cursor.fetchall()
+    webcal_subscriptions = [
+        _merge_webcal_count(row, events_per_webcal) for row in webcal_rows
+    ]
 
     return templates.TemplateResponse(request, "dashboard.html", context={
         "user": user,
@@ -601,3 +617,24 @@ async def admin_settings(request: Request):
         "sa_email": sa_email,
         "all_users": all_users,
     })
+
+
+# ---------------------------------------------------------------------------
+# Helpers: merge facade counts into row dicts so templates that read
+# ``row['event_count']`` / ``row['busy_block_count']`` keep working.
+# ---------------------------------------------------------------------------
+def _merge_counts(row, events_by_cal: dict[int, int], busy_by_cal: dict[int, int]) -> dict:
+    """Convert an aiosqlite.Row into a dict and inject ledger
+    counts under ``event_count`` / ``busy_block_count`` keys."""
+    d = {k: row[k] for k in row.keys()}
+    cid = int(d.get("id") or 0)
+    d["event_count"] = events_by_cal.get(cid, 0)
+    d["busy_block_count"] = busy_by_cal.get(cid, 0)
+    return d
+
+
+def _merge_webcal_count(row, events_by_sub: dict[int, int]) -> dict:
+    d = {k: row[k] for k in row.keys()}
+    sid = int(d.get("id") or 0)
+    d["event_count"] = events_by_sub.get(sid, 0)
+    return d

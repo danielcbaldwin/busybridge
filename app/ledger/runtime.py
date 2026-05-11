@@ -16,13 +16,23 @@ Entry points:
 * :func:`drain_all_due_users` — find every user with a due
   ``reconcile_requests`` row, claim it, run, release.  Used by
   the scheduler tick.
+
+Test injection:
+
+* :func:`set_google_client_factory` — swap the
+  ``RealGoogleClient(credentials)`` builder for a test factory
+  that returns a :class:`tests.fakes.FakeGoogleCalendar`.  This
+  is the only patch a test needs to make to run the full app
+  against an in-memory fake.
+* :func:`set_webcal_fetcher` — same idea for webcal subscription
+  fetches.
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import aiosqlite
 
@@ -35,6 +45,59 @@ from google.oauth2.credentials import Credentials
 
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
+
+
+# ---------------------------------------------------------------------------
+# Pluggable client factory (tests override this)
+# ---------------------------------------------------------------------------
+GoogleClientFactory = Callable[[int, str], Awaitable[Any]]
+WebcalFetcher = Callable[[str, Optional[str]], dict]
+
+
+async def _default_google_client_factory(user_id: int, email: str):
+    """Production factory: build a RealGoogleClient from the
+    OAuth token store."""
+    access_token = await get_valid_access_token(user_id, email)
+    return RealGoogleClient(Credentials(token=access_token))
+
+
+_google_client_factory: GoogleClientFactory = _default_google_client_factory
+_webcal_fetcher: Optional[WebcalFetcher] = None
+
+
+def set_google_client_factory(factory: Optional[GoogleClientFactory]) -> None:
+    """Override the GoogleClient builder.  Pass ``None`` to reset.
+
+    Test usage::
+
+        from app.ledger.runtime import set_google_client_factory
+
+        async def fake_factory(user_id, email):
+            return my_fake_google_calendar
+
+        set_google_client_factory(fake_factory)
+    """
+    global _google_client_factory
+    _google_client_factory = (
+        factory if factory is not None else _default_google_client_factory
+    )
+
+
+def set_webcal_fetcher(fetcher: Optional[WebcalFetcher]) -> None:
+    """Override the webcal fetch hook.  Pass ``None`` to reset
+    to the httpx-backed default."""
+    global _webcal_fetcher
+    _webcal_fetcher = fetcher
+
+
+def _resolve_webcal_fetcher() -> Optional[WebcalFetcher]:
+    if _webcal_fetcher is not None:
+        return _webcal_fetcher
+    try:
+        return _default_webcal_fetcher()
+    except Exception as e:  # httpx may be unavailable in some envs
+        logger.warning("default webcal fetcher unavailable: %s", e)
+        return None
 
 
 async def reconcile_user_by_id(
@@ -63,12 +126,12 @@ async def reconcile_user_by_id(
     if not main_email:
         return {"skipped": "no_home_oauth_token"}
     try:
-        main_token = await get_valid_access_token(user_id, main_email)
+        main_client = await _google_client_factory(user_id, main_email)
     except Exception as e:
-        logger.warning("Cannot get main token for user %s: %s", user_id, e)
-        return {"skipped": "main_token_unavailable", "error": str(e)}
-
-    main_client = RealGoogleClient(Credentials(token=main_token))
+        logger.warning(
+            "Cannot build Google client for user %s: %s", user_id, e,
+        )
+        return {"skipped": "google_client_unavailable", "error": str(e)}
 
     # Active client calendars.
     client_rows = await (await db.execute(
@@ -118,7 +181,7 @@ async def reconcile_user_by_id(
         all_known_client_calendars=all_known,
         personal_calendars=active_personals,
         webcal_subscriptions=webcal_subs,
-        webcal_fetch=_default_webcal_fetcher() if webcal_subs else None,
+        webcal_fetch=_resolve_webcal_fetcher() if webcal_subs else None,
         include_main=include_main,
         drain=drain,
         run_discovery=run_discovery,
