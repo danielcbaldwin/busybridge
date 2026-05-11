@@ -34,33 +34,14 @@
                         </div>
                     </div>
 
-                    {% if sa_uploaded and sa_email %}
-                    <div class="flex items-start">
-                        <div class="flex-shrink-0 h-8 w-8 rounded-full bg-indigo-100 flex items-center justify-center">
-                            <span class="text-indigo-600 font-medium">2</span>
-                        </div>
-                        <div class="ml-4">
-                            <h3 class="text-sm font-medium text-gray-900">Share Calendar with Service Account</h3>
-                            <p class="text-sm text-gray-500">
-                                In <a href="https://calendar.google.com" target="_blank" class="text-indigo-600 hover:underline">Google Calendar</a>, go to your main calendar's <strong>Settings and sharing</strong> &rarr; <strong>Share with specific people</strong> and add:
-                            </p>
-                            <div class="mt-2 flex items-center bg-gray-50 rounded-md p-2" x-data="{ copied: false }">
-                                <code class="text-xs text-indigo-600 break-all flex-1" id="sa-email">{{ sa_email }}</code>
-                                <button type="button"
-                                    @click="navigator.clipboard.writeText(document.getElementById('sa-email').textContent.trim()); copied = true; setTimeout(() => copied = false, 2000)"
-                                    class="ml-2 text-gray-400 hover:text-indigo-600 flex-shrink-0">
-                                    <span x-show="!copied"><i class="fas fa-copy"></i></span>
-                                    <span x-show="copied" x-cloak class="text-green-600"><i class="fas fa-check"></i></span>
-                                </button>
-                            </div>
-                            <p class="text-xs text-gray-500 mt-1">Grant <strong>Make changes to events</strong> permission. Then activate via <strong>Admin Settings</strong>.</p>
-                        </div>
-                    </div>
-                    {% endif %}
+                    {# Service-account step was removed at the Stage-5
+                       cutover.  Non-editable events are handled by the
+                       uniform 🔒-emoji + revert-on-drift mechanism in
+                       the ledger pipeline. #}
 
                     <div class="flex items-start">
                         <div class="flex-shrink-0 h-8 w-8 rounded-full bg-indigo-100 flex items-center justify-center">
-                            <span class="text-indigo-600 font-medium">{{ '3' if sa_uploaded else '2' }}</span>
+                            <span class="text-indigo-600 font-medium">2</span>
                         </div>
                         <div class="ml-4">
                             <h3 class="text-sm font-medium text-gray-900">Connect Client Calendars</h3>
@@ -70,7 +51,7 @@
 
                     <div class="flex items-start">
                         <div class="flex-shrink-0 h-8 w-8 rounded-full bg-indigo-100 flex items-center justify-center">
-                            <span class="text-indigo-600 font-medium">{{ '4' if sa_uploaded else '3' }}</span>
+                            <span class="text-indigo-600 font-medium">3</span>
                         </div>
                         <div class="ml-4">
                             <h3 class="text-sm font-medium text-gray-900">Let It Sync</h3>
@@ -87,10 +68,9 @@
                 </div>
             </div>
 
-            <!-- Progress indicator -->
+            <!-- Progress indicator (6 steps post-cutover; step 5 removed) -->
             <div class="mt-8 flex justify-center">
                 <div class="flex space-x-2">
-                    <div class="h-2 w-8 rounded-full bg-indigo-600"></div>
                     <div class="h-2 w-8 rounded-full bg-indigo-600"></div>
                     <div class="h-2 w-8 rounded-full bg-indigo-600"></div>
                     <div class="h-2 w-8 rounded-full bg-indigo-600"></div>

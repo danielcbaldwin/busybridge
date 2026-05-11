@@ -2,24 +2,32 @@
 
 A self-hosted calendar synchronization service for consulting organizations. Connect multiple client calendars to a single main calendar, keeping availability in sync without exposing details across clients.
 
+> **Note:** the sync engine was rewritten in May 2026 per
+> [`REWRITE_PLAN.md`](./REWRITE_PLAN.md).  The new architecture
+> is a single canonical ledger + projection + idempotent outbox
+> drain instead of three-concurrent-paths-with-locks.  See
+> [`CUTOVER.md`](./CUTOVER.md) for the migration runbook if you're
+> upgrading an existing deployment.
+
 ## Features
 
 - **Bidirectional Sync**: Client calendar events appear on your main calendar with full details; your main calendar events appear as "Busy" blocks on client calendars
 - **Personal Calendar Sync**: Connect personal Gmail/Workspace calendars as read-only sources that create privacy-preserving "Busy (Personal)" blocks across all calendars
 - **Webcal/ICS Subscriptions**: Subscribe to external ICS feeds (e.g. conference schedules, travel itineraries) that sync to your main calendar with busy blocks on clients
-- **Recurring Events**: Full fidelity for recurring events including single-instance modifications and cancellations
+- **Recurring Events**: Full fidelity for recurring events including single-instance modifications and cancellations.  Cancellations are sticky — they survive sync-token expiry (the "recurring-cancellation amnesia" bug from the legacy engine is fixed structurally).
 - **Smart Busy Blocks**: Only creates blocks for events that actually block time (respects Free/Busy status)
 - **RSVP Propagation**: Accept/decline on main calendar propagates back to the client calendar
 - **Calendar Color Coding**: Assign Google Calendar colors to each client calendar; events are color-coded on your main calendar
-- **Webhook Integration**: Real-time sync via Google Calendar push notifications (5-second debounce)
+- **Webhook Integration**: Real-time sync via Google Calendar push notifications (5-second debounce; immediate drain scheduled on receipt)
+- **Drift Revert**: Non-editable events that get dragged on the main calendar are automatically reverted to their canonical position
+- **Idempotent Writes**: Every Google API call uses a deterministic event ID + etag precondition so retries never duplicate
 - **Rate Limiting**: Token-bucket rate limiter (5 req/s) with exponential backoff prevents Google API quota exhaustion
-- **Service Account Mode**: Optional SA creates main calendar events, making non-editable events physically immovable
 - **ICS Calendar Export**: Full calendar export to ICS format with a "clean" variant that strips BusyBridge-managed events (for migration or external backup)
-- **Email Alerts**: Notifications for sync failures, token revocations, integrity issues
+- **Email Alerts**: Notifications for sync failures, token revocations, integrity issues, and poison-pill events
 - **Automated Backups**: Daily database + ICS backups with 7-daily/2-weekly/6-monthly retention
-- **Self-Healing**: Hourly consistency checks, 6-hourly orphan scans, automatic retry of missing busy blocks, circuit breaker auto-pauses sync when all calendars fail consecutively
+- **Self-Healing**: Structural consistency via the ledger architecture; 6-hourly orphan scans for events on Google that escaped tracking; circuit breaker auto-pauses sync when all calendars fail consecutively
 - **Sync Control**: Full re-sync, per-calendar cleanup & re-sync, global cleanup & pause, live progress tracking
-- **Admin Dashboard**: User management, system health, sync activity feed, log viewer, factory reset
+- **Admin Dashboard**: User management, system health, sync activity feed, log viewer, factory reset, permanent-failure surface
 
 ## Quick Start
 
