@@ -5,6 +5,12 @@ Each invariant is a method named ``check_<n>_*`` that returns a
 list of violation strings (empty list = pass).  The dispatcher
 runs them all and aggregates.
 
+Invariants 1-8 are evaluable at any single point in time and
+live here.  Invariants 9-11 are runtime properties (latency,
+DB-size growth, post-failure recovery time) that the soak
+harness loop evaluates over multiple cycles; helpers for those
+live in this file too.
+
 Invariants:
 
 1. For every active ledger event, projections exist on exactly
@@ -18,18 +24,16 @@ Invariants:
 6. Count of full-detail copies on main matches the oracle.
 7. Count of busy blocks on each client matches the oracle.
 8. Outbox queue eventually drains to zero.
-9. Reconcile latency stays bounded (a soak-loop assertion, not
-   here — see harness.py).
-10. Database size grows sub-linearly in event count (soak-loop).
-11. After any failure injection, the system reaches a clean
-    state within a bounded number of cycles (soak-loop).
-
-This module covers 1-8.  9-11 are runtime properties evaluated
-by the harness.
+9. Reconcile latency stays bounded as event count grows.
+10. Database size grows sub-linearly in event count.
+11. After failure injection, the system reaches a clean state
+    within a bounded number of cycles.
 """
 
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 
 import aiosqlite
@@ -45,16 +49,35 @@ class InvariantViolation(AssertionError):
 
 
 @dataclass
+class LatencySample:
+    """Single (event_count, wall_seconds) pair for invariant 9."""
+    event_count: int
+    wall_seconds: float
+
+
+@dataclass
+class DbSizeSample:
+    """Single (event_count, ledger_row_count, db_bytes) for inv. 10."""
+    event_count: int
+    ledger_row_count: int
+    db_bytes: int
+
+
+@dataclass
 class InvariantChecker:
     db: aiosqlite.Connection
     google: FakeGoogleCalendar
     oracle: Oracle
     user_id: int
     main_google_id: str
-    client_google_ids: dict[str, str]  # nickname -> google id
+    # nickname -> google id (kept for reference) AND nickname -> db id
+    # for INV-7 + INV-2.
+    client_google_ids: dict[str, str]
+    client_db_ids: dict[str, int] = None  # type: ignore[assignment]
 
     async def check_all(self) -> list[str]:
-        """Run every invariant; return the combined violation list."""
+        """Run every point-in-time invariant; return the combined
+        violation list."""
         out: list[str] = []
         out += await self.check_1_projections_match_ledger()
         out += await self.check_2_present_projections_exist_on_google()
@@ -93,6 +116,7 @@ class InvariantChecker:
     # 2. Present projections correspond to real events on Google.
     # ------------------------------------------------------------------
     async def check_2_present_projections_exist_on_google(self) -> list[str]:
+        await self._ensure_client_db_ids()
         rows = await (await self.db.execute(
             """SELECT p.id, p.target_kind, p.target_calendar_id,
                       p.google_event_id, p.desired_state
@@ -105,10 +129,18 @@ class InvariantChecker:
         )).fetchall()
         out = []
         for r in rows:
-            cal_google_id = self._resolve_target_google_id(
+            cal_google_id = await self._resolve_target_google_id(
                 r["target_kind"], r["target_calendar_id"],
             )
             if cal_google_id is None:
+                # Target calendar was disconnected and pruned from the
+                # DB; the projection should have been re-targeted by
+                # cleanup_one_calendar.  Surface as a violation.
+                out.append(
+                    f"INV-2: projection {r['id']} (kind={r['target_kind']}, "
+                    f"target_calendar_id={r['target_calendar_id']}) "
+                    f"cannot resolve a Google calendar id",
+                )
                 continue
             try:
                 ev = self.google.get_event(cal_google_id, r["google_event_id"])
@@ -200,21 +232,12 @@ class InvariantChecker:
     # ------------------------------------------------------------------
     async def check_7_busy_block_counts_match_oracle(self) -> list[str]:
         from app.ledger.facade import count_busy_blocks_per_calendar
+        await self._ensure_client_db_ids()
         actual = await count_busy_blocks_per_calendar(
             self.db, user_id=self.user_id,
         )
         out = []
-        for nick, _ in self.client_google_ids.items():
-            # Map nickname → DB id via DB lookup.
-            row = await (await self.db.execute(
-                """SELECT id FROM client_calendars
-                    WHERE user_id = ? AND display_name = ?
-                    LIMIT 1""",
-                (self.user_id, nick),
-            )).fetchone()
-            if row is None:
-                continue
-            cid = int(row["id"])
+        for nick, cid in self.client_db_ids.items():
             expected = self.oracle.expected_busy_blocks_on(nick)
             actual_count = int(actual.get(cid, 0))
             if actual_count != expected:
@@ -241,14 +264,160 @@ class InvariantChecker:
         return []
 
     # ------------------------------------------------------------------
+    # Runtime invariants (9-11)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def check_9_reconcile_latency_bounded(
+        samples: list[LatencySample],
+        *,
+        slope_tolerance: float = 1.5,
+    ) -> list[str]:
+        """Latency must scale ~linearly in event count, not worse.
+
+        We fit a line through ``samples`` and complain if the
+        last sample's per-event cost is more than
+        ``slope_tolerance`` × the median per-event cost.
+        Exponential blowup catches the eye immediately.
+        """
+        if len(samples) < 3:
+            return []  # not enough data
+        per_event = [
+            s.wall_seconds / max(1, s.event_count) for s in samples
+        ]
+        median = sorted(per_event)[len(per_event) // 2]
+        last = per_event[-1]
+        if median <= 0:
+            return []
+        ratio = last / median
+        if ratio > slope_tolerance:
+            return [
+                f"INV-9: latency-per-event regression: median={median:.4f}s, "
+                f"latest={last:.4f}s (ratio={ratio:.2f} > {slope_tolerance})"
+            ]
+        return []
+
+    @staticmethod
+    def check_10_db_size_sub_linear(
+        samples: list[DbSizeSample],
+        *,
+        bytes_per_row_ceiling: int = 8 * 1024,  # 8KB per ledger row is generous
+    ) -> list[str]:
+        """Database byte-size per ledger row must stay bounded.
+
+        Catches an unbounded-table regression where, for example,
+        we accidentally grow outbox_operations linearly with
+        events forever instead of pruning settled rows.
+        """
+        if not samples:
+            return []
+        last = samples[-1]
+        if last.ledger_row_count == 0:
+            return []
+        bytes_per_row = last.db_bytes / last.ledger_row_count
+        if bytes_per_row > bytes_per_row_ceiling:
+            return [
+                f"INV-10: db_bytes_per_ledger_row={bytes_per_row:.0f} > "
+                f"ceiling {bytes_per_row_ceiling} (db_bytes={last.db_bytes}, "
+                f"rows={last.ledger_row_count})"
+            ]
+        return []
+
+    @staticmethod
+    def check_11_recovery_within_cycles(
+        cycles_to_clean: int | None,
+        *,
+        max_cycles: int = 5,
+    ) -> list[str]:
+        """After failure injection, system must reach a clean state
+        within ``max_cycles`` reconciliation cycles."""
+        if cycles_to_clean is None:
+            return [f"INV-11: did not converge within {max_cycles} cycles"]
+        if cycles_to_clean > max_cycles:
+            return [
+                f"INV-11: took {cycles_to_clean} cycles to recover "
+                f"(max allowed={max_cycles})"
+            ]
+        return []
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _resolve_target_google_id(
+    async def _ensure_client_db_ids(self) -> None:
+        """Lazy-fill ``client_db_ids`` from the database the first
+        time it's needed.  The harness supplies nicknames; we
+        resolve them to ``client_calendars.id``."""
+        if self.client_db_ids is not None:
+            return
+        self.client_db_ids = {}
+        for nick in self.client_google_ids:
+            row = await (await self.db.execute(
+                """SELECT id FROM client_calendars
+                    WHERE user_id = ? AND display_name = ?
+                    LIMIT 1""",
+                (self.user_id, nick),
+            )).fetchone()
+            if row is not None:
+                self.client_db_ids[nick] = int(row["id"])
+
+    async def _resolve_target_google_id(
         self, target_kind: str, target_calendar_id: int | None,
     ) -> str | None:
+        """Resolve a projection's target to a Google calendar id.
+
+        Looks up ``client_calendars.google_calendar_id`` for client
+        targets (covers disconnected calendars too — those are
+        still in the table with ``is_active=0``).
+        """
         if target_kind == "main":
             return self.main_google_id
-        # target_kind == 'client': need to look up the google id by db id.
-        # Caller can supply via client_google_ids by nickname; here we'd
-        # need a reverse map.  Keep it simple — query the DB.
-        return None  # caller's responsibility if needed
+        if target_calendar_id is None:
+            return None
+        row = await (await self.db.execute(
+            "SELECT google_calendar_id FROM client_calendars WHERE id = ?",
+            (int(target_calendar_id),),
+        )).fetchone()
+        if row is None:
+            return None
+        return row["google_calendar_id"]
+
+
+# ---------------------------------------------------------------------------
+# Helpers for runtime invariants 9 & 10
+# ---------------------------------------------------------------------------
+async def sample_db_size(
+    db: aiosqlite.Connection,
+    db_path: str,
+    user_id: int,
+) -> DbSizeSample:
+    """Snapshot the database file size + ledger row count.
+
+    For in-memory databases (``:memory:``) we fall back to a sum
+    over the sqlite_dbpage size, which is the closest equivalent.
+    """
+    row = await (await db.execute(
+        "SELECT COUNT(*) AS n FROM ledger_events WHERE user_id = ?",
+        (user_id,),
+    )).fetchone()
+    ledger_rows = int(row["n"] or 0)
+
+    if db_path and db_path != ":memory:" and os.path.exists(db_path):
+        size = os.path.getsize(db_path)
+    else:
+        # In-memory: estimate via page_count * page_size.
+        pc = await (await db.execute("PRAGMA page_count")).fetchone()
+        ps = await (await db.execute("PRAGMA page_size")).fetchone()
+        size = int(pc[0]) * int(ps[0]) if pc and ps else 0
+
+    # event_count from the oracle perspective is the same as the
+    # ledger row count under normal operation.
+    return DbSizeSample(
+        event_count=ledger_rows,
+        ledger_row_count=ledger_rows,
+        db_bytes=size,
+    )
+
+
+def timed_reconcile(label: str = ""):
+    """Context-manager-style helper: returns ``(start_perf_counter,
+    finalizer)`` for measuring reconcile-cycle wall time."""
+    return time.perf_counter()

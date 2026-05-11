@@ -126,6 +126,11 @@ class SoakHarness:
                 nick: self.scenario.cal(nick)
                 for nick in self.client_nicks
             },
+            client_db_ids={
+                nick: user.client_calendar_ids[nick]
+                for nick in self.client_nicks
+                if nick in user.client_calendar_ids
+            },
         )
         return await checker.check_all()
 
