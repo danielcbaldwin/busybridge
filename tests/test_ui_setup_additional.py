@@ -33,8 +33,12 @@ class FakeFormRequest:
 
 
 @pytest.mark.asyncio
-async def test_setup_step5_existing_key_context_and_step2_completed_guard(test_db, monkeypatch):
-    """Setup wizard should reuse existing key context and step 2 should reject completed setup."""
+async def test_setup_step6_existing_key_context_and_step2_completed_guard(test_db, monkeypatch):
+    """Setup wizard should reuse existing key context and step 2 should reject completed setup.
+
+    Step 5 (service-account upload) was removed at the Stage-5
+    cutover.  The encryption-key step is now step 6, and any
+    request for step 5 redirects there."""
     from app.ui import setup as setup_module
     from app.ui.setup import setup_step_2, setup_wizard
 
@@ -46,7 +50,11 @@ async def test_setup_step5_existing_key_context_and_step2_completed_guard(test_d
         return False
 
     monkeypatch.setattr("app.ui.setup.is_oobe_completed", oobe_incomplete)
-    rendered = await setup_wizard(_request("/setup"), step=5)
+    # step=5 redirects to step=6 now.
+    redirect = await setup_wizard(_request("/setup"), step=5)
+    assert redirect.status_code == 302
+    assert redirect.headers["location"] == "/setup?step=6"
+    rendered = await setup_wizard(_request("/setup"), step=6)
     assert rendered.status_code == 200
     assert rendered.context["encryption_key_b64"] == "existing-key-b64"
 
@@ -67,10 +75,22 @@ async def test_setup_step5_existing_key_context_and_step2_completed_guard(test_d
 
 
 @pytest.mark.asyncio
-async def test_setup_step5_generates_key_creates_directory_and_sets_alerts_disabled(test_db, monkeypatch, tmp_path):
-    """Step 5 completion should generate key when missing, create key dir, and disable alerts when SMTP off."""
-    from app.ui import setup as setup_module
+async def test_setup_step5_is_a_redirect_post_cutover():
+    """Step 5 (service-account upload) was removed; the POST handler
+    is a thin redirect to step 6."""
     from app.ui.setup import setup_step_5
+    response = await setup_step_5(FakeFormRequest({}))
+    assert response.status_code == 302
+    assert response.headers["location"] == "/setup?step=6"
+
+
+@pytest.mark.asyncio
+async def test_setup_step6_completes_setup_and_disables_alerts(test_db, monkeypatch, tmp_path):
+    """Step 6 (final completion) generates the encryption key when
+    missing, creates the key directory, and disables alerts when
+    SMTP was not configured."""
+    from app.ui import setup as setup_module
+    from app.ui.setup import setup_step_6
 
     setup_module._oobe_data.clear()
     setup_module._oobe_data.update(
@@ -90,17 +110,22 @@ async def test_setup_step5_generates_key_creates_directory_and_sets_alerts_disab
 
     nested_dir = tmp_path / "nested" / "keys"
     key_path = nested_dir / "enc.key"
-    monkeypatch.setattr("app.ui.setup.get_settings", lambda: SimpleNamespace(encryption_key_file=str(key_path)))
+    monkeypatch.setattr(
+        "app.ui.setup.get_settings",
+        lambda: SimpleNamespace(encryption_key_file=str(key_path)),
+    )
     monkeypatch.setattr("app.ui.setup.generate_encryption_key", lambda: b"1" * 32)
 
-    response = await setup_step_5(FakeFormRequest({"confirmed": "on"}))
+    response = await setup_step_6(FakeFormRequest({"confirmed": "on"}))
     assert response.status_code == 302
-    assert response.headers["location"] == "/setup?step=6"
+    assert response.headers["location"].startswith("/setup?step=7")
     assert key_path.exists()
     assert setup_module._oobe_data == {}
 
     db = await get_database()
-    cursor = await db.execute("SELECT value_plain FROM settings WHERE key = 'alerts_enabled'")
+    cursor = await db.execute(
+        "SELECT value_plain FROM settings WHERE key = 'alerts_enabled'",
+    )
     row = await cursor.fetchone()
     assert row["value_plain"] == "false"
 

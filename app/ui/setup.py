@@ -61,15 +61,21 @@ async def setup_wizard(
     if await is_oobe_completed():
         return RedirectResponse(url="/app", status_code=status.HTTP_302_FOUND)
 
+    # Step 5 (service-account upload) was removed at the Stage-5
+    # cutover; the wizard now jumps step 4 → step 6 (encryption).
+    # We keep step number 6 stable so existing redirects still land
+    # on the right page.
     template_map = {
         1: "setup/step1_welcome.html",
         2: "setup/step2_credentials.html",
         3: "setup/step3_admin.html",
         4: "setup/step4_email.html",
-        5: "setup/step5_service_account.html",
         6: "setup/step6_encryption.html",
         7: "setup/step7_complete.html",
     }
+    if step == 5:
+        # Anyone arriving at step 5 gets bounced to step 6.
+        return RedirectResponse(url="/setup?step=6", status_code=status.HTTP_302_FOUND)
 
     template = template_map.get(step, "setup/step1_welcome.html")
 
@@ -84,15 +90,11 @@ async def setup_wizard(
         "public_url": settings.public_url.rstrip("/"),
     }
 
-    # For step 5, include SA upload status
-    if step == 5:
-        context["sa_uploaded"] = _oobe_data.get("sa_uploaded", False)
-        context["sa_email"] = _oobe_data.get("sa_email", "")
-
-    # For step 7, pass SA info from query params (oobe_data is cleared by then)
+    # Step 5 (service-account) and SA context fields were removed
+    # at the Stage-5 cutover; step 7 no longer renders SA banners.
     if step == 7:
-        context["sa_uploaded"] = sa == "1"
-        context["sa_email"] = sa_email or ""
+        context["sa_uploaded"] = False
+        context["sa_email"] = ""
 
     # For step 6, generate encryption key if not already done
     if step == 6 and "encryption_key" not in _oobe_data:
@@ -277,69 +279,18 @@ async def test_email(request: Request):
 
 @router.post("/step/5")
 async def setup_step_5(request: Request):
-    """Handle step 5 - Service account key upload."""
-    form = await request.form()
-    sa_file: Optional[UploadFile] = form.get("sa_key_file")
-
-    if sa_file and sa_file.filename:
-        try:
-            contents = await sa_file.read()
-            sa_data = json.loads(contents)
-
-            # Validate required fields
-            if "client_email" not in sa_data or "private_key" not in sa_data:
-                return templates.TemplateResponse(request, "setup/step5_service_account.html", context={
-                    "step": 5,
-                    "error": "Invalid service account key file. It must contain 'client_email' and 'private_key' fields.",
-                    "sa_uploaded": False,
-                    "sa_email": "",
-                    "public_url": get_settings().public_url.rstrip("/"),
-                })
-
-            # Save the key file
-            key_dir = os.path.dirname(SA_KEY_PATH)
-            if key_dir and not os.path.exists(key_dir):
-                os.makedirs(key_dir, exist_ok=True)
-
-            with open(SA_KEY_PATH, "w") as f:
-                json.dump(sa_data, f)
-
-            _oobe_data["sa_uploaded"] = True
-            _oobe_data["sa_email"] = sa_data["client_email"]
-            _oobe_data["sa_key_path"] = SA_KEY_PATH
-
-            logger.info(f"Service account key uploaded: {sa_data['client_email']}")
-
-        except json.JSONDecodeError:
-            return templates.TemplateResponse(request, "setup/step5_service_account.html", context={
-                "step": 5,
-                "error": "The uploaded file is not valid JSON. Make sure you're uploading the JSON key file from Google Cloud Console.",
-                "sa_uploaded": False,
-                "sa_email": "",
-                "public_url": get_settings().public_url.rstrip("/"),
-            })
-        except PermissionError:
-            return templates.TemplateResponse(request, "setup/step5_service_account.html", context={
-                "step": 5,
-                "error": f"Permission denied writing to {SA_KEY_PATH}. Make sure the secrets/ directory is writable (run: sudo chown -R 1000:1000 secrets/).",
-                "sa_uploaded": False,
-                "sa_email": "",
-                "public_url": get_settings().public_url.rstrip("/"),
-            })
+    """Service-account upload step was removed at the Stage-5
+    cutover; this handler just redirects to step 6 so existing
+    bookmarks / old form submits don't 404."""
+    return RedirectResponse(url="/setup?step=6", status_code=status.HTTP_302_FOUND)
 
     return RedirectResponse(url="/setup?step=5", status_code=status.HTTP_302_FOUND)
 
 
 @router.post("/step/5/skip")
-async def setup_step_5_skip(request: Request):
-    """Skip service account setup."""
-    _oobe_data["sa_uploaded"] = False
-    return RedirectResponse(url="/setup?step=6", status_code=status.HTTP_302_FOUND)
-
-
 @router.post("/step/5/continue")
-async def setup_step_5_continue(request: Request):
-    """Continue after service account upload."""
+async def setup_step_5_bypass(request: Request):
+    """Legacy handlers — service-account upload step is gone."""
     return RedirectResponse(url="/setup?step=6", status_code=status.HTTP_302_FOUND)
 
 
@@ -436,27 +387,16 @@ async def setup_step_6(request: Request):
 
     await db.commit()
 
-    # Activate service account if uploaded during setup
-    sa_uploaded = _oobe_data.get("sa_uploaded", False)
-    sa_email = _oobe_data.get("sa_email", "")
-    if sa_uploaded and _oobe_data.get("sa_key_path"):
-        os.environ["SERVICE_ACCOUNT_KEY_FILE"] = _oobe_data["sa_key_path"]
-        # Clear cached settings and SA info so the new key is picked up
-        from app.config import get_settings as _gs
-        _gs.cache_clear()
-        from app.auth.service_account import reset_cache as _sa_reset
-        _sa_reset()
-        logger.info(f"Service account activated: {sa_email}")
+    # Service-account activation block was removed at the
+    # Stage-5 cutover (REWRITE_PLAN.md §1).
 
     # Clear OOBE data
     _oobe_data.clear()
 
     logger.info("OOBE setup completed successfully")
 
-    # Pass SA info to the completion page
     return RedirectResponse(
-        url=f"/setup?step=7&sa={'1' if sa_uploaded else '0'}&sa_email={sa_email}",
-        status_code=status.HTTP_302_FOUND,
+        url="/setup?step=7", status_code=status.HTTP_302_FOUND,
     )
 
 

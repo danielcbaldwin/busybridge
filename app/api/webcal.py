@@ -44,15 +44,19 @@ async def list_webcal_subscriptions(user: User = Depends(get_current_user)):
     db = await get_database()
 
     cursor = await db.execute(
-        """SELECT ws.*,
-                  (SELECT COUNT(*) FROM event_mappings em
-                   WHERE em.webcal_subscription_id = ws.id AND em.deleted_at IS NULL) as event_count
+        """SELECT ws.*
            FROM webcal_subscriptions ws
            WHERE ws.user_id = ? AND ws.is_active = TRUE
            ORDER BY ws.created_at DESC""",
         (user.id,),
     )
     rows = await cursor.fetchall()
+
+    # Event counts now come from the ledger.
+    from app.ledger.facade import count_active_events_per_webcal_subscription
+    counts = await count_active_events_per_webcal_subscription(
+        db, user_id=user.id,
+    )
 
     results = []
     for row in rows:
@@ -74,7 +78,7 @@ async def list_webcal_subscriptions(user: User = Depends(get_current_user)):
             sync_status=sync_status,
             consecutive_failures=row["consecutive_failures"] or 0,
             last_error=row["last_error"],
-            event_count=row["event_count"] or 0,
+            event_count=counts.get(int(row["id"]), 0),
         ))
 
     return results
@@ -111,7 +115,7 @@ async def create_webcal_subscription(
         )
 
     # SSRF check + validate by trying to fetch
-    from app.sync.ics_parser import fetch_ics_feed, validate_url_for_ssrf
+    from app.utils.ics_fetch import fetch_ics_feed, validate_url_for_ssrf
     try:
         validate_url_for_ssrf(url)
     except ValueError:
@@ -162,12 +166,10 @@ async def create_webcal_subscription(
     )
     await db.commit()
 
-    # Trigger initial sync
-    from app.sync.webcal_sync import sync_webcal_subscription
-    from app.utils.tasks import create_background_task
-    create_background_task(
-        sync_webcal_subscription(sub_id),
-        f"initial_sync_webcal_{sub_id}",
+    # Trigger initial sync via the ledger queue.
+    from app.ledger.triggers import enqueue_manual
+    await enqueue_manual(
+        db, user_id=user.id, source_hint=f"webcal:{sub_id}",
     )
 
     return WebcalSubscriptionResponse(
@@ -198,16 +200,27 @@ async def delete_webcal_subscription(
             detail="Subscription not found",
         )
 
-    # Clean up events
-    from app.sync.webcal_sync import cleanup_webcal_subscription
-    await cleanup_webcal_subscription(subscription_id, user.id)
-
-    # Deactivate
+    # Cancel every ledger row sourced from this subscription so
+    # the next reconcile drains the deletes.
+    now_iso = datetime.utcnow().isoformat()
+    await db.execute(
+        """UPDATE ledger_events
+              SET status = 'cancelled',
+                  version = version + 1,
+                  cancelled_at = ?, updated_at = ?
+            WHERE user_id = ? AND source_type = 'webcal'
+              AND source_calendar_id = ? AND status = 'active'""",
+        (now_iso, now_iso, user.id, subscription_id),
+    )
     await db.execute(
         "UPDATE webcal_subscriptions SET is_active = FALSE, updated_at = ? WHERE id = ?",
-        (datetime.utcnow().isoformat(), subscription_id),
+        (now_iso, subscription_id),
     )
     await db.commit()
+    # Enqueue reconcile so the planner sets projections to absent
+    # and the outbox drains.
+    from app.ledger.triggers import enqueue_manual
+    await enqueue_manual(db, user_id=user.id, source_hint="all")
 
     # Log
     await db.execute(
@@ -238,13 +251,10 @@ async def trigger_webcal_sync(
             detail="Subscription not found",
         )
 
-    from app.sync.webcal_sync import sync_webcal_subscription
-    from app.utils.tasks import create_background_task
-    create_background_task(
-        sync_webcal_subscription(subscription_id),
-        f"manual_sync_webcal_{subscription_id}",
+    from app.ledger.triggers import enqueue_manual
+    await enqueue_manual(
+        db, user_id=user.id, source_hint=f"webcal:{subscription_id}",
     )
-
     return {"status": "ok", "message": "Sync triggered"}
 
 
@@ -273,20 +283,15 @@ async def update_webcal_subscription(
     )
     await db.commit()
 
-    # Trigger re-sync to update event summaries
-    from app.sync.webcal_sync import sync_webcal_subscription
-    from app.utils.tasks import create_background_task
-
-    # Clear etag to force re-processing
+    # Clear etag and trigger re-sync via the ledger queue.
     await db.execute(
         "UPDATE webcal_subscriptions SET last_etag = NULL WHERE id = ?",
         (subscription_id,),
     )
     await db.commit()
-
-    create_background_task(
-        sync_webcal_subscription(subscription_id),
-        f"resync_webcal_{subscription_id}",
+    from app.ledger.triggers import enqueue_manual
+    await enqueue_manual(
+        db, user_id=user.id, source_hint=f"webcal:{subscription_id}",
     )
 
     return {"status": "ok", "message": "Prefix updated, re-sync triggered"}

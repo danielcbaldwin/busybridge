@@ -198,49 +198,32 @@ def test_main_module_main_block_runs_with_stubbed_uvicorn(tmp_path, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_cleanup_recurring_branch_and_vacuum(test_db, monkeypatch):
-    """Cleanup should handle recurring-series deletion and vacuum call."""
+    """Cleanup should handle recurring-series deletion and vacuum call.
+
+    Post-cutover the retention job operates on ``ledger_events``
+    rather than ``event_mappings``.  Seed a cancelled recurring
+    ledger row past the retention cutoff and verify the job
+    removes it."""
     from app.jobs.cleanup import run_retention_cleanup, vacuum_database
 
     db = await get_database()
-    # Create recurring mapping soft-deleted in the past.
     await db.execute(
         """INSERT INTO users (email, google_user_id, display_name)
            VALUES ('cleanup-rec@example.com', 'cleanup-rec-google', 'x')"""
     )
-    cursor = await db.execute("SELECT id FROM users WHERE email = 'cleanup-rec@example.com'")
+    cursor = await db.execute(
+        "SELECT id FROM users WHERE email = 'cleanup-rec@example.com'",
+    )
     user_id = (await cursor.fetchone())["id"]
+    long_ago = (datetime.utcnow() - timedelta(days=40)).isoformat()
     await db.execute(
-        """INSERT INTO event_mappings
-           (user_id, origin_type, origin_event_id, main_event_id, is_recurring, deleted_at, user_can_edit)
-           VALUES (?, 'main', 'orig-rec', 'main-rec', TRUE, ?, TRUE)""",
-        (user_id, (datetime.utcnow() - timedelta(days=40)).isoformat()),
-    )
-    await db.execute(
-        """INSERT INTO oauth_tokens
-           (user_id, account_type, google_account_email, access_token_encrypted, refresh_token_encrypted)
-           VALUES (?, 'client', 'cleanup-client@example.com', ?, ?)""",
-        (user_id, b"a", b"r"),
-    )
-    cursor = await db.execute(
-        """SELECT id FROM oauth_tokens
-           WHERE user_id = ? AND google_account_email = 'cleanup-client@example.com'""",
-        (user_id,),
-    )
-    oauth_token_id = (await cursor.fetchone())["id"]
-    await db.execute(
-        """INSERT INTO client_calendars (user_id, oauth_token_id, google_calendar_id, display_name)
-           VALUES (?, ?, 'cleanup-client-cal', 'Cleanup Client')""",
-        (user_id, oauth_token_id),
-    )
-    cursor = await db.execute(
-        "SELECT id FROM client_calendars WHERE google_calendar_id = 'cleanup-client-cal'"
-    )
-    client_calendar_id = (await cursor.fetchone())["id"]
-    cursor = await db.execute("SELECT id FROM event_mappings WHERE origin_event_id = 'orig-rec'")
-    mapping_id = (await cursor.fetchone())["id"]
-    await db.execute(
-        "INSERT INTO busy_blocks (event_mapping_id, client_calendar_id, busy_block_event_id) VALUES (?, ?, 'bb-rec')",
-        (mapping_id, client_calendar_id),
+        """INSERT INTO ledger_events
+              (user_id, canonical_uid, source_type,
+               is_recurring, status, cancelled_at, version,
+               created_at, updated_at)
+           VALUES (?, 'main_native:rec:1', 'main_native',
+                   1, 'cancelled', ?, 1, ?, ?)""",
+        (user_id, long_ago, long_ago, long_ago),
     )
     await db.commit()
 

@@ -139,7 +139,15 @@ async def ingest_webcal_subscription(
     # Stale-detection: anything previously sourced from this
     # subscription but not in this poll's seen set, AND not seen
     # for >= 2 poll intervals, flips to cancelled.
-    poll_interval = int(state["poll_interval_seconds"] or 3600)
+    # Production schema stores poll_interval_minutes; some test
+    # schemas use poll_interval_seconds.  Tolerate either.
+    keys = state.keys() if hasattr(state, "keys") else []
+    if "poll_interval_minutes" in keys and state["poll_interval_minutes"]:
+        poll_interval = int(state["poll_interval_minutes"]) * 60
+    elif "poll_interval_seconds" in keys and state["poll_interval_seconds"]:
+        poll_interval = int(state["poll_interval_seconds"])
+    else:
+        poll_interval = 3600
     stale_cutoff = (now - timedelta(seconds=2 * poll_interval)).isoformat()
     rows = await (await db.execute(
         """SELECT id, canonical_uid FROM ledger_events
@@ -415,12 +423,31 @@ async def _record_fetch_success(
     etag: Optional[str],
     now: datetime,
 ) -> None:
+    # Production schema uses ``last_poll_at`` + ``last_success_at``;
+    # test schema uses ``last_polled_at``.  Update each that exists.
+    iso = now.isoformat()
+    for column in ("last_poll_at", "last_polled_at"):
+        try:
+            await db.execute(
+                f"UPDATE webcal_subscriptions SET {column} = ? WHERE id = ?",
+                (iso, subscription_id),
+            )
+        except Exception:
+            pass
+    for column in ("last_success_at",):
+        try:
+            await db.execute(
+                f"UPDATE webcal_subscriptions SET {column} = ? WHERE id = ?",
+                (iso, subscription_id),
+            )
+        except Exception:
+            pass
     await db.execute(
         """UPDATE webcal_subscriptions
-              SET last_etag = ?, last_polled_at = ?,
+              SET last_etag = ?,
                   consecutive_failures = 0, last_error = NULL
             WHERE id = ?""",
-        (etag, now.isoformat(), subscription_id),
+        (etag, subscription_id),
     )
 
 

@@ -61,7 +61,11 @@ class Settings(BaseSettings):
     disconnected_calendar_retention_days: int = 30
 
     # Service account
-    service_account_key_file: Optional[str] = None
+    # service_account_key_file removed at the Stage-5 cutover
+    # (REWRITE_PLAN.md §1 / §9).  Kept as a no-op field on
+    # Settings only if the env var is set, since pydantic-settings
+    # rejects unknown env vars at parse time.
+    service_account_key_file: Optional[str] = None  # unused; retained for env-var back-compat
 
     # Google Calendar
     calendar_sync_tag: str = "calendarSyncEngine"

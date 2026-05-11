@@ -115,46 +115,13 @@ async def receive_google_calendar_webhook(
         # Never let the ledger trigger plumbing block legacy sync.
         logger.warning("ledger enqueue_webhook failed: %s", e)
 
-    # Trigger sync for the affected calendar
-    try:
-        from app.sync.engine import trigger_sync_for_calendar, trigger_sync_for_main_calendar, trigger_sync_for_personal_calendar
-        from app.utils.tasks import create_background_task
-
-        # Debounce webhook-triggered syncs by a few seconds.  Google
-        # Calendar's push notifications can arrive before the API returns
-        # consistent data for recent writes, so a short delay avoids
-        # syncing stale snapshots that would never be corrected
-        # (incremental sync tokens move past consumed changes).
-        _WEBHOOK_DEBOUNCE = 5
-
-        if channel["calendar_type"] == "main":
-            create_background_task(
-                trigger_sync_for_main_calendar(channel["user_id"], debounce=_WEBHOOK_DEBOUNCE, schedule_verification=False),
-                f"sync_main_calendar_user_{channel['user_id']}"
-            )
-        elif channel["calendar_type"] == "personal":
-            if channel["client_calendar_id"]:
-                create_background_task(
-                    trigger_sync_for_personal_calendar(channel["client_calendar_id"], debounce=_WEBHOOK_DEBOUNCE),
-                    f"sync_personal_{channel['client_calendar_id']}"
-                )
-        else:
-            if channel["client_calendar_id"]:
-                create_background_task(
-                    trigger_sync_for_calendar(channel["client_calendar_id"], debounce=_WEBHOOK_DEBOUNCE, schedule_verification=False),
-                    f"sync_calendar_{channel['client_calendar_id']}"
-                )
-
-        logger.info(
-            f"Sync triggered for calendar: "
-            f"type={channel['calendar_type']}, calendar_id={channel['client_calendar_id']}"
-        )
-
-    except Exception as e:
-        logger.exception(f"Failed to trigger sync from webhook: {e}")
-        # Still return OK to avoid Google retrying
-        return {"status": "ok", "message": "Sync trigger failed"}
-
+    # The earlier enqueue_webhook call above is the only sync
+    # trigger.  The scheduler's ledger-drain job picks it up
+    # within the next 30s.
+    logger.info(
+        "Webhook recorded: calendar_type=%s calendar_id=%s",
+        channel["calendar_type"], channel["client_calendar_id"],
+    )
     return {"status": "ok"}
 
 

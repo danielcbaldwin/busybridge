@@ -145,12 +145,10 @@ async def connect_personal_calendars(
         )
         await db.commit()
 
-        # Trigger initial sync
-        from app.sync.engine import trigger_sync_for_personal_calendar
-        from app.utils.tasks import create_background_task
-        create_background_task(
-            trigger_sync_for_personal_calendar(new_id),
-            f"initial_sync_personal_{new_id}"
+        # Trigger initial sync via the ledger queue.
+        from app.ledger.triggers import enqueue_manual
+        await enqueue_manual(
+            db, user_id=user.id, source_hint=f"personal:{new_id}",
         )
 
         results.append(PersonalCalendarResponse(
@@ -186,16 +184,10 @@ async def disconnect_personal_calendar(
             detail="Personal calendar not found"
         )
 
-    from app.sync.engine import cleanup_disconnected_calendar
-    await cleanup_disconnected_calendar(calendar_id, user.id)
-
-    await db.execute(
-        """UPDATE client_calendars
-           SET is_active = FALSE, disconnected_at = ?
-           WHERE id = ?""",
-        (datetime.utcnow().isoformat(), calendar_id)
+    from app.ledger.admin_ops import disconnect_calendar
+    await disconnect_calendar(
+        db, user_id=user.id, client_calendar_id=calendar_id,
     )
-    await db.commit()
 
     await db.execute(
         """INSERT INTO sync_log (user_id, calendar_id, action, status, details)
@@ -228,11 +220,9 @@ async def trigger_personal_calendar_sync(
             detail="Personal calendar not found"
         )
 
-    from app.sync.engine import trigger_sync_for_personal_calendar
-    from app.utils.tasks import create_background_task
-    create_background_task(
-        trigger_sync_for_personal_calendar(calendar_id),
-        f"manual_sync_personal_{calendar_id}"
+    from app.ledger.triggers import enqueue_manual
+    await enqueue_manual(
+        db, user_id=user.id, source_hint=f"personal:{calendar_id}",
     )
 
     return {"status": "ok", "message": "Sync triggered"}

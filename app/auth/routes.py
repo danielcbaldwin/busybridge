@@ -224,25 +224,30 @@ async def oauth_callback(
             expires_in=tokens.get("expires_in")
         )
 
-        # Initialize main calendar if not set
+        # Initialize main calendar if not set — list via the
+        # RealGoogleClient adapter (same client the ledger uses).
         if not user.main_calendar_id:
             try:
-                from app.sync.google_calendar import AsyncGoogleCalendarClient
-                client_settings = get_settings()
-                cal_client = AsyncGoogleCalendarClient(access_token, client_settings)
-                calendars = await cal_client.list_calendars()
-                # Find the primary calendar
-                primary_cal = next((c for c in calendars if c.get("primary")), None)
+                from app.ledger.real_google_client import RealGoogleClient
+                from google.oauth2.credentials import Credentials
+                cal_client = RealGoogleClient(Credentials(token=access_token))
+                cals = cal_client._service.calendarList().list().execute()
+                items = cals.get("items", [])
+                primary_cal = next((c for c in items if c.get("primary")), None)
                 if primary_cal:
                     db = await get_database()
                     await db.execute(
                         "UPDATE users SET main_calendar_id = ? WHERE id = ?",
-                        (primary_cal["id"], user.id)
+                        (primary_cal["id"], user.id),
                     )
                     await db.commit()
-                    logger.info(f"Set main calendar for user {user.id}: {primary_cal['id']}")
+                    logger.info(
+                        f"Set main calendar for user {user.id}: {primary_cal['id']}"
+                    )
             except Exception as e:
-                logger.warning(f"Could not initialize main calendar for user {user.id}: {e}")
+                logger.warning(
+                    f"Could not initialize main calendar for user {user.id}: {e}"
+                )
 
         # Update last login
         await update_user_last_login(user.id)

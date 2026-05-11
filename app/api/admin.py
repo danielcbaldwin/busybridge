@@ -111,13 +111,18 @@ async def get_system_health(admin: User = Depends(require_admin)):
     )
     active_calendars = (await cursor.fetchone())[0]
 
-    # Events and busy blocks
+    # Events and busy blocks: now sourced from the ledger.
     cursor = await db.execute(
-        "SELECT COUNT(*) FROM event_mappings WHERE deleted_at IS NULL"
+        """SELECT COUNT(*) FROM ledger_events
+            WHERE status = 'active' AND user_intentionally_deleted = 0"""
     )
     total_events = (await cursor.fetchone())[0]
 
-    cursor = await db.execute("SELECT COUNT(*) FROM busy_blocks")
+    cursor = await db.execute(
+        """SELECT COUNT(*) FROM ledger_projections
+            WHERE current_state = 'present'
+              AND desired_state IN ('present_busy', 'present_personal_busy')"""
+    )
     total_busy_blocks = (await cursor.fetchone())[0]
 
     # Sync errors in last 24h
@@ -270,12 +275,8 @@ async def trigger_user_sync(
             detail="User not found"
         )
 
-    from app.sync.engine import trigger_sync_for_user
-    from app.utils.tasks import create_background_task
-    create_background_task(
-        trigger_sync_for_user(user_id),
-        f"admin_trigger_sync_user_{user_id}"
-    )
+    from app.ledger.triggers import enqueue_manual
+    await enqueue_manual(db, user_id=user_id, source_hint="all")
 
     return {"status": "ok", "message": "Sync triggered"}
 
@@ -310,29 +311,12 @@ async def force_user_reauth(
            )""",
         (user_id,)
     )
+    # Ledger projections + outbox cascade through user_id on ledger_events.
     await db.execute(
-        """DELETE FROM busy_blocks
-           WHERE client_calendar_id IN (
-               SELECT id FROM client_calendars WHERE user_id = ?
-           )""",
-        (user_id,)
+        """DELETE FROM ledger_events WHERE user_id = ?""", (user_id,),
     )
     await db.execute(
-        """DELETE FROM busy_blocks
-           WHERE event_mapping_id IN (
-               SELECT id FROM event_mappings
-               WHERE origin_calendar_id IN (
-                   SELECT id FROM client_calendars WHERE user_id = ?
-               )
-           )""",
-        (user_id,)
-    )
-    await db.execute(
-        """DELETE FROM event_mappings
-           WHERE origin_calendar_id IN (
-               SELECT id FROM client_calendars WHERE user_id = ?
-           )""",
-        (user_id,)
+        """DELETE FROM reconcile_requests WHERE user_id = ?""", (user_id,),
     )
     await db.execute(
         """DELETE FROM sync_log
@@ -385,10 +369,12 @@ async def delete_user(
     )
     calendars = await cursor.fetchall()
 
-    from app.sync.engine import cleanup_disconnected_calendar
+    from app.ledger.admin_ops import disconnect_calendar
     for cal in calendars:
         try:
-            await cleanup_disconnected_calendar(cal["id"], user_id)
+            await disconnect_calendar(
+                db, user_id=user_id, client_calendar_id=int(cal["id"]),
+            )
         except Exception as e:
             logger.warning(f"Error cleaning up calendar {cal['id']}: {e}")
 
@@ -446,17 +432,10 @@ async def admin_disconnect_calendar(
             detail="Calendar not found"
         )
 
-    from app.sync.engine import cleanup_disconnected_calendar
-    await cleanup_disconnected_calendar(calendar_id, user_id)
-
-    await db.execute(
-        """UPDATE client_calendars
-           SET is_active = FALSE, disconnected_at = ?
-           WHERE id = ?""",
-        (datetime.utcnow().isoformat(), calendar_id)
+    from app.ledger.admin_ops import disconnect_calendar
+    await disconnect_calendar(
+        db, user_id=user_id, client_calendar_id=calendar_id,
     )
-    await db.commit()
-
     return {"status": "ok", "message": "Calendar disconnected"}
 
 
@@ -547,37 +526,53 @@ async def trigger_consistency_check(
 ):
     """Run (or preview) the consistency check.
 
-    With dry_run=True no changes are made; the response includes a
-    "planned_actions" list describing every action that would be taken.
-    Pass user_id to scope the check to a single user.
-    """
-    from app.sync.consistency import run_consistency_check, check_user_consistency
+    Under the ledger architecture (REWRITE_PLAN.md §3) consistency
+    is structurally enforced by the planner + outbox: divergences
+    between desired and applied projection state ARE the
+    inconsistencies, and they're reconciled automatically every
+    drain tick.  This endpoint therefore reports — but does not
+    "fix" — the current divergence count.
 
+    For active repair, use POST ``/admin/ledger/users/{id}/sync-now``
+    (enqueue a reconcile) or
+    ``/admin/ledger/users/{id}/full-resync`` (clear sync tokens).
+    """
+    from app.ledger.facade import outbox_summary
+
+    db = await get_database()
     if user_id is not None:
-        db = await get_database()
         cursor = await db.execute("SELECT id FROM users WHERE id = ?", (user_id,))
         if not await cursor.fetchone():
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found",
+                status_code=status.HTTP_404_NOT_FOUND, detail="User not found",
             )
+        target_ids = [user_id]
+    else:
+        rows = await (await db.execute("SELECT id FROM users")).fetchall()
+        target_ids = [int(r["id"]) for r in rows]
 
-        per_user_summary = {
-            "users_checked": 0,
-            "mappings_checked": 0,
-            "orphaned_main_events_deleted": 0,
-            "missing_copies_recreated": 0,
-            "orphaned_busy_blocks_deleted": 0,
-            "errors": 0,
-        }
-        if dry_run:
-            per_user_summary["planned_actions"] = []
-
-        await check_user_consistency(user_id, per_user_summary, dry_run=dry_run)
-        return {"dry_run": dry_run, "summary": per_user_summary}
-
-    result = await run_consistency_check(dry_run=dry_run)
-    return {"dry_run": dry_run, "summary": result}
+    summary = {
+        "users_checked": len(target_ids),
+        "pending_outbox": 0,
+        "in_flight_outbox": 0,
+        "permanently_failed": 0,
+        "diverged_projections": 0,
+    }
+    for uid in target_ids:
+        ob = await outbox_summary(db, user_id=uid)
+        summary["pending_outbox"] += ob.get("pending", 0)
+        summary["in_flight_outbox"] += ob.get("in_flight", 0)
+        summary["permanently_failed"] += ob.get("permanent_failure", 0)
+        row = await (await db.execute(
+            """SELECT COUNT(*) AS n FROM ledger_projections p
+                 JOIN ledger_events e ON e.id = p.ledger_event_id
+                WHERE e.user_id = ?
+                  AND (p.applied_ledger_version IS NULL
+                       OR p.applied_ledger_version != p.desired_ledger_version)""",
+            (uid,),
+        )).fetchone()
+        summary["diverged_projections"] += int(row["n"] or 0)
+    return {"dry_run": dry_run, "summary": summary}
 
 
 @router.post("/consistency/cleanup-duplicates")
@@ -585,14 +580,17 @@ async def trigger_duplicate_cleanup(
     dry_run: bool = True,
     admin: User = Depends(require_admin),
 ):
-    """Find and remove duplicate events from recurring event rescheduling.
-
-    With dry_run=True (default) no changes are made; returns planned actions.
-    """
-    from app.sync.consistency import cleanup_recurring_duplicates
-
-    result = await cleanup_recurring_duplicates(dry_run=dry_run)
-    return {"dry_run": dry_run, "summary": result}
+    """Duplicates from recurring rescheduling are structurally
+    prevented under the ledger architecture (the deterministic
+    Google ID + 409-as-success path in app/ledger/outbox.py).
+    Kept as a no-op endpoint for backwards compatibility."""
+    return {
+        "dry_run": dry_run,
+        "summary": {
+            "duplicates_removed": 0,
+            "note": "deterministic IDs make duplicates structurally impossible",
+        },
+    }
 
 
 @router.get("/settings", response_model=SettingsResponse)
@@ -685,16 +683,19 @@ async def factory_reset(
     # SQLite doesn't support parameterized table names, so this is intentionally
     # a hardcoded ordered list.
     SAFE_TABLES_IN_DELETE_ORDER = [
-        "busy_blocks",
+        "outbox_operations",
+        "ledger_projections",
+        "ledger_events",
+        "reconcile_requests",
         "webhook_channels",
         "calendar_sync_state",
         "main_calendar_sync_state",
-        "event_mappings",
         "sync_log",
         "alert_queue",
         "oauth_states",
         "integrity_status",
         "client_calendars",
+        "webcal_subscriptions",
         "oauth_tokens",
         "users",
         "settings",
@@ -703,7 +704,12 @@ async def factory_reset(
     ]
 
     for table in SAFE_TABLES_IN_DELETE_ORDER:
-        await db.execute(f"DELETE FROM {table}")
+        try:
+            await db.execute(f"DELETE FROM {table}")
+        except Exception:
+            # Tables we may have already removed in migrations are
+            # tolerated so factory-reset works post-cutover.
+            pass
 
     await db.commit()
 
@@ -732,100 +738,7 @@ async def export_database(admin: User = Depends(require_admin)):
     )
 
 
-@router.get("/service-account")
-async def get_service_account_status(admin: User = Depends(require_admin)):
-    """Get service account configuration status."""
-    from app.auth.service_account import is_sa_configured, get_sa_email
-
-    configured = is_sa_configured()
-    email = get_sa_email() if configured else None
-
-    return {
-        "configured": configured,
-        "email": email,
-    }
-
-
-@router.post("/service-account/test/{user_id}")
-async def test_service_account_access(
-    user_id: int,
-    admin: User = Depends(require_admin),
-):
-    """Test SA access to a user's main calendar and set sa_tier on success."""
-    db = await get_database()
-
-    cursor = await db.execute(
-        "SELECT id, email, main_calendar_id FROM users WHERE id = ?", (user_id,)
-    )
-    user = await cursor.fetchone()
-
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
-
-    if not user["main_calendar_id"]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="User has no main calendar configured",
-        )
-
-    from app.auth.service_account import is_sa_configured, get_sa_main_client, get_sa_email
-
-    if not is_sa_configured():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Service account key file not configured",
-        )
-
-    sa_client = get_sa_main_client(user["main_calendar_id"])
-    if sa_client is None:
-        # SA cannot access the calendar
-        await db.execute("UPDATE users SET sa_tier = 0 WHERE id = ?", (user_id,))
-        await db.commit()
-        sa_email = get_sa_email()
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                f"Service account cannot access calendar {user['main_calendar_id']}. "
-                f"Share the calendar with {sa_email} (Make changes to events)."
-            ),
-        )
-
-    # Success — set tier 2
-    await db.execute("UPDATE users SET sa_tier = 2 WHERE id = ?", (user_id,))
-    await db.commit()
-
-    return {
-        "status": "ok",
-        "sa_tier": 2,
-        "message": f"Service account can access {user['main_calendar_id']}",
-    }
-
-
-@router.post("/service-account/deactivate/{user_id}")
-async def deactivate_service_account(
-    user_id: int,
-    admin: User = Depends(require_admin),
-):
-    """Deactivate service account for a user (set sa_tier back to 0)."""
-    db = await get_database()
-
-    cursor = await db.execute("SELECT id, email FROM users WHERE id = ?", (user_id,))
-    user = await cursor.fetchone()
-
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
-
-    await db.execute("UPDATE users SET sa_tier = 0 WHERE id = ?", (user_id,))
-    await db.commit()
-
-    return {
-        "status": "ok",
-        "sa_tier": 0,
-        "message": f"Service account deactivated for {user['email']}",
-    }
+# NOTE: service-account endpoints were removed per REWRITE_PLAN.md §1
+# and §9.  The 🔒 emoji + uniform revert-on-drift mechanism in the
+# ledger pipeline (app/ledger/payload.py + app/ledger/outbox.py)
+# replaces SA mode entirely.

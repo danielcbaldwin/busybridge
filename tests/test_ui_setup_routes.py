@@ -51,8 +51,12 @@ async def test_setup_wizard_and_step2_paths(test_db, monkeypatch):
         return False
 
     monkeypatch.setattr("app.ui.setup.is_oobe_completed", oobe_incomplete)
+    # Step 5 (SA upload) was removed; the wizard now bounces to step 6.
     step5 = await setup_wizard(_request("/setup"), step=5)
-    assert step5.status_code == 200
+    assert step5.status_code == 302
+    assert step5.headers["location"] == "/setup?step=6"
+    step6 = await setup_wizard(_request("/setup"), step=6)
+    assert step6.status_code == 200
     assert "encryption_key_b64" in setup_module._oobe_data
 
     # Step 2 validation errors.
@@ -157,10 +161,14 @@ async def test_setup_step3_paths_and_test_credentials(test_db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_setup_step4_and_step5_completion_flow(test_db, monkeypatch, tmp_path):
-    """Steps 4 and 5 should persist OOBE data, complete setup, and clear temporary state."""
+async def test_setup_step4_and_step6_completion_flow(test_db, monkeypatch, tmp_path):
+    """Steps 4 and 6 should persist OOBE data, complete setup, and clear temporary state.
+
+    (Step 5 — service-account upload — was removed at cutover and is
+    now a redirect to step 6.)
+    """
     from app.ui import setup as setup_module
-    from app.ui.setup import setup_complete, setup_step_4, setup_step_5, test_email
+    from app.ui.setup import setup_complete, setup_step_4, setup_step_6, test_email
 
     setup_module._oobe_data.clear()
 
@@ -187,9 +195,9 @@ async def test_setup_step4_and_step5_completion_flow(test_db, monkeypatch, tmp_p
 
     assert (await test_email(FakeFormRequest({})))["success"] is True
 
-    # Step 5 requires confirmation.
+    # Step 6 requires confirmation.
     setup_module._oobe_data["encryption_key_b64"] = "abc"
-    missing_confirm = await setup_step_5(FakeFormRequest({"confirmed": ""}))
+    missing_confirm = await setup_step_6(FakeFormRequest({"confirmed": ""}))
     assert missing_confirm.status_code == 200
     assert "must confirm" in missing_confirm.context["error"].lower()
 
@@ -217,11 +225,14 @@ async def test_setup_step4_and_step5_completion_flow(test_db, monkeypatch, tmp_p
         }
     )
 
-    monkeypatch.setattr("app.ui.setup.get_settings", lambda: SimpleNamespace(encryption_key_file=str(key_path)))
+    monkeypatch.setattr(
+        "app.ui.setup.get_settings",
+        lambda: SimpleNamespace(encryption_key_file=str(key_path)),
+    )
 
-    completed = await setup_step_5(FakeFormRequest({"confirmed": "on"}))
+    completed = await setup_step_6(FakeFormRequest({"confirmed": "on"}))
     assert completed.status_code == 302
-    assert completed.headers["location"] == "/setup?step=6"
+    assert completed.headers["location"].startswith("/setup?step=7")
     assert key_path.exists()
     assert setup_module._oobe_data == {}
 

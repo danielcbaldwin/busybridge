@@ -1,17 +1,19 @@
-"""Sync engine module."""
+"""Legacy sync engine — drained out at the Stage-5 cutover.
 
-from app.sync.engine import (
-    trigger_sync_for_calendar,
-    trigger_sync_for_main_calendar,
-    trigger_sync_for_user,
-    cleanup_disconnected_calendar,
-    cleanup_managed_events_for_user,
-)
+What remains under ``app/sync/``:
 
-__all__ = [
-    "trigger_sync_for_calendar",
-    "trigger_sync_for_main_calendar",
-    "trigger_sync_for_user",
-    "cleanup_disconnected_calendar",
-    "cleanup_managed_events_for_user",
-]
+* ``google_calendar`` — the Google Calendar API adapter used by
+  the backup / ICS-export subsystem.  Kept; not used by the new
+  ledger pipeline (the ledger has its own
+  ``app/ledger/real_google_client.py``).
+* ``backup`` — SQLite dump + restore.  Kept (REWRITE_PLAN.md §13).
+* ``ics_export`` — ICS file export.  Kept.
+
+The orchestrator (``engine.py``), per-event rules (``rules.py``),
+consistency checker (``consistency.py``), webcal sync
+(``webcal_sync.py``) and the unused ICS parser (``ics_parser.py``)
+were removed at the cutover.  Their behaviours live in
+``app/ledger/`` now.
+"""
+
+__all__: list[str] = []

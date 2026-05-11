@@ -192,12 +192,10 @@ async def connect_client_calendar(
     )
     await db.commit()
 
-    # Trigger initial sync (in background)
-    from app.sync.engine import trigger_sync_for_calendar
-    from app.utils.tasks import create_background_task
-    create_background_task(
-        trigger_sync_for_calendar(calendar_id),
-        f"initial_sync_calendar_{calendar_id}"
+    # Trigger initial sync via the ledger queue.
+    from app.ledger.triggers import enqueue_manual
+    await enqueue_manual(
+        db, user_id=user.id, source_hint=f"client:{calendar_id}",
     )
 
     return ClientCalendarResponse(
@@ -232,18 +230,11 @@ async def disconnect_client_calendar(
             detail="Calendar not found"
         )
 
-    # Perform cleanup
-    from app.sync.engine import cleanup_disconnected_calendar
-    await cleanup_disconnected_calendar(calendar_id, user.id)
-
-    # Mark calendar as inactive
-    await db.execute(
-        """UPDATE client_calendars
-           SET is_active = FALSE, disconnected_at = ?
-           WHERE id = ?""",
-        (datetime.utcnow().isoformat(), calendar_id)
+    # Ledger disconnect: cleanup + deactivate + drain.
+    from app.ledger.admin_ops import disconnect_calendar
+    await disconnect_calendar(
+        db, user_id=user.id, client_calendar_id=calendar_id,
     )
-    await db.commit()
 
     # Log the disconnection
     await db.execute(
@@ -278,20 +269,13 @@ async def trigger_calendar_sync(
             detail="Calendar not found"
         )
 
-    # Trigger sync with settling delay so Google's cross-session
-    # eventual consistency has time to propagate recent writes.
+    # Settling delay matches the legacy trigger so Google's
+    # cross-session eventual consistency has time to propagate.
     _MANUAL_SYNC_SETTLE = 25
-    from app.sync.engine import trigger_sync_for_calendar
-    from app.utils.tasks import create_background_task
-    create_background_task(
-        trigger_sync_for_calendar(
-            calendar_id,
-            debounce=_MANUAL_SYNC_SETTLE,
-            track_progress=True,
-        ),
-        f"manual_sync_calendar_{calendar_id}"
+    from app.ledger.triggers import enqueue_manual
+    await enqueue_manual(
+        db, user_id=user.id, source_hint=f"client:{calendar_id}",
     )
-
     return {"status": "ok", "message": "Sync triggered", "settle_seconds": _MANUAL_SYNC_SETTLE}
 
 
@@ -314,11 +298,19 @@ async def get_calendar_sync_progress(
             detail="Calendar not found"
         )
 
-    from app.sync.engine import get_sync_progress
-    progress = get_sync_progress(calendar_id)
-    if progress is None:
+    # Surface the outbox queue depth for this calendar's projections
+    # as "progress".  Empty queue = idle = done.
+    row = await (await db.execute(
+        """SELECT COUNT(*) AS pending FROM outbox_operations o
+             JOIN ledger_projections p ON p.id = o.projection_id
+            WHERE o.user_id = ? AND o.status IN ('pending', 'in_flight')
+              AND (p.target_calendar_id = ? OR p.target_kind = 'main')""",
+        (user.id, calendar_id),
+    )).fetchone()
+    pending = int(row["pending"] or 0)
+    if pending == 0:
         return {"status": "idle"}
-    return progress
+    return {"status": "running", "pending": pending}
 
 
 @router.post("/{calendar_id}/resync")
@@ -349,13 +341,10 @@ async def trigger_calendar_resync(
     )
     await db.commit()
 
-    from app.sync.engine import trigger_sync_for_calendar
-    from app.utils.tasks import create_background_task
-    create_background_task(
-        trigger_sync_for_calendar(calendar_id),
-        f"resync_calendar_{calendar_id}"
+    from app.ledger.triggers import enqueue_manual
+    await enqueue_manual(
+        db, user_id=user.id, source_hint=f"client:{calendar_id}",
     )
-
     return {"status": "ok", "message": "Full resync triggered"}
 
 
@@ -380,13 +369,14 @@ async def trigger_calendar_cleanup_resync(
             detail="Calendar not found"
         )
 
-    from app.sync.engine import cleanup_and_resync_calendar
-    from app.utils.tasks import create_background_task
-    create_background_task(
-        cleanup_and_resync_calendar(calendar_id, user.id),
-        f"cleanup_resync_calendar_{calendar_id}"
+    from app.ledger.admin_ops import cleanup_one_calendar
+    from app.ledger.triggers import enqueue_manual
+    await cleanup_one_calendar(
+        db, user_id=user.id, client_calendar_id=calendar_id,
     )
-
+    await enqueue_manual(
+        db, user_id=user.id, source_hint=f"client:{calendar_id}",
+    )
     return {"status": "ok", "message": "Cleanup & re-sync started"}
 
 
@@ -415,19 +405,17 @@ async def get_calendar_status(
             detail="Calendar not found"
         )
 
-    # Count events and busy blocks
-    cursor = await db.execute(
-        """SELECT COUNT(*) FROM event_mappings
-           WHERE origin_calendar_id = ? AND deleted_at IS NULL""",
-        (calendar_id,)
+    # Count events and busy blocks via the ledger.
+    from app.ledger.facade import (
+        count_active_events_per_source_calendar,
+        count_busy_blocks_per_calendar,
     )
-    event_count = (await cursor.fetchone())[0]
-
-    cursor = await db.execute(
-        """SELECT COUNT(*) FROM busy_blocks WHERE client_calendar_id = ?""",
-        (calendar_id,)
+    src_counts = await count_active_events_per_source_calendar(
+        db, user_id=user.id,
     )
-    busy_block_count = (await cursor.fetchone())[0]
+    busy_counts = await count_busy_blocks_per_calendar(db, user_id=user.id)
+    event_count = int(src_counts.get(calendar_id, 0))
+    busy_block_count = int(busy_counts.get(calendar_id, 0))
 
     return CalendarStatusResponse(
         id=calendar["id"],
@@ -476,18 +464,13 @@ async def update_calendar_color(
     if old_color == request.color_id:
         return {"status": "ok", "message": "Color unchanged"}
 
-    await db.execute(
-        "UPDATE client_calendars SET color_id = ? WHERE id = ?",
-        (request.color_id, calendar_id),
+    # Recolor every ledger row sourced from this calendar; the
+    # next reconcile re-renders projection payloads with the new
+    # colorId.
+    from app.ledger.admin_ops import recolor_client_calendar
+    from app.ledger.triggers import enqueue_manual
+    await recolor_client_calendar(
+        db, client_calendar_id=calendar_id, new_color_id=request.color_id,
     )
-    await db.commit()
-
-    # Kick off background task to recolor existing events on main
-    from app.sync.engine import recolor_calendar_events
-    from app.utils.tasks import create_background_task
-    create_background_task(
-        recolor_calendar_events(calendar_id, request.color_id),
-        f"recolor_calendar_{calendar_id}",
-    )
-
+    await enqueue_manual(db, user_id=user.id, source_hint="all")
     return {"status": "ok", "message": "Color updated, recoloring events in background"}

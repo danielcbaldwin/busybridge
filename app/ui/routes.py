@@ -598,17 +598,19 @@ async def admin_settings(request: Request):
         if setting:
             settings[key] = setting.get("value_plain", "")
 
-    # Service account status
-    from app.auth.service_account import is_sa_configured, get_sa_email
-    sa_configured = is_sa_configured()
-    sa_email = get_sa_email() if sa_configured else None
+    # Service-account mode was removed at the Stage-5 cutover.
+    sa_configured = False
+    sa_email = None
 
-    # Get all users with their SA tier
     db = await get_database()
     cursor = await db.execute(
-        "SELECT id, email, display_name, main_calendar_id, sa_tier FROM users ORDER BY id"
+        "SELECT id, email, display_name, main_calendar_id FROM users ORDER BY id"
     )
     all_users = [dict(row) for row in await cursor.fetchall()]
+    # Templates may still reference ``u.sa_tier``; surface zero so
+    # Jinja's ``{% if u.sa_tier == 2 %}`` keeps rendering benignly.
+    for u in all_users:
+        u.setdefault("sa_tier", 0)
 
     return templates.TemplateResponse(request, "admin/settings.html", context={
         "user": user,
