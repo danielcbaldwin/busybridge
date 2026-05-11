@@ -420,7 +420,10 @@ async def admin_dashboard(request: Request):
     cursor = await db.execute("SELECT COUNT(*) FROM client_calendars WHERE is_active = TRUE")
     active_calendars = (await cursor.fetchone())[0]
 
-    cursor = await db.execute("SELECT COUNT(*) FROM event_mappings WHERE deleted_at IS NULL")
+    cursor = await db.execute(
+        """SELECT COUNT(*) FROM ledger_events
+            WHERE status = 'active' AND user_intentionally_deleted = 0"""
+    )
     total_events = (await cursor.fetchone())[0]
 
     cursor = await db.execute(
@@ -598,25 +601,18 @@ async def admin_settings(request: Request):
         if setting:
             settings[key] = setting.get("value_plain", "")
 
-    # Service-account mode was removed at the Stage-5 cutover.
-    sa_configured = False
-    sa_email = None
-
+    # Service-account mode was removed at the Stage-5 cutover; the
+    # template no longer renders any sa_* fields, so we don't pass
+    # them in.
     db = await get_database()
     cursor = await db.execute(
         "SELECT id, email, display_name, main_calendar_id FROM users ORDER BY id"
     )
     all_users = [dict(row) for row in await cursor.fetchall()]
-    # Templates may still reference ``u.sa_tier``; surface zero so
-    # Jinja's ``{% if u.sa_tier == 2 %}`` keeps rendering benignly.
-    for u in all_users:
-        u.setdefault("sa_tier", 0)
 
     return templates.TemplateResponse(request, "admin/settings.html", context={
         "user": user,
         "settings": settings,
-        "sa_configured": sa_configured,
-        "sa_email": sa_email,
         "all_users": all_users,
     })
 

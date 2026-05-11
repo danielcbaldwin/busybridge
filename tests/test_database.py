@@ -29,19 +29,23 @@ async def test_schema_tables_exist(test_db):
     db = await get_database()
 
     tables = [
+        # Core app tables
         "organization",
         "settings",
         "users",
         "oauth_tokens",
         "client_calendars",
         "calendar_sync_state",
-        "event_mappings",
-        "busy_blocks",
-        "sync_log",
+        "main_calendar_sync_state",
         "webhook_channels",
+        "sync_log",
         "alert_queue",
         "job_locks",
-        "main_calendar_sync_state",
+        # Ledger tables (REWRITE_PLAN.md §4)
+        "ledger_events",
+        "ledger_projections",
+        "outbox_operations",
+        "reconcile_requests",
     ]
 
     for table in tables:

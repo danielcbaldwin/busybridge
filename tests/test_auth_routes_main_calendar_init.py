@@ -54,23 +54,18 @@ async def test_oauth_callback_initializes_main_calendar_when_missing(test_db, mo
         return None
 
     class FakeRealGoogleClient:
-        """Stand-in for RealGoogleClient; the OAuth callback uses
-        ``client._service.calendarList().list().execute()`` to
-        find the primary calendar."""
+        """Stand-in for RealGoogleClient; the OAuth callback calls
+        ``client.list_calendar_list()`` to find the primary calendar."""
         def __init__(self, _credentials):
-            from types import SimpleNamespace as _SN
-            self._service = _SN(
-                calendarList=lambda: _SN(
-                    list=lambda: _SN(
-                        execute=lambda: {
-                            "items": [
-                                {"id": "primary-22", "primary": True},
-                                {"id": "other", "primary": False},
-                            ]
-                        }
-                    )
-                ),
-            )
+            pass
+
+        def list_calendar_list(self):
+            return {
+                "items": [
+                    {"id": "primary-22", "primary": True},
+                    {"id": "other", "primary": False},
+                ]
+            }
 
     monkeypatch.setattr("app.auth.routes.get_oauth_state", fake_get_oauth_state)
     monkeypatch.setattr("app.auth.routes.exchange_code_for_tokens", fake_exchange)

@@ -287,10 +287,12 @@ class TestOAuthCallbackMainCalendarInit:
             uid = await _insert_user("new@example.com", "gid-new", main_calendar_id=None)
             return SessionUser(id=uid, email="new@example.com", google_user_id="gid-new", is_admin=False)
 
+        # OAuth callback uses RealGoogleClient post-cutover.  Provide
+        # a stand-in whose list_calendar_list() returns one primary.
         fake_cal_client = MagicMock()
-        fake_cal_client.list_calendars.return_value = [
-            {"id": "primary@example.com", "primary": True}
-        ]
+        fake_cal_client.list_calendar_list.return_value = {
+            "items": [{"id": "primary@example.com", "primary": True}],
+        }
 
         from types import SimpleNamespace
         monkeypatch.setattr("app.auth.routes.exchange_code_for_tokens", fake_exchange)
@@ -304,11 +306,9 @@ class TestOAuthCallbackMainCalendarInit:
         )
         monkeypatch.setattr("app.auth.routes.get_organization", AsyncMock(return_value=None))
         monkeypatch.setattr("app.auth.routes.is_oobe_completed", AsyncMock(return_value=True))
-        # GoogleCalendarClient is lazily imported inside the route handler;
-        # patch it where it is actually defined.
         monkeypatch.setattr(
-            "app.sync.google_calendar.GoogleCalendarClient",
-            lambda token, settings=None: fake_cal_client,
+            "app.ledger.real_google_client.RealGoogleClient",
+            lambda credentials: fake_cal_client,
         )
 
         req = _fake_request()

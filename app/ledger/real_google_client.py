@@ -216,6 +216,15 @@ class RealGoogleClient:
         except HttpError as e:
             raise _wrap(e) from e
 
+    # ------------------------------------------------------------------
+    # CalendarList
+    # ------------------------------------------------------------------
+    def list_calendar_list(self) -> dict:
+        try:
+            return self._service.calendarList().list().execute()
+        except HttpError as e:
+            raise _wrap(e) from e
+
 
 def _to_iso(v: datetime | str) -> str:
     if isinstance(v, str):

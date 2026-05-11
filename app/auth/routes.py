@@ -231,8 +231,7 @@ async def oauth_callback(
                 from app.ledger.real_google_client import RealGoogleClient
                 from google.oauth2.credentials import Credentials
                 cal_client = RealGoogleClient(Credentials(token=access_token))
-                cals = cal_client._service.calendarList().list().execute()
-                items = cals.get("items", [])
+                items = cal_client.list_calendar_list().get("items", [])
                 primary_cal = next((c for c in items if c.get("primary")), None)
                 if primary_cal:
                     db = await get_database()

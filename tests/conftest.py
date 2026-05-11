@@ -129,3 +129,26 @@ def mock_google_api(mocker):
     )
 
     return mock_service
+
+
+@pytest.fixture(autouse=True)
+def _disable_rate_limiter():
+    """Turn the slowapi limiter off for the duration of a test.
+
+    Two problems the limiter causes in tests:
+    1. It accumulates across tests in the same process, so the 10th+
+       callback test gets a spurious 429.
+    2. Its decorator inspects the ``request`` arg and crashes if it's
+       a ``MagicMock`` rather than a real ``starlette.requests.Request``.
+
+    Setting ``limiter.enabled = False`` bypasses both — the limiter
+    becomes a no-op pass-through, which is what unit tests want.
+    """
+    try:
+        from app.rate_limit import limiter
+        prev = limiter.enabled
+        limiter.enabled = False
+        yield
+        limiter.enabled = prev
+    except Exception:
+        yield

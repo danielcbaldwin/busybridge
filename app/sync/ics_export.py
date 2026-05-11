@@ -446,11 +446,31 @@ def _safe_filename(name: str) -> str:
 
 
 def _is_busybridge_event(event: dict) -> bool:
-    """Check if an event is BusyBridge-managed."""
-    settings = get_settings()
+    """Check if an event was written by BusyBridge.
 
+    Recognises three signals:
+    * Deterministic ledger ID (``bb`` + 13 base32hex chars; the
+      primary post-cutover signal — REWRITE_PLAN.md §7).
+    * ``extendedProperties.private.bb_proj_id`` (defence-in-depth
+      stamp the ledger payload renderer applies; see
+      ``app.ledger.payload.EP_PROJ_ID``).
+    * Legacy ``calendar_sync_tag`` extended property (events
+      written by the pre-cutover engine).
+    * Legacy summary prefix (events from older versions that
+      didn't stamp extended properties).
+    """
+    from app.ledger.identity import is_managed_google_event_id
+
+    if is_managed_google_event_id(event.get("id")):
+        return True
+
+    settings = get_settings()
     ext_props = event.get("extendedProperties", {})
     private_props = ext_props.get("private", {})
+
+    if private_props.get("bb_proj_id"):
+        return True
+
     if private_props.get(settings.calendar_sync_tag) == "true":
         return True
 

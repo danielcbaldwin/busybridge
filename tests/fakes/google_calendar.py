@@ -349,6 +349,17 @@ class FakeGoogleCalendar:
             "items": [self._calendar_to_api(c) for c in self._calendars.values()],
         }
 
+    def list_calendar_list(self) -> dict:
+        """Alias for :meth:`list_calendars` matching the
+        ``GoogleClient`` protocol.  Each calendar registered with
+        :meth:`add_calendar` appears here; the first one added is
+        marked ``primary=True`` so OAuth-callback main-calendar
+        discovery works in tests."""
+        out = self.list_calendars()
+        for i, item in enumerate(out["items"]):
+            item["primary"] = (i == 0)
+        return out
+
     def get_calendar(self, calendar_id: str) -> dict:
         self._check_failures("get_calendar")
         cal = self._calendars.get(calendar_id)

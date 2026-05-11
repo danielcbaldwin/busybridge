@@ -114,28 +114,9 @@ async def run_retention_cleanup() -> dict:
     )
     summary["settled_outbox_rows"] = len(await cursor.fetchall())
 
-    # 6. Legacy tables — best-effort prune for the parallel-run window.
-    try:
-        cursor = await db.execute(
-            """DELETE FROM event_mappings
-                WHERE is_recurring = FALSE
-                  AND event_end IS NOT NULL
-                  AND event_end < ?
-                RETURNING id""",
-            (event_cutoff,),
-        )
-        summary["expired_event_mappings"] = len(await cursor.fetchall())
-    except Exception:
-        pass
-    try:
-        cursor = await db.execute(
-            """DELETE FROM busy_blocks
-                WHERE event_mapping_id NOT IN (SELECT id FROM event_mappings)
-                RETURNING id""",
-        )
-        summary["old_busy_blocks"] = len(await cursor.fetchall())
-    except Exception:
-        pass
+    # Legacy event_mappings / busy_blocks tables were dropped at the
+    # Stage-5 cutover; nothing to prune here.  The summary keys stay
+    # at zero for backwards-compatibility with admin UI consumers.
 
     await db.commit()
     logger.info(f"Retention cleanup completed: {summary}")

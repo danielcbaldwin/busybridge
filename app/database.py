@@ -88,41 +88,6 @@ CREATE TABLE IF NOT EXISTS calendar_sync_state (
     UNIQUE(client_calendar_id)
 );
 
--- The core event mapping table
-CREATE TABLE IF NOT EXISTS event_mappings (
-    id INTEGER PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    origin_type TEXT NOT NULL,
-    origin_calendar_id INTEGER REFERENCES client_calendars(id),
-    origin_event_id TEXT NOT NULL,
-    origin_recurring_event_id TEXT,
-    main_event_id TEXT,
-    event_start TIMESTAMP,
-    event_end TIMESTAMP,
-    is_all_day BOOLEAN DEFAULT FALSE,
-    is_recurring BOOLEAN DEFAULT FALSE,
-    user_can_edit BOOLEAN DEFAULT TRUE,
-    rsvp_status TEXT,
-    deleted_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP,
-    UNIQUE(user_id, origin_calendar_id, origin_event_id)
-);
-
--- Index for retention cleanup
-CREATE INDEX IF NOT EXISTS idx_event_mappings_cleanup
-    ON event_mappings(is_recurring, event_end, deleted_at);
-
--- Busy blocks created on client calendars
-CREATE TABLE IF NOT EXISTS busy_blocks (
-    id INTEGER PRIMARY KEY,
-    event_mapping_id INTEGER NOT NULL REFERENCES event_mappings(id) ON DELETE CASCADE,
-    client_calendar_id INTEGER NOT NULL REFERENCES client_calendars(id),
-    busy_block_event_id TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(event_mapping_id, client_calendar_id)
-);
-
 -- Audit log
 CREATE TABLE IF NOT EXISTS sync_log (
     id INTEGER PRIMARY KEY,
@@ -251,16 +216,16 @@ async def init_schema(db: aiosqlite.Connection) -> None:
     await db.commit()
 
     # Migrations for columns added after initial release.
-    # ALTER TABLE IF NOT EXISTS ... ADD COLUMN is not supported in older SQLite,
-    # so we swallow the "duplicate column" error instead.
+    # ALTER TABLE IF NOT EXISTS ... ADD COLUMN is not supported in older
+    # SQLite, so we swallow the "duplicate column" error instead.
+    # All event_mappings / sa_tier migrations have been removed at the
+    # Stage-5 cutover; the legacy tables they targeted are no longer in
+    # the schema.  A `DROP TABLE IF EXISTS` pass below cleans up
+    # databases that survived from before the cutover.
     migrations = [
         "ALTER TABLE webhook_channels ADD COLUMN token TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE event_mappings ADD COLUMN rsvp_status TEXT",
-        "ALTER TABLE users ADD COLUMN sa_tier INTEGER DEFAULT 0",
         "ALTER TABLE client_calendars ADD COLUMN calendar_type TEXT NOT NULL DEFAULT 'client'",
-        "ALTER TABLE event_mappings ADD COLUMN webcal_subscription_id INTEGER REFERENCES webcal_subscriptions(id)",
         "ALTER TABLE users ADD COLUMN sync_paused BOOLEAN DEFAULT FALSE",
-        "ALTER TABLE event_mappings ADD COLUMN recurrence_rule TEXT",
     ]
     for stmt in migrations:
         try:
@@ -269,15 +234,13 @@ async def init_schema(db: aiosqlite.Connection) -> None:
         except Exception:
             pass  # column already exists
 
-    try:
-        await db.execute(
-            """CREATE INDEX IF NOT EXISTS idx_event_mappings_webcal
-               ON event_mappings(webcal_subscription_id, origin_event_id)
-               WHERE webcal_subscription_id IS NOT NULL"""
-        )
-        await db.commit()
-    except Exception:
-        pass
+    # Drop pre-cutover legacy tables if they exist (no-op on fresh DBs).
+    for legacy_table in ("busy_blocks", "event_mappings"):
+        try:
+            await db.execute(f"DROP TABLE IF EXISTS {legacy_table}")
+            await db.commit()
+        except Exception:
+            pass
 
     # Ledger tables (REWRITE_PLAN.md §4).  Additive — they sit
     # alongside the legacy event_mappings/busy_blocks until the

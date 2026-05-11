@@ -78,3 +78,12 @@ class GoogleClient(Protocol):
         show_deleted: bool = False,
         max_results: int = 250,
     ) -> dict: ...
+
+    def list_calendar_list(self) -> dict:
+        """Return the user's CalendarList.
+
+        Each item has at least ``id`` and may have ``primary: true``.
+        Used by the OAuth-callback wiring in :mod:`app.auth.routes`
+        to discover the user's main calendar.
+        """
+        ...

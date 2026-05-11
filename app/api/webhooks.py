@@ -98,12 +98,13 @@ async def receive_google_calendar_webhook(
             # TODO: Trigger webhook re-registration for this calendar
             return {"status": "ok", "message": "Channel expired and removed"}
 
-    # Mirror the notification into the ledger's reconcile queue.
-    # Non-disruptive: enqueues a debounced request that the
-    # scheduler's ledger-drain job will pick up.  If the legacy
-    # sync (below) is still authoritative this is a no-op observer.
+    # Enqueue a debounced reconcile request and schedule an
+    # immediate drain pass so latency matches the plan's 5s
+    # debounce rather than the scheduler's 30s tick.
     try:
+        from app.ledger.runtime import reconcile_user_by_id
         from app.ledger.triggers import enqueue_webhook
+        from app.utils.tasks import create_background_task
         if channel["calendar_type"] == "main":
             hint = "main"
         elif channel["calendar_type"] == "personal":
@@ -111,15 +112,29 @@ async def receive_google_calendar_webhook(
         else:
             hint = f"client:{channel['client_calendar_id']}"
         await enqueue_webhook(db, user_id=channel["user_id"], source_hint=hint)
-    except Exception as e:
-        # Never let the ledger trigger plumbing block legacy sync.
-        logger.warning("ledger enqueue_webhook failed: %s", e)
 
-    # The earlier enqueue_webhook call above is the only sync
-    # trigger.  The scheduler's ledger-drain job picks it up
-    # within the next 30s.
+        # Sleep ~5s, then drain.  Run as a background task so the
+        # webhook ack is fast; the sleep gives Google's eventual-
+        # consistency window time to settle before we ingest.
+        async def _delayed_drain(user_id: int) -> None:
+            import asyncio
+            await asyncio.sleep(5)
+            try:
+                await reconcile_user_by_id(user_id)
+            except Exception:
+                logger.exception(
+                    "webhook-triggered reconcile failed for user %s", user_id,
+                )
+
+        create_background_task(
+            _delayed_drain(channel["user_id"]),
+            f"webhook_drain_user_{channel['user_id']}",
+        )
+    except Exception as e:
+        logger.warning("ledger webhook enqueue/drain failed: %s", e)
+
     logger.info(
-        "Webhook recorded: calendar_type=%s calendar_id=%s",
+        "Webhook handled: calendar_type=%s calendar_id=%s",
         channel["calendar_type"], channel["client_calendar_id"],
     )
     return {"status": "ok"}
