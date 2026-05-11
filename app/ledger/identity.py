@@ -126,8 +126,44 @@ def derive_google_event_id(projection_id: int) -> str:
     return out
 
 
+def derive_instance_google_event_id(
+    parent_google_event_id: str,
+    original_start_at: str,
+    is_all_day: bool,
+) -> str:
+    """Build the Google ID for an exception/instance of a recurring event.
+
+    Google's instance ID format is ``<parent>_<stamp>`` where the
+    stamp is ``YYYYMMDD`` for all-day events or
+    ``YYYYMMDDTHHMMSSZ`` for timed events.  Used by the diff step
+    to pre-set ``ledger_projections.google_event_id`` on instance
+    projections so the outbox can ``events.update`` /
+    ``events.delete`` them directly.
+    """
+    if is_all_day:
+        stamp = original_start_at.replace("-", "")
+        # Defensive: ensure 8 digits.
+        stamp = stamp[:8]
+        return f"{parent_google_event_id}_{stamp}"
+    # Normalise the timed form to UTC and strip punctuation.
+    s = original_start_at
+    if s.endswith("Z"):
+        s = s[:-1]
+    # Strip fractional seconds if present.
+    if "." in s:
+        s = s.split(".", 1)[0]
+    # s is now YYYY-MM-DDTHH:MM:SS (assume already UTC).
+    stamp = s.replace("-", "").replace(":", "") + "Z"
+    return f"{parent_google_event_id}_{stamp}"
+
+
 def is_managed_google_event_id(event_id: Optional[str]) -> bool:
     """True if ``event_id`` looks like a deterministic ID we issued.
+
+    Match shape: exactly 13 base32hex chars after the ``bb`` prefix
+    (a 64-bit projection_id encoded with padding stripped).  Anything
+    else — including user-chosen IDs that happen to start with
+    ``bb`` — is NOT ours and must not be skipped by ingest.
 
     Used by the discovery / orphan scan to recognise our writes
     without hitting the database.  This is "is it ours?" by
@@ -138,4 +174,4 @@ def is_managed_google_event_id(event_id: Optional[str]) -> bool:
     if not event_id.startswith(_BB_PREFIX):
         return False
     rest = event_id[len(_BB_PREFIX) :]
-    return bool(re.fullmatch(r"[a-v0-9]{1,1022}", rest))
+    return bool(re.fullmatch(r"[a-v0-9]{13}", rest))

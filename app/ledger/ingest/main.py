@@ -141,7 +141,8 @@ async def _ingest_one_main_event(
     # exact projection lookup.
     is_our_write = is_managed_google_event_id(event_id)
     proj_match = await (await db.execute(
-        """SELECT p.id AS projection_id, p.ledger_event_id
+        """SELECT p.id AS projection_id, p.ledger_event_id,
+                  p.google_etag, p.applied_payload_hash
              FROM ledger_projections p
              JOIN ledger_events e ON e.id = p.ledger_event_id
             WHERE p.google_event_id = ? AND e.user_id = ?
@@ -155,6 +156,24 @@ async def _ingest_one_main_event(
             ledger_id = int(proj_match["ledger_event_id"])
             await _mark_user_intentionally_deleted(db, ledger_id)
             return "user_deletes", ledger_id
+        # Edit-on-main detection: the user has changed our copy.
+        # Two outcomes per REWRITE_PLAN.md §9:
+        # * Editable event (client source, user_can_edit): propagate
+        #   RSVP and/or time back to the source by bumping the
+        #   ledger row.
+        # * Non-editable (lock-emoji): the planner will revert
+        #   automatically because the new etag invalidates our
+        #   If-Match next time we try to update, AND because
+        #   bumping the ledger row's version produces a fresh
+        #   desired_payload_hash that re-asserts the canonical state.
+        if proj_match is not None and status != "cancelled":
+            outcome = await _maybe_apply_main_edit_back(
+                db, user_email=user_email,
+                ledger_event_id=int(proj_match["ledger_event_id"]),
+                event=event,
+            )
+            if outcome is not None:
+                return outcome, int(proj_match["ledger_event_id"])
         return "our_writes_skipped", None
 
     # A native main event we haven't seen before, or seen previously.
@@ -252,6 +271,104 @@ async def _ingest_one_main_event(
         ),
     )
     return "native_updated", int(existing["id"])
+
+
+async def _maybe_apply_main_edit_back(
+    db: aiosqlite.Connection,
+    *,
+    user_email: str,
+    ledger_event_id: int,
+    event: dict,
+) -> Optional[str]:
+    """User edited our copy on main.  Decide what to do per
+    REWRITE_PLAN.md §9:
+
+    * Editable client event + RSVP changed → propagate the new
+      RSVP back to source (next reconcile will pick up the
+      version bump and the planner will route the change to the
+      origin client via ``present_full_rsvp_only`` projection).
+    * Editable + time changed → propagate time back.
+    * Non-editable + anything changed → bump version so the
+      planner re-renders the canonical payload and the outbox
+      reverts the drift on Google.
+    """
+    ledger = await (await db.execute(
+        "SELECT * FROM ledger_events WHERE id = ?",
+        (ledger_event_id,),
+    )).fetchone()
+    if ledger is None:
+        return None
+
+    new_rsvp = _extract_self_rsvp(event, user_email)
+    new_start, new_end, is_all_day = _extract_start_end(event)
+
+    user_can_edit = bool(ledger["user_can_edit"])
+    rsvp_changed = (new_rsvp is not None and new_rsvp != ledger["user_rsvp_status"])
+    time_changed = (
+        new_start is not None
+        and (new_start != ledger["start_at"] or new_end != ledger["end_at"])
+    )
+
+    if not (rsvp_changed or time_changed):
+        return "our_writes_skipped"
+
+    when = datetime.now(UTC).isoformat()
+    if user_can_edit:
+        # Forward-edit: update the ledger and let the planner push
+        # the change back to the source.  The desired_payload_hash
+        # changes on the source projection, so the outbox issues an
+        # update (RSVP or time).
+        await db.execute(
+            """UPDATE ledger_events
+                  SET user_rsvp_status = COALESCE(?, user_rsvp_status),
+                      start_at = COALESCE(?, start_at),
+                      end_at = COALESCE(?, end_at),
+                      is_all_day = COALESCE(?, is_all_day),
+                      version = version + 1,
+                      updated_at = ?
+                WHERE id = ?""",
+            (
+                new_rsvp,
+                new_start,
+                new_end,
+                is_all_day,
+                when, ledger_event_id,
+            ),
+        )
+        return "main_edit_propagated"
+
+    # Non-editable: drift bumps the version but does NOT change
+    # the canonical content.  Next plan/diff pass will re-render
+    # the desired payload identically and notice that the projection
+    # still has applied_payload_hash matching, but the etag on
+    # Google is stale.  We force a re-write by bumping the version
+    # alone (no field changes) which makes the version-bump-only
+    # path advance desired_ledger_version past applied.
+    await db.execute(
+        """UPDATE ledger_events
+              SET version = version + 1,
+                  updated_at = ?
+            WHERE id = ?""",
+        (when, ledger_event_id),
+    )
+    return "main_drift_reverted"
+
+
+def _extract_self_rsvp(event: dict, user_email: str) -> Optional[str]:
+    for att in (event.get("attendees") or []):
+        if att.get("self") or att.get("email", "").lower() == user_email.lower():
+            return att.get("responseStatus")
+    return None
+
+
+def _extract_start_end(event: dict) -> tuple[Optional[str], Optional[str], Optional[bool]]:
+    start = event.get("start") or {}
+    end = event.get("end") or {}
+    if "date" in start:
+        return start.get("date"), end.get("date"), True
+    if "dateTime" in start:
+        return start.get("dateTime"), end.get("dateTime"), False
+    return None, None, None
 
 
 async def _mark_user_intentionally_deleted(

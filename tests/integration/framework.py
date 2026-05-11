@@ -500,6 +500,8 @@ class _LedgerUser:
     main_nick: str
     main_google_calendar_id: str
     client_calendar_ids: dict[str, int] = field(default_factory=dict)
+    personal_calendar_ids: dict[str, int] = field(default_factory=dict)
+    webcal_subscription_ids: dict[str, int] = field(default_factory=dict)
     """Maps client *nickname* → client_calendars.id (the integer FK)."""
 
 
@@ -521,13 +523,16 @@ async def _scenario_setup_db(self: Scenario) -> aiosqlite.Connection:
 
     # Minimal app tables the ledger refers to via FK.  We don't need
     # the whole production schema — just users, client_calendars,
-    # calendar_sync_state, main_calendar_sync_state.
+    # calendar_sync_state, main_calendar_sync_state,
+    # webcal_subscriptions, personal_calendars.
     await db.executescript(
         """
         CREATE TABLE users (
             id INTEGER PRIMARY KEY,
             email TEXT NOT NULL UNIQUE,
-            display_name TEXT
+            display_name TEXT,
+            sync_paused BOOLEAN DEFAULT FALSE,
+            main_calendar_id TEXT
         );
         CREATE TABLE client_calendars (
             id INTEGER PRIMARY KEY,
@@ -535,7 +540,9 @@ async def _scenario_setup_db(self: Scenario) -> aiosqlite.Connection:
             google_calendar_id TEXT NOT NULL,
             display_name TEXT,
             color_id TEXT,
-            is_active BOOLEAN DEFAULT TRUE
+            calendar_type TEXT NOT NULL DEFAULT 'client',
+            is_active BOOLEAN DEFAULT TRUE,
+            disconnected_at TIMESTAMP
         );
         CREATE TABLE calendar_sync_state (
             id INTEGER PRIMARY KEY,
@@ -558,6 +565,20 @@ async def _scenario_setup_db(self: Scenario) -> aiosqlite.Connection:
             last_error TEXT,
             UNIQUE(user_id)
         );
+        CREATE TABLE webcal_subscriptions (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            url TEXT NOT NULL,
+            display_name TEXT,
+            color_id TEXT,
+            last_etag TEXT,
+            last_polled_at TIMESTAMP,
+            poll_interval_seconds INTEGER NOT NULL DEFAULT 3600,
+            consecutive_failures INTEGER DEFAULT 0,
+            last_error TEXT,
+            is_active BOOLEAN DEFAULT TRUE,
+            UNIQUE(user_id, url)
+        );
         """
     )
     await init_ledger_schema(db)
@@ -573,6 +594,7 @@ async def _scenario_given_user(
     email: Optional[str] = None,
     main: str,
     clients: Iterable[str] = (),
+    personals: Iterable[str] = (),
 ) -> _LedgerUser:
     """Register a user with the ledger system and bind them to
     previously-registered calendar nicknames.
@@ -582,6 +604,8 @@ async def _scenario_given_user(
         email: defaults to ``f"{nickname}@example.com"``.
         main: nickname of the user's main calendar.
         clients: nicknames of the user's client calendars.
+        personals: nicknames of the user's personal calendars
+            (read-only origin sources; not busy-block targets).
     """
     if nickname in self._users_by_nick:
         raise ValueError(f"user nickname already in use: {nickname!r}")
@@ -599,11 +623,24 @@ async def _scenario_given_user(
         google_id = self.cal(client_nick)
         cur = await db.execute(
             """INSERT INTO client_calendars
-                  (user_id, google_calendar_id, display_name, is_active)
-               VALUES (?, ?, ?, 1)""",
+                  (user_id, google_calendar_id, display_name,
+                   calendar_type, is_active)
+               VALUES (?, ?, ?, 'client', 1)""",
             (user_id, google_id, client_nick),
         )
         client_ids[client_nick] = int(cur.lastrowid)
+
+    personal_ids: dict[str, int] = {}
+    for personal_nick in personals:
+        google_id = self.cal(personal_nick)
+        cur = await db.execute(
+            """INSERT INTO client_calendars
+                  (user_id, google_calendar_id, display_name,
+                   calendar_type, is_active)
+               VALUES (?, ?, ?, 'personal', 1)""",
+            (user_id, google_id, personal_nick),
+        )
+        personal_ids[personal_nick] = int(cur.lastrowid)
     await db.commit()
 
     user = _LedgerUser(
@@ -612,9 +649,32 @@ async def _scenario_given_user(
         main_nick=main,
         main_google_calendar_id=main_id,
         client_calendar_ids=client_ids,
+        personal_calendar_ids=personal_ids,
     )
     self._users_by_nick[nickname] = user
     return user
+
+
+async def _scenario_given_webcal(
+    self: Scenario,
+    user_nick: str,
+    *,
+    sub_nick: str,
+    url: str,
+) -> int:
+    """Register a webcal subscription for a previously-created user."""
+    user = self.user(user_nick)
+    db = await _scenario_setup_db(self)
+    cur = await db.execute(
+        """INSERT INTO webcal_subscriptions
+              (user_id, url, display_name, is_active)
+           VALUES (?, ?, ?, 1)""",
+        (user.user_id, url, sub_nick),
+    )
+    await db.commit()
+    sub_id = int(cur.lastrowid)
+    user.webcal_subscription_ids[sub_nick] = sub_id
+    return sub_id
 
 
 async def _scenario_run_reconciler(
@@ -623,6 +683,8 @@ async def _scenario_run_reconciler(
     *,
     include_main: bool = True,
     drain: bool = True,
+    run_discovery: bool = False,
+    webcal_fetch=None,
 ) -> dict:
     """Drive one ingest → plan → diff → drain pass for a user.
 
@@ -634,17 +696,47 @@ async def _scenario_run_reconciler(
 
     user = self.user(user_nick)
     db = await _scenario_setup_db(self)
+    # Build the list of calendars to ingest (active only) AND the
+    # ID-mapping the diff/outbox use (all known calendars, including
+    # disconnected — the outbox still needs to issue deletes
+    # against them).
+    active_clients: list[dict] = []
+    all_clients: list[dict] = []
+    for nick, cid in user.client_calendar_ids.items():
+        row = await (await db.execute(
+            "SELECT is_active FROM client_calendars WHERE id = ?", (cid,),
+        )).fetchone()
+        entry = {"id": cid, "google_calendar_id": self.cal(nick)}
+        all_clients.append(entry)
+        if row is not None and row["is_active"]:
+            active_clients.append(entry)
+    active_personals: list[dict] = []
+    for nick, pid in user.personal_calendar_ids.items():
+        row = await (await db.execute(
+            "SELECT is_active FROM client_calendars WHERE id = ?", (pid,),
+        )).fetchone()
+        if row is not None and row["is_active"]:
+            active_personals.append({"id": pid, "google_calendar_id": self.cal(nick)})
+    webcal_subs: list[dict] = []
+    for nick, sid in user.webcal_subscription_ids.items():
+        row = await (await db.execute(
+            "SELECT url, is_active FROM webcal_subscriptions WHERE id = ?", (sid,),
+        )).fetchone()
+        if row is not None and row["is_active"]:
+            webcal_subs.append({"id": sid, "url": row["url"], "nick": nick})
     return await reconcile_user(
         db, self.google,
         user_id=user.user_id,
         user_email=user.email,
         main_google_calendar_id=user.main_google_calendar_id,
-        client_calendars=[
-            {"id": cid, "google_calendar_id": self.cal(nick)}
-            for nick, cid in user.client_calendar_ids.items()
-        ],
+        client_calendars=active_clients,
+        all_known_client_calendars=all_clients,
+        personal_calendars=active_personals,
+        webcal_subscriptions=webcal_subs,
+        webcal_fetch=webcal_fetch,
         include_main=include_main,
         drain=drain,
+        run_discovery=run_discovery,
     )
 
 
@@ -704,6 +796,7 @@ async def _scenario_close(self: Scenario) -> None:
 # and lets the ledger code be lazy-imported.
 Scenario.setup_db = _scenario_setup_db  # type: ignore[attr-defined]
 Scenario.given_user = _scenario_given_user  # type: ignore[attr-defined]
+Scenario.given_webcal = _scenario_given_webcal  # type: ignore[attr-defined]
 Scenario.run_reconciler = _scenario_run_reconciler  # type: ignore[attr-defined]
 Scenario.run_reconciler_until_quiescent = (  # type: ignore[attr-defined]
     _scenario_run_reconciler_until_quiescent

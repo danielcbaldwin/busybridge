@@ -22,7 +22,13 @@ import aiosqlite
 
 from app.ledger.diff import diff_and_enqueue_for_user
 from app.ledger.google_client import GoogleClient
-from app.ledger.ingest import ingest_client_calendar, ingest_main_calendar
+from app.ledger.ingest import (
+    discover_orphans,
+    ingest_client_calendar,
+    ingest_main_calendar,
+    ingest_personal_calendar,
+    ingest_webcal_subscription,
+)
 from app.ledger.outbox import drain_user
 from app.ledger.planner import plan_for_ledger_event
 
@@ -38,8 +44,13 @@ async def reconcile_user(
     user_email: str,
     main_google_calendar_id: str,
     client_calendars: list[dict],
+    all_known_client_calendars: Optional[list[dict]] = None,
+    personal_calendars: Optional[list[dict]] = None,
+    webcal_subscriptions: Optional[list[dict]] = None,
+    webcal_fetch=None,
     include_main: bool = True,
     drain: bool = True,
+    run_discovery: bool = False,
 ) -> dict:
     """Run one full reconciliation pass for one user.
 
@@ -59,11 +70,52 @@ async def reconcile_user(
 
     Returns a counters dict aggregating each phase.
     """
-    out: dict = {"ingest": {}, "ingest_errors": {}, "planned": 0, "enqueued": 0, "drain": {}}
+    # If the user is paused, skip ingest/planning entirely — the
+    # outbox should still drain (so a paused user's pending deletes
+    # complete) but we don't pull new state in.
+    paused_row = await (await db.execute(
+        "SELECT sync_paused FROM users WHERE id = ?", (user_id,),
+    )).fetchone()
+    paused = bool(paused_row and paused_row["sync_paused"])
 
-    google_id_for: dict[int, str] = {
-        int(c["id"]): c["google_calendar_id"] for c in client_calendars
+    out: dict = {
+        "ingest": {}, "ingest_errors": {},
+        "planned": 0, "enqueued": 0, "drain": {},
+        "paused": paused,
     }
+
+    # Diff/outbox needs the Google ID for any calendar a projection
+    # might target — including disconnected ones we still owe a
+    # delete to.  Default to the active list if the caller didn't
+    # supply a wider set.
+    google_id_for: dict[int, str] = {
+        int(c["id"]): c["google_calendar_id"]
+        for c in (all_known_client_calendars or client_calendars)
+    }
+
+    if paused:
+        # Skip ingest + plan (don't pull new state).  But DO run
+        # diff+drain so admin-staged cleanup work (cleanup_and_pause
+        # sets projections to absent) can converge.  The fixed-point
+        # loop below handles this uniformly.
+        out["drain"] = {"processed": 0, "succeeded": 0, "retried": 0,
+                        "failed_permanent": 0, "superseded": 0}
+        for _ in range(3):
+            enq = await diff_and_enqueue_for_user(
+                db, user_id=user_id,
+                main_calendar_id=main_google_calendar_id,
+                google_calendar_id_for=google_id_for,
+            )
+            out["enqueued"] += enq
+            await db.commit()
+            if not drain:
+                break
+            counters = await drain_user(db, google, user_id=user_id)
+            for k, v in counters.items():
+                out["drain"][k] = out["drain"].get(k, 0) + v
+            if counters["processed"] == 0 and counters["superseded"] == 0:
+                break
+        return out
 
     # 1. Ingest each client.  Failures are caught per-calendar so
     #    one bad calendar doesn't block planning the rest.  Per the
@@ -88,6 +140,48 @@ async def reconcile_user(
             await _bump_failure(db, client_calendar_id=int(cal["id"]), error=str(e))
             out["ingest_errors"][f"client:{cal['id']}"] = str(e)
 
+    # 1b. Ingest each personal calendar (same Google API surface).
+    for cal in (personal_calendars or []):
+        try:
+            out["ingest"][f"personal:{cal['id']}"] = await ingest_personal_calendar(
+                db, google,
+                user_id=user_id,
+                personal_calendar_id=int(cal["id"]),
+                google_calendar_id=cal["google_calendar_id"],
+                user_email=user_email,
+            )
+        except Exception as e:
+            logger.warning(
+                "personal ingest failed user_id=%s personal=%s: %s",
+                user_id, cal["id"], e,
+            )
+            await _bump_failure(db, client_calendar_id=int(cal["id"]), error=str(e))
+            out["ingest_errors"][f"personal:{cal['id']}"] = str(e)
+
+    # 1c. Poll each webcal subscription (no Google API; uses the
+    #     fetch hook supplied by the caller).
+    for sub in (webcal_subscriptions or []):
+        if webcal_fetch is None:
+            logger.warning(
+                "webcal subscription %s skipped: no fetch hook supplied",
+                sub["id"],
+            )
+            continue
+        try:
+            out["ingest"][f"webcal:{sub['id']}"] = await ingest_webcal_subscription(
+                db,
+                user_id=user_id,
+                subscription_id=int(sub["id"]),
+                url=sub["url"],
+                fetch=webcal_fetch,
+            )
+        except Exception as e:
+            logger.warning(
+                "webcal ingest failed user_id=%s sub=%s: %s",
+                user_id, sub["id"], e,
+            )
+            out["ingest_errors"][f"webcal:{sub['id']}"] = str(e)
+
     # 2. Ingest main.
     if include_main:
         try:
@@ -102,6 +196,19 @@ async def reconcile_user(
             await _bump_failure(db, user_id=user_id, error=str(e))
             out["ingest_errors"]["main"] = str(e)
 
+    # 2b. Discovery / orphan scan (caller-controlled cadence).
+    if run_discovery:
+        try:
+            out["discovery"] = await discover_orphans(
+                db, google,
+                user_id=user_id,
+                main_google_calendar_id=main_google_calendar_id,
+                client_google_calendar_ids=google_id_for,
+            )
+        except Exception as e:
+            logger.warning("discovery scan failed user_id=%s: %s", user_id, e)
+            out["ingest_errors"]["discovery"] = str(e)
+
     # 3. Plan affected ledger rows.  We pull the affected list out
     #    of reconcile_requests and clear it inside this run.
     affected = await _consume_affected_ledger_ids(db, user_id=user_id)
@@ -109,19 +216,34 @@ async def reconcile_user(
         await plan_for_ledger_event(db, ledger_event_id=ledger_id)
         out["planned"] += 1
 
-    # 4. Diff projections, enqueue outbox ops.
-    out["enqueued"] = await diff_and_enqueue_for_user(
-        db,
-        user_id=user_id,
-        main_calendar_id=main_google_calendar_id,
-        google_calendar_id_for=google_id_for,
-    )
-    await db.commit()
-
-    # 5. Drain the outbox (one pass; caller may loop for retries
-    #    via clock-advance + re-call).
-    if drain:
-        out["drain"] = await drain_user(db, google, user_id=user_id)
+    # 4. Diff + drain + replan loop.  An etag-mismatch on update
+    #    marks an op superseded and clears the projection's
+    #    applied_ledger_version (asking for a replan).  Iterating
+    #    until quiescent lets revert-on-drift converge in one
+    #    reconcile pass instead of waiting for the next caller.
+    #    A hard cap (3 inner passes) guards against infinite
+    #    bounce; soak tests cover the edge cases.
+    max_inner_passes = 3
+    out["drain"] = {"processed": 0, "succeeded": 0, "retried": 0,
+                    "failed_permanent": 0, "superseded": 0}
+    for _ in range(max_inner_passes):
+        enq = await diff_and_enqueue_for_user(
+            db,
+            user_id=user_id,
+            main_calendar_id=main_google_calendar_id,
+            google_calendar_id_for=google_id_for,
+        )
+        out["enqueued"] += enq
+        await db.commit()
+        if not drain:
+            break
+        drain_counters = await drain_user(db, google, user_id=user_id)
+        for k, v in drain_counters.items():
+            out["drain"][k] = out["drain"].get(k, 0) + v
+        # If nothing was processed AND nothing was superseded
+        # (which would trigger another replan), we're done.
+        if drain_counters["processed"] == 0 and drain_counters["superseded"] == 0:
+            break
 
     return out
 

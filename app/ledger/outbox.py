@@ -95,18 +95,32 @@ async def enqueue(
     if operation not in (OP_CREATE, OP_UPDATE, OP_DELETE):
         raise ValueError(f"unknown operation: {operation!r}")
     when = (now or datetime.now(UTC)).isoformat()
+    idem = f"proj:{projection_id}:v{ledger_version}:{operation}"
 
-    # Supersede any pending op for the same projection.  In-flight
-    # ops are left alone — the drain will discover their work is
-    # stale via etag mismatch on the next attempt.
+    # If an op with this exact idempotency key is already pending,
+    # the caller is re-asking for the same work — no-op.  Without
+    # this check the supersede-below would knock it out of the
+    # queue without a successor.
+    same_op = await (await db.execute(
+        "SELECT id, status FROM outbox_operations WHERE idempotency_key = ?",
+        (idem,),
+    )).fetchone()
+    if same_op is not None and same_op["status"] in (STATUS_PENDING, STATUS_IN_FLIGHT):
+        return int(same_op["id"])
+
+    # Supersede any pending op for the same projection with a
+    # different idempotency key.  In-flight ops are left alone —
+    # the drain will discover their work is stale via etag
+    # mismatch on the next attempt.
     await db.execute(
         """UPDATE outbox_operations
               SET status = ?, completed_at = ?
-            WHERE projection_id = ? AND status = ?""",
-        (STATUS_SUPERSEDED, when, projection_id, STATUS_PENDING),
+            WHERE projection_id = ?
+              AND status = ?
+              AND idempotency_key != ?""",
+        (STATUS_SUPERSEDED, when, projection_id, STATUS_PENDING, idem),
     )
 
-    idem = f"proj:{projection_id}:v{ledger_version}:{operation}"
     payload_json = json.dumps(payload, sort_keys=True) if payload is not None else None
 
     cursor = await db.execute(
@@ -124,8 +138,18 @@ async def enqueue(
     )
     if cursor.rowcount > 0:
         return cursor.lastrowid
-    # Conflict: a row with this idempotency key already exists.
-    # Look it up.
+    # Conflict resurrection: a prior op with the same key exists
+    # but is done/superseded.  Bring it back to pending so the
+    # drain retries.
+    await db.execute(
+        """UPDATE outbox_operations
+              SET status = ?, attempts = 0, next_attempt_at = ?,
+                  last_error = NULL, last_http_status = NULL,
+                  payload_json = ?, started_at = NULL, completed_at = NULL,
+                  ledger_version_at_enqueue = ?
+            WHERE idempotency_key = ?""",
+        (STATUS_PENDING, when, payload_json, ledger_version, idem),
+    )
     row = await (await db.execute(
         "SELECT id FROM outbox_operations WHERE idempotency_key = ?",
         (idem,),
@@ -254,13 +278,34 @@ async def _do_create(
         result = google.insert_event(cal_id, body)
     except Exception as e:
         if getattr(e, "status", None) == 409:
-            # The ID is already on Google — either a successful retry
-            # or a state we should adopt.  GET, verify, mark done.
+            # The ID is already on Google.  Two cases:
+            # * Retry-of-our-own-write: existing event matches our
+            #   intended payload → adopt and mark done.
+            # * Concurrent edit (e.g. user dragged our copy on main):
+            #   existing event differs from our intended payload.
+            #   We own this ID by construction; UPDATE to restore.
             existing = google.get_event(cal_id, google_id)
+            try:
+                result = google.update_event(
+                    cal_id, google_id, payload,
+                    if_match=existing.get("etag"),
+                )
+            except Exception as e2:
+                if getattr(e2, "status", None) == 412:
+                    # Lost the race; supersede + replan.
+                    await _mark_superseded(
+                        db, op,
+                        error="etag_mismatch_on_409",
+                        http_status=412,
+                        now=now,
+                    )
+                    await _request_projection_replan(db, op["projection_id"])
+                    return
+                raise
             await _record_success(
                 db, op,
-                google_event_id=existing["id"],
-                google_etag=existing.get("etag", ""),
+                google_event_id=result["id"],
+                google_etag=result.get("etag", ""),
                 now=now,
             )
             return
@@ -300,6 +345,20 @@ async def _do_update(
         )
     except Exception as e:
         if getattr(e, "status", None) == 412:
+            # Refresh our etag from Google so the next attempt sends
+            # the correct If-Match.  Without this, we'd ping-pong on
+            # 412 forever.
+            try:
+                fresh = google.get_event(cal_id, proj["google_event_id"])
+                await db.execute(
+                    """UPDATE ledger_projections
+                          SET google_etag = ?
+                        WHERE id = ?""",
+                    (fresh.get("etag", ""), int(proj["id"])),
+                )
+                await db.commit()
+            except Exception:
+                pass  # best-effort; drain will retry
             await _mark_superseded(
                 db, op,
                 error="etag_mismatch",
@@ -527,13 +586,15 @@ async def _request_projection_replan(
 ) -> None:
     """Mark the projection as needing fresh planner attention.
 
-    We bump ``desired_ledger_version`` past ``applied_ledger_version``
-    by clearing the latter; the next reconciler tick re-derives.
+    Clears ``applied_ledger_version`` so the diff filter picks it
+    up again, but leaves ``current_state`` as ``'present'`` (if it
+    was) so the next diff resolves to UPDATE rather than CREATE —
+    the event still exists on Google; we just need to re-assert
+    our desired payload against a freshly-fetched etag.
     """
     await db.execute(
         """UPDATE ledger_projections
-              SET applied_ledger_version = NULL,
-                  current_state = 'unknown'
+              SET applied_ledger_version = NULL
             WHERE id = ?""",
         (int(projection_id),),
     )

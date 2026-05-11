@@ -20,11 +20,12 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Iterable, Optional
 
 import aiosqlite
 
 from app.ledger.google_client import GoogleClient
+from app.ledger.identity import derive_instance_google_event_id
 from app.ledger.outbox import OP_CREATE, OP_DELETE, OP_UPDATE, enqueue
 from app.ledger.payload import ABSENT, render_payload
 
@@ -51,17 +52,68 @@ async def diff_and_enqueue_for_user(
     """
     rows = await _diverged_projections(db, user_id=user_id)
     enqueued = 0
-    for proj in rows:
+    # Process parents (non-instance rows) before instances so a
+    # parent's google_event_id is settled by the time we look it
+    # up for instance derivation.
+    rows_sorted = sorted(rows, key=lambda r: bool(r["parent_canonical_uid"]))
+
+    for proj in rows_sorted:
+        # Instance projections: derive google_event_id from the
+        # parent's projection on the same target.
+        if proj["parent_canonical_uid"]:
+            parent_proj_google_id = await _parent_projection_google_id(
+                db,
+                user_id=user_id,
+                parent_canonical_uid=proj["parent_canonical_uid"],
+                target_kind=proj["target_kind"],
+                target_calendar_id=proj["target_calendar_id"],
+            )
+            if not parent_proj_google_id:
+                # Parent hasn't been written yet; defer this instance
+                # to the next reconcile pass.
+                continue
+            derived = derive_instance_google_event_id(
+                parent_proj_google_id,
+                proj["recurrence_instance_original_start"] or "",
+                bool(proj["is_all_day"]),
+            )
+            # Pre-set google_event_id on the instance projection so
+            # the outbox's update/delete code path can find it.
+            if not proj["google_event_id"]:
+                await db.execute(
+                    """UPDATE ledger_projections
+                          SET google_event_id = ?
+                        WHERE id = ?""",
+                    (derived, int(proj["id"])),
+                )
+                # Re-read; otherwise _decide sees the stale row.
+                proj = await (await db.execute(
+                    """SELECT p.*, e.user_id AS user_id_from_ledger,
+                              e.summary, e.description, e.location,
+                              e.start_at, e.end_at, e.is_all_day, e.show_as,
+                              e.color_id, e.user_can_edit, e.user_rsvp_status,
+                              e.recurrence_rule_json, e.version AS ledger_version,
+                              e.parent_canonical_uid,
+                              e.recurrence_instance_original_start
+                         FROM ledger_projections p
+                         JOIN ledger_events e ON e.id = p.ledger_event_id
+                        WHERE p.id = ?""",
+                    (int(proj["id"]),),
+                )).fetchone()
+
         op_kind, payload, target_cal = _decide(
             proj=proj,
             main_calendar_id=main_calendar_id,
             google_calendar_id_for=google_calendar_id_for,
         )
         if op_kind is None:
-            # absent/absent — clear divergence by snapping applied
-            # forward.
             await _snap_applied(db, proj["id"], int(proj["desired_ledger_version"]))
             continue
+        # Instances are applied via UPDATE on the derived ID (the
+        # fake — and real Google — materialise the override
+        # transparently).  No INSERT path for instances.
+        if proj["parent_canonical_uid"] and op_kind == OP_CREATE:
+            op_kind = OP_UPDATE
         await enqueue(
             db,
             user_id=user_id,
@@ -76,6 +128,32 @@ async def diff_and_enqueue_for_user(
     return enqueued
 
 
+async def _parent_projection_google_id(
+    db: aiosqlite.Connection,
+    *,
+    user_id: int,
+    parent_canonical_uid: str,
+    target_kind: str,
+    target_calendar_id: Optional[int],
+) -> Optional[str]:
+    """Look up the parent ledger row's projection on the same
+    target, and return its ``google_event_id`` if set."""
+    row = await (await db.execute(
+        """SELECT p.google_event_id
+             FROM ledger_projections p
+             JOIN ledger_events e ON e.id = p.ledger_event_id
+            WHERE e.user_id = ?
+              AND e.canonical_uid = ?
+              AND p.target_kind = ?
+              AND COALESCE(p.target_calendar_id, -1) = COALESCE(?, -1)
+            LIMIT 1""",
+        (user_id, parent_canonical_uid, target_kind, target_calendar_id),
+    )).fetchone()
+    if row is None:
+        return None
+    return row["google_event_id"]
+
+
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
@@ -88,7 +166,9 @@ async def _diverged_projections(
                   e.summary, e.description, e.location,
                   e.start_at, e.end_at, e.is_all_day, e.show_as,
                   e.color_id, e.user_can_edit, e.user_rsvp_status,
-                  e.recurrence_rule_json, e.version AS ledger_version
+                  e.recurrence_rule_json, e.version AS ledger_version,
+                  e.parent_canonical_uid,
+                  e.recurrence_instance_original_start
              FROM ledger_projections p
              JOIN ledger_events e ON e.id = p.ledger_event_id
             WHERE e.user_id = ?
@@ -133,8 +213,14 @@ def _decide(
     )
 
     if desired == ABSENT:
-        # No google_event_id ever assigned → nothing to delete.
-        if not proj["google_event_id"] or current in ("absent", "unknown"):
+        # No google_event_id ever assigned → nothing to delete,
+        # unless this is an instance projection (whose google_event_id
+        # is derived from the parent — the delete materialises a
+        # cancelled exception on the series).
+        is_instance = bool(proj["parent_canonical_uid"])
+        if not proj["google_event_id"]:
+            return None, None, target_cal
+        if current in ("absent",) and not is_instance:
             return None, None, target_cal
         return OP_DELETE, None, target_cal
 

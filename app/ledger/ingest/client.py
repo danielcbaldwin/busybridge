@@ -27,6 +27,7 @@ import aiosqlite
 from app.ledger.google_client import GoogleClient
 from app.ledger.identity import (
     canonical_uid_client,
+    canonical_uid_for_instance,
     is_managed_google_event_id,
 )
 
@@ -157,9 +158,21 @@ async def _ingest_one_event(
     if proj_match is not None:
         return "skipped", None
 
+    # 2. Recurring-event INSTANCE (modified or cancelled).  Route
+    #    to the instance handler — these get their own ledger row
+    #    with parent_canonical_uid set so cancellations are sticky.
+    if event.get("recurringEventId"):
+        return await _ingest_instance(
+            db,
+            user_id=user_id,
+            client_calendar_id=client_calendar_id,
+            user_email=user_email,
+            event=event,
+        )
+
     canonical = canonical_uid_client(client_calendar_id, event_id)
 
-    # 2. Rescheduled-parent ``_R`` quirk.  Re-key existing ledger
+    # 3. Rescheduled-parent ``_R`` quirk.  Re-key existing ledger
     # row before treating this as a new event.
     if (
         status != "cancelled"
@@ -212,6 +225,160 @@ async def _ingest_one_event(
         user_email=user_email,
     )
     return ("updated" if changed else "skipped"), int(existing["id"])
+
+
+# ---------------------------------------------------------------------------
+# Instance handling
+# ---------------------------------------------------------------------------
+async def _ingest_instance(
+    db: aiosqlite.Connection,
+    *,
+    user_id: int,
+    client_calendar_id: int,
+    user_email: str,
+    event: dict,
+) -> tuple[str, Optional[int]]:
+    """Upsert a modified or cancelled instance of a recurring series.
+
+    Instances are kept as separate ledger rows with
+    ``parent_canonical_uid`` set, so a cancellation persists even
+    if the recurring parent series later gets re-ingested via
+    full sync (which omits cancelled exceptions — the documented
+    "recurring-cancellation amnesia" bug).
+    """
+    parent_event_id = event["recurringEventId"]
+    parent_canonical = canonical_uid_client(client_calendar_id, parent_event_id)
+    ost = event.get("originalStartTime", {}) or {}
+    if "dateTime" in ost:
+        original_start = ost["dateTime"]
+    elif "date" in ost:
+        original_start = ost["date"]
+    else:
+        original_start = (event.get("start") or {}).get("dateTime") or (
+            event.get("start") or {}
+        ).get("date") or ""
+
+    instance_canonical = canonical_uid_for_instance(
+        parent_canonical, original_start,
+    )
+    status = event.get("status", "confirmed")
+    when = datetime.now(UTC).isoformat()
+
+    existing = await (await db.execute(
+        """SELECT * FROM ledger_events
+            WHERE user_id = ? AND canonical_uid = ?""",
+        (user_id, instance_canonical),
+    )).fetchone()
+
+    # Cancelled instance — sticky ledger row that survives parent
+    # full-sync (since incremental sync surfaces the cancellation
+    # once, and our row persists across future passes).
+    if status == "cancelled":
+        if existing is not None and existing["status"] == "cancelled":
+            return "skipped", int(existing["id"])
+        if existing is None:
+            cursor = await db.execute(
+                """INSERT INTO ledger_events
+                      (user_id, canonical_uid, parent_canonical_uid,
+                       source_type, source_calendar_id, source_event_id,
+                       recurrence_instance_original_start,
+                       status, version, is_recurring,
+                       created_at, updated_at, last_seen_at, cancelled_at)
+                   VALUES (?, ?, ?,
+                           'client', ?, ?, ?,
+                           'cancelled', 1, 0,
+                           ?, ?, ?, ?)""",
+                (
+                    user_id, instance_canonical, parent_canonical,
+                    client_calendar_id, event["id"], original_start,
+                    when, when, when, when,
+                ),
+            )
+            return "cancelled", int(cursor.lastrowid)
+        await db.execute(
+            """UPDATE ledger_events
+                  SET status = 'cancelled',
+                      version = version + 1,
+                      cancelled_at = ?, updated_at = ?, last_seen_at = ?
+                WHERE id = ?""",
+            (when, when, when, int(existing["id"])),
+        )
+        return "cancelled", int(existing["id"])
+
+    # Modified instance — single-instance override on the series.
+    fields = _extract_event_fields(event, user_email=user_email)
+    if existing is None:
+        cursor = await db.execute(
+            """INSERT INTO ledger_events
+                  (user_id, canonical_uid, parent_canonical_uid,
+                   source_type, source_calendar_id, source_event_id,
+                   recurrence_instance_original_start,
+                   source_etag, source_updated_at,
+                   summary, description, location,
+                   start_at, end_at, is_all_day,
+                   show_as, visibility, color_id,
+                   organizer_email, user_can_edit, user_rsvp_status,
+                   attendees_json,
+                   status, is_recurring, version,
+                   created_at, updated_at, last_seen_at)
+               VALUES (?, ?, ?,
+                       'client', ?, ?, ?,
+                       ?, ?,
+                       ?, ?, ?,
+                       ?, ?, ?,
+                       ?, ?, ?,
+                       ?, ?, ?,
+                       ?,
+                       'active', 0, 1,
+                       ?, ?, ?)""",
+            (
+                user_id, instance_canonical, parent_canonical,
+                client_calendar_id, event["id"], original_start,
+                event.get("etag"), event.get("updated"),
+                fields["summary"], fields["description"], fields["location"],
+                fields["start_at"], fields["end_at"], fields["is_all_day"],
+                fields["show_as"], fields["visibility"], fields["color_id"],
+                fields["organizer_email"], fields["user_can_edit"],
+                fields["user_rsvp_status"],
+                fields["attendees_json"],
+                when, when, when,
+            ),
+        )
+        return "created", int(cursor.lastrowid)
+
+    new_hash = _content_hash(fields)
+    old_hash = _content_hash_from_row(existing)
+    if new_hash == old_hash:
+        await db.execute(
+            "UPDATE ledger_events SET last_seen_at = ? WHERE id = ?",
+            (when, int(existing["id"])),
+        )
+        return "skipped", int(existing["id"])
+    await db.execute(
+        """UPDATE ledger_events
+              SET source_etag = ?, source_updated_at = ?,
+                  summary = ?, description = ?, location = ?,
+                  start_at = ?, end_at = ?, is_all_day = ?,
+                  show_as = ?, visibility = ?, color_id = ?,
+                  organizer_email = ?, user_can_edit = ?,
+                  user_rsvp_status = ?,
+                  attendees_json = ?,
+                  status = 'active',
+                  version = version + 1,
+                  updated_at = ?, last_seen_at = ?
+            WHERE id = ?""",
+        (
+            event.get("etag"), event.get("updated"),
+            fields["summary"], fields["description"], fields["location"],
+            fields["start_at"], fields["end_at"], fields["is_all_day"],
+            fields["show_as"], fields["visibility"], fields["color_id"],
+            fields["organizer_email"], fields["user_can_edit"],
+            fields["user_rsvp_status"],
+            fields["attendees_json"],
+            when, when, int(existing["id"]),
+        ),
+    )
+    return "updated", int(existing["id"])
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +442,8 @@ async def _apply_event_to_ledger(
     user_email: str,
 ) -> bool:
     """Update an existing ledger row.  Returns True if any material
-    field changed (and version was bumped)."""
+    field changed (and version was bumped).  A row resurrecting
+    from ``cancelled`` to ``active`` always counts as changed."""
     fields = _extract_event_fields(event, user_email=user_email)
     existing = await (await db.execute(
         "SELECT * FROM ledger_events WHERE id = ?",
@@ -285,7 +453,8 @@ async def _apply_event_to_ledger(
 
     new_hash = _content_hash(fields)
     old_hash = _content_hash_from_row(existing)
-    changed = (new_hash != old_hash)
+    resurrecting = existing["status"] == "cancelled"
+    changed = (new_hash != old_hash) or resurrecting
 
     if not changed:
         await db.execute(

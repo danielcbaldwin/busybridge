@@ -128,23 +128,34 @@ def _resolve_targets(
     desired: dict[str, str],
     active_clients: list[aiosqlite.Row],
 ) -> list[tuple[str, Optional[int], str]]:
-    """Convert role-keyed desired states to concrete (kind, cal_id, state) triples."""
+    """Convert role-keyed desired states to concrete (kind, cal_id, state) triples.
+
+    Origin-exclusion (the client calendar that *sourced* the event
+    does not receive a busy block) only applies when the source is
+    a client calendar.  Personal / webcal / main_native sources do
+    not share an ID space with ``client_calendars.id``, so we must
+    NOT compare numeric IDs across spaces — that would accidentally
+    exclude a client whose ID matched, e.g., a webcal subscription's
+    ID.
+    """
     out: list[tuple[str, Optional[int], str]] = []
 
     main_state = desired["main"]
     out.append((TARGET_MAIN, None, main_state))
 
+    source_type = ledger["source_type"]
     origin_cal_id = (
         int(ledger["source_calendar_id"])
         if ledger["source_calendar_id"] is not None
         else None
     )
+    same_id_space = source_type in ("client",)
     peer_state = desired["peer_clients"]
     origin_state = desired["origin_client"]
 
     for cal in active_clients:
         cal_id = int(cal["id"])
-        if cal_id == origin_cal_id:
+        if same_id_space and cal_id == origin_cal_id:
             state = origin_state
         else:
             state = peer_state
@@ -263,9 +274,14 @@ async def _get_ledger_row(db: aiosqlite.Connection, ledger_event_id: int):
 async def _active_client_calendars(
     db: aiosqlite.Connection, user_id: int,
 ) -> list[aiosqlite.Row]:
+    """Active CLIENT calendars — personal calendars are deliberately
+    excluded, per REWRITE_PLAN.md §6.1: personal calendars are
+    read-only origin sources, never busy-block targets."""
     cursor = await db.execute(
         """SELECT id FROM client_calendars
-            WHERE user_id = ? AND is_active = 1""",
+            WHERE user_id = ?
+              AND is_active = 1
+              AND calendar_type = 'client'""",
         (int(user_id),),
     )
     return await cursor.fetchall()
