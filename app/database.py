@@ -279,6 +279,15 @@ async def init_schema(db: aiosqlite.Connection) -> None:
     except Exception:
         pass
 
+    # Ledger tables (REWRITE_PLAN.md §4).  Additive — they sit
+    # alongside the legacy event_mappings/busy_blocks until the
+    # Stage-5 cutover.
+    try:
+        from app.ledger.schema import init_ledger_schema
+        await init_ledger_schema(db)
+    except Exception as e:
+        logger.warning("ledger schema init failed (non-fatal): %s", e)
+
     logger.info("Database schema initialized")
 
 

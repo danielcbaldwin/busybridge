@@ -10,6 +10,7 @@ from app.api.admin import router as admin_router
 from app.api.webhooks import router as webhooks_router
 from app.api.backup import router as backup_router
 from app.api.webcal import router as webcal_router
+from app.api.ledger_admin import router as ledger_admin_router
 
 api_router = APIRouter(prefix="/api")
 
@@ -21,5 +22,6 @@ api_router.include_router(admin_router)
 api_router.include_router(webhooks_router)
 api_router.include_router(backup_router)
 api_router.include_router(webcal_router)
+api_router.include_router(ledger_admin_router)
 
 __all__ = ["api_router"]

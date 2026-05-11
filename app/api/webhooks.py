@@ -98,6 +98,23 @@ async def receive_google_calendar_webhook(
             # TODO: Trigger webhook re-registration for this calendar
             return {"status": "ok", "message": "Channel expired and removed"}
 
+    # Mirror the notification into the ledger's reconcile queue.
+    # Non-disruptive: enqueues a debounced request that the
+    # scheduler's ledger-drain job will pick up.  If the legacy
+    # sync (below) is still authoritative this is a no-op observer.
+    try:
+        from app.ledger.triggers import enqueue_webhook
+        if channel["calendar_type"] == "main":
+            hint = "main"
+        elif channel["calendar_type"] == "personal":
+            hint = f"personal:{channel['client_calendar_id']}"
+        else:
+            hint = f"client:{channel['client_calendar_id']}"
+        await enqueue_webhook(db, user_id=channel["user_id"], source_hint=hint)
+    except Exception as e:
+        # Never let the ledger trigger plumbing block legacy sync.
+        logger.warning("ledger enqueue_webhook failed: %s", e)
+
     # Trigger sync for the affected calendar
     try:
         from app.sync.engine import trigger_sync_for_calendar, trigger_sync_for_main_calendar, trigger_sync_for_personal_calendar

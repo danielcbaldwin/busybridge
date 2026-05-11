@@ -32,6 +32,10 @@ class Settings(BaseSettings):
 
     # Runtime features
     enable_webhooks: bool = True
+    # When True, the scheduler runs the new ledger-pipeline jobs
+    # alongside the legacy sync.  Disabled by default so the new
+    # system is opt-in until Stage 5 cutover (REWRITE_PLAN.md §13).
+    enable_ledger_jobs: bool = False
 
     # Test mode controls
     test_mode: bool = False

@@ -111,6 +111,26 @@ def setup_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
 
+    # Ledger pipeline jobs (REWRITE_PLAN.md): these run alongside the
+    # legacy sync jobs until cutover.  Drain often (30s) so debounced
+    # webhook requests reach Google quickly; enqueue periodic
+    # reconcile requests at the same cadence as the legacy sync.
+    if getattr(settings, "enable_ledger_jobs", False):
+        _scheduler.add_job(
+            "app.jobs.ledger_jobs:ledger_drain_due",
+            trigger=IntervalTrigger(seconds=30),
+            id="ledger_drain_due",
+            name="Ledger Drain",
+            replace_existing=True,
+        )
+        _scheduler.add_job(
+            "app.jobs.ledger_jobs:ledger_enqueue_periodic",
+            trigger=IntervalTrigger(minutes=settings.sync_interval_minutes),
+            id="ledger_enqueue_periodic",
+            name="Ledger Periodic Enqueue",
+            replace_existing=True,
+        )
+
     _scheduler.start()
     logger.info("Background scheduler started")
 
