@@ -137,6 +137,51 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to start scheduler: {e}")
 
+    # Optional: BB_FAKE_GOOGLE=1 boots the app with the in-memory
+    # FakeGoogleCalendar wired into the ledger runtime.  Useful for
+    # end-to-end smoke tests against a running uvicorn (no real
+    # Google credentials required).  Strictly opt-in.
+    if os.environ.get("BB_FAKE_GOOGLE") == "1":
+        try:
+            from app.ledger.runtime import set_google_client_factory
+            from tests.fakes.google_calendar import FakeGoogleCalendar
+
+            _fake = FakeGoogleCalendar()
+            # Register every calendar already in the DB so it's
+            # immediately addressable.
+            db_conn = await get_database()
+            rows = await (await db_conn.execute(
+                "SELECT DISTINCT main_calendar_id FROM users "
+                "WHERE main_calendar_id IS NOT NULL"
+            )).fetchall()
+            for row in rows:
+                try:
+                    _fake.add_calendar(row[0], row[0])
+                except Exception:
+                    pass
+            rows = await (await db_conn.execute(
+                "SELECT DISTINCT google_calendar_id FROM client_calendars"
+            )).fetchall()
+            for row in rows:
+                try:
+                    _fake.add_calendar(row[0], row[0])
+                except Exception:
+                    pass
+
+            async def _factory(user_id, email):
+                return _fake
+
+            set_google_client_factory(_factory)
+            # Expose on app.state so external test scripts can
+            # poke events into it via a debug endpoint.
+            app.state.fake_google = _fake
+            logger.warning(
+                "BB_FAKE_GOOGLE=1: ledger runtime wired to FakeGoogleCalendar "
+                "(NOT for production use)",
+            )
+        except Exception as e:
+            logger.error(f"Failed to install fake Google client: {e}")
+
     yield
 
     # Shutdown
@@ -201,6 +246,57 @@ async def health_check():
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"status": "unhealthy", "error": str(e)},
         )
+
+
+# ---------------------------------------------------------------------------
+# Debug endpoints — only mounted when BB_FAKE_GOOGLE=1
+# ---------------------------------------------------------------------------
+if os.environ.get("BB_FAKE_GOOGLE") == "1":
+    @app.post("/_fake/calendars/{calendar_id}/events")
+    @limiter.exempt
+    async def _fake_insert_event(calendar_id: str, body: dict):
+        """Plant an event on the FakeGoogleCalendar.  Only available
+        when ``BB_FAKE_GOOGLE=1``.  Returns the inserted event dict."""
+        fake = getattr(app.state, "fake_google", None)
+        if fake is None:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "fake Google not initialised"},
+            )
+        try:
+            return fake.insert_event(calendar_id, body)
+        except Exception as e:
+            return JSONResponse(status_code=400, content={"error": str(e)})
+
+    @app.delete("/_fake/calendars/{calendar_id}/events/{event_id}")
+    @limiter.exempt
+    async def _fake_delete_event(calendar_id: str, event_id: str):
+        fake = getattr(app.state, "fake_google", None)
+        if fake is None:
+            return JSONResponse(status_code=503, content={"error": "fake Google not initialised"})
+        try:
+            fake.delete_event(calendar_id, event_id)
+            return {"status": "deleted"}
+        except Exception as e:
+            return JSONResponse(status_code=400, content={"error": str(e)})
+
+    @app.get("/_fake/calendars/{calendar_id}/events")
+    @limiter.exempt
+    async def _fake_list_events(calendar_id: str, show_deleted: bool = False):
+        fake = getattr(app.state, "fake_google", None)
+        if fake is None:
+            return JSONResponse(status_code=503, content={"error": "fake Google not initialised"})
+        return fake.list_events(calendar_id, show_deleted=show_deleted)
+
+    @app.get("/_fake/calendars/{calendar_id}/events/{event_id}/instances")
+    @limiter.exempt
+    async def _fake_list_instances(
+        calendar_id: str, event_id: str, show_deleted: bool = False,
+    ):
+        fake = getattr(app.state, "fake_google", None)
+        if fake is None:
+            return JSONResponse(status_code=503, content={"error": "fake Google not initialised"})
+        return fake.list_instances(calendar_id, event_id, show_deleted=show_deleted)
 
 
 # Include routers
