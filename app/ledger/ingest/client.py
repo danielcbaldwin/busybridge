@@ -62,6 +62,9 @@ async def ingest_client_calendar(
     page_token: Optional[str] = None
     new_sync_token: Optional[str] = None
     full_sync = sync_token is None
+    # Recurring parent event IDs seen this pass; on a full sync we
+    # must scan their instances explicitly (see below).
+    recurring_parent_ids: set[str] = set()
 
     while True:
         try:
@@ -83,11 +86,18 @@ async def ingest_client_calendar(
                 sync_token = None
                 page_token = None
                 full_sync = True
+                recurring_parent_ids.clear()
                 continue
             raise
 
         for event in page.get("items", []):
             counters["seen"] += 1
+            if (
+                event.get("recurrence")
+                and not event.get("recurringEventId")
+                and event.get("status") != "cancelled"
+            ):
+                recurring_parent_ids.add(event["id"])
             outcome, ledger_id = await _ingest_one_event(
                 db,
                 user_id=user_id,
@@ -104,6 +114,46 @@ async def ingest_client_calendar(
             continue
         new_sync_token = page.get("nextSyncToken")
         break
+
+    # FULL-SYNC RECURRING-CANCELLATION RECOVERY.
+    #
+    # Full ``events.list`` does NOT return cancelled instance
+    # exceptions of recurring series (documented Google quirk —
+    # see tests/fakes/QUIRKS.md).  So an instance cancelled during
+    # a sync-token gap is invisible to the full-sync loop above.
+    # ``events.instances(showDeleted=True)`` IS reliable, so on a
+    # full sync we scan every recurring parent's instances and
+    # ingest the cancelled ones.  This closes the
+    # recurring-cancellation-amnesia bug (REWRITE_PLAN.md §8).
+    if full_sync and recurring_parent_ids:
+        for parent_id in recurring_parent_ids:
+            try:
+                inst_resp = google.list_instances(
+                    google_calendar_id, parent_id,
+                    show_deleted=True, max_results=2500,
+                )
+            except Exception as e:
+                logger.warning(
+                    "instance scan failed for %s/%s: %s",
+                    client_calendar_id, parent_id, e,
+                )
+                continue
+            for inst in inst_resp.get("items", []):
+                if inst.get("status") != "cancelled":
+                    continue
+                if not inst.get("recurringEventId"):
+                    continue
+                counters["seen"] += 1
+                outcome, ledger_id = await _ingest_one_event(
+                    db,
+                    user_id=user_id,
+                    client_calendar_id=client_calendar_id,
+                    user_email=user_email,
+                    event=inst,
+                )
+                counters[outcome] = counters.get(outcome, 0) + 1
+                if ledger_id is not None:
+                    affected_ledger_ids.append(ledger_id)
 
     when = datetime.now(UTC).isoformat()
     await db.execute(
