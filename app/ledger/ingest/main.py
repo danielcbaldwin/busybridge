@@ -35,7 +35,10 @@ from app.ledger.ingest.client import (
     _content_hash,
     _content_hash_from_row,
     _extract_event_fields,
+    _ingest_instance,
+    _is_recurring_parent,
     _record_affected,
+    scan_full_sync_recurring_cancellations,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,7 @@ async def ingest_main_calendar(
     page_token: Optional[str] = None
     new_sync_token: Optional[str] = None
     full_sync = sync_token is None
+    recurring_parent_ids: set[str] = set()
 
     while True:
         try:
@@ -85,11 +89,14 @@ async def ingest_main_calendar(
                 sync_token = None
                 page_token = None
                 full_sync = True
+                recurring_parent_ids.clear()
                 continue
             raise
 
         for event in page.get("items", []):
             counters["seen"] += 1
+            if _is_recurring_parent(event):
+                recurring_parent_ids.add(event["id"])
             outcome, ledger_id = await _ingest_one_main_event(
                 db,
                 user_id=user_id,
@@ -105,6 +112,25 @@ async def ingest_main_calendar(
             continue
         new_sync_token = page.get("nextSyncToken")
         break
+
+    # On a full sync, recover cancelled recurring instances that
+    # ``events.list`` omits (see scan_full_sync_recurring_cancellations).
+    if full_sync and recurring_parent_ids:
+        async def _ingest(inst: dict) -> tuple[str, Optional[int]]:
+            return await _ingest_one_main_event(
+                db,
+                user_id=user_id,
+                user_email=user_email,
+                event=inst,
+            )
+        await scan_full_sync_recurring_cancellations(
+            db, google,
+            google_calendar_id=google_main_calendar_id,
+            recurring_parent_ids=recurring_parent_ids,
+            counters=counters,
+            affected_ledger_ids=affected_ledger_ids,
+            ingest_one=_ingest,
+        )
 
     when = datetime.now(UTC).isoformat()
     await db.execute(
@@ -175,6 +201,24 @@ async def _ingest_one_main_event(
             if outcome is not None:
                 return outcome, int(proj_match["ledger_event_id"])
         return "our_writes_skipped", None
+
+    # Recurring-event INSTANCE of a *native* main series — route to
+    # the shared instance handler so cancellations get their own
+    # sticky ledger row.  Instances whose parent is one of our own
+    # managed writes are left to the native path below (which
+    # safely skips an unknown cancelled event).
+    recurring_parent = event.get("recurringEventId")
+    if recurring_parent and not is_managed_google_event_id(recurring_parent):
+        parent_canonical = canonical_uid_main_native(user_id, recurring_parent)
+        return await _ingest_instance(
+            db,
+            user_id=user_id,
+            user_email=user_email,
+            event=event,
+            parent_canonical=parent_canonical,
+            source_type="main_native",
+            source_calendar_id=None,
+        )
 
     # A native main event we haven't seen before, or seen previously.
     canonical = canonical_uid_main_native(user_id, event_id)

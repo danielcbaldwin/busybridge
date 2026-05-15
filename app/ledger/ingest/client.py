@@ -20,7 +20,7 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import aiosqlite
 
@@ -92,11 +92,7 @@ async def ingest_client_calendar(
 
         for event in page.get("items", []):
             counters["seen"] += 1
-            if (
-                event.get("recurrence")
-                and not event.get("recurringEventId")
-                and event.get("status") != "cancelled"
-            ):
+            if _is_recurring_parent(event):
                 recurring_parent_ids.add(event["id"])
             outcome, ledger_id = await _ingest_one_event(
                 db,
@@ -115,45 +111,25 @@ async def ingest_client_calendar(
         new_sync_token = page.get("nextSyncToken")
         break
 
-    # FULL-SYNC RECURRING-CANCELLATION RECOVERY.
-    #
-    # Full ``events.list`` does NOT return cancelled instance
-    # exceptions of recurring series (documented Google quirk —
-    # see tests/fakes/QUIRKS.md).  So an instance cancelled during
-    # a sync-token gap is invisible to the full-sync loop above.
-    # ``events.instances(showDeleted=True)`` IS reliable, so on a
-    # full sync we scan every recurring parent's instances and
-    # ingest the cancelled ones.  This closes the
-    # recurring-cancellation-amnesia bug (REWRITE_PLAN.md §8).
+    # On a full sync, recover cancelled recurring instances that
+    # ``events.list`` omits (see scan_full_sync_recurring_cancellations).
     if full_sync and recurring_parent_ids:
-        for parent_id in recurring_parent_ids:
-            try:
-                inst_resp = google.list_instances(
-                    google_calendar_id, parent_id,
-                    show_deleted=True, max_results=2500,
-                )
-            except Exception as e:
-                logger.warning(
-                    "instance scan failed for %s/%s: %s",
-                    client_calendar_id, parent_id, e,
-                )
-                continue
-            for inst in inst_resp.get("items", []):
-                if inst.get("status") != "cancelled":
-                    continue
-                if not inst.get("recurringEventId"):
-                    continue
-                counters["seen"] += 1
-                outcome, ledger_id = await _ingest_one_event(
-                    db,
-                    user_id=user_id,
-                    client_calendar_id=client_calendar_id,
-                    user_email=user_email,
-                    event=inst,
-                )
-                counters[outcome] = counters.get(outcome, 0) + 1
-                if ledger_id is not None:
-                    affected_ledger_ids.append(ledger_id)
+        async def _ingest(inst: dict) -> tuple[str, Optional[int]]:
+            return await _ingest_one_event(
+                db,
+                user_id=user_id,
+                client_calendar_id=client_calendar_id,
+                user_email=user_email,
+                event=inst,
+            )
+        await scan_full_sync_recurring_cancellations(
+            db, google,
+            google_calendar_id=google_calendar_id,
+            recurring_parent_ids=recurring_parent_ids,
+            counters=counters,
+            affected_ledger_ids=affected_ledger_ids,
+            ingest_one=_ingest,
+        )
 
     when = datetime.now(UTC).isoformat()
     await db.execute(
@@ -175,6 +151,67 @@ async def ingest_client_calendar(
         await _record_affected(db, user_id=user_id, ledger_ids=affected_ledger_ids)
     await db.commit()
     return counters
+
+
+# ---------------------------------------------------------------------------
+# Full-sync recurring-cancellation recovery (shared by every source)
+# ---------------------------------------------------------------------------
+def _is_recurring_parent(event: dict) -> bool:
+    """True for a recurring *series master* we did not write: it
+    carries a recurrence rule, is not itself an instance, is not
+    cancelled, and is not one of our own managed copies."""
+    return bool(
+        event.get("recurrence")
+        and not event.get("recurringEventId")
+        and event.get("status") != "cancelled"
+        and not is_managed_google_event_id(event.get("id"))
+    )
+
+
+async def scan_full_sync_recurring_cancellations(
+    db: aiosqlite.Connection,
+    google: GoogleClient,
+    *,
+    google_calendar_id: str,
+    recurring_parent_ids: set[str],
+    counters: dict,
+    affected_ledger_ids: list[int],
+    ingest_one: Callable[[dict], Awaitable[tuple[str, Optional[int]]]],
+) -> None:
+    """Recover cancelled recurring instances that a full sync omits.
+
+    Full ``events.list`` does NOT return cancelled instance
+    exceptions of recurring series (documented Google quirk — see
+    tests/fakes/QUIRKS.md), so an instance cancelled during a
+    sync-token gap is invisible to the full-sync page loop.
+    ``events.instances(showDeleted=True)`` IS reliable: this scans
+    every recurring parent seen this pass and routes the cancelled
+    instances through ``ingest_one``.  Closes the
+    recurring-cancellation-amnesia bug (REWRITE_PLAN.md §8) for
+    every source type — client, personal, and native main.
+    """
+    for parent_id in recurring_parent_ids:
+        try:
+            inst_resp = google.list_instances(
+                google_calendar_id, parent_id,
+                show_deleted=True, max_results=2500,
+            )
+        except Exception as e:
+            logger.warning(
+                "instance scan failed for %s/%s: %s",
+                google_calendar_id, parent_id, e,
+            )
+            continue
+        for inst in inst_resp.get("items", []):
+            if inst.get("status") != "cancelled":
+                continue
+            if not inst.get("recurringEventId"):
+                continue
+            counters["seen"] += 1
+            outcome, ledger_id = await ingest_one(inst)
+            counters[outcome] = counters.get(outcome, 0) + 1
+            if ledger_id is not None:
+                affected_ledger_ids.append(ledger_id)
 
 
 # ---------------------------------------------------------------------------
@@ -212,12 +249,17 @@ async def _ingest_one_event(
     #    to the instance handler — these get their own ledger row
     #    with parent_canonical_uid set so cancellations are sticky.
     if event.get("recurringEventId"):
+        parent_canonical = canonical_uid_client(
+            client_calendar_id, event["recurringEventId"],
+        )
         return await _ingest_instance(
             db,
             user_id=user_id,
-            client_calendar_id=client_calendar_id,
             user_email=user_email,
             event=event,
+            parent_canonical=parent_canonical,
+            source_type="client",
+            source_calendar_id=client_calendar_id,
         )
 
     canonical = canonical_uid_client(client_calendar_id, event_id)
@@ -284,20 +326,23 @@ async def _ingest_instance(
     db: aiosqlite.Connection,
     *,
     user_id: int,
-    client_calendar_id: int,
     user_email: str,
     event: dict,
+    parent_canonical: str,
+    source_type: str,
+    source_calendar_id: Optional[int],
 ) -> tuple[str, Optional[int]]:
     """Upsert a modified or cancelled instance of a recurring series.
 
-    Instances are kept as separate ledger rows with
-    ``parent_canonical_uid`` set, so a cancellation persists even
-    if the recurring parent series later gets re-ingested via
-    full sync (which omits cancelled exceptions — the documented
-    "recurring-cancellation amnesia" bug).
+    Source-neutral: ``source_type`` is ``'client'``, ``'personal'``,
+    or ``'main_native'`` and ``source_calendar_id`` is the owning
+    calendar id (``None`` for native main).  Instances are kept as
+    separate ledger rows with ``parent_canonical_uid`` set, so a
+    cancellation persists even if the recurring parent series later
+    gets re-ingested via full sync (which omits cancelled
+    exceptions — the documented "recurring-cancellation amnesia"
+    bug).
     """
-    parent_event_id = event["recurringEventId"]
-    parent_canonical = canonical_uid_client(client_calendar_id, parent_event_id)
     ost = event.get("originalStartTime", {}) or {}
     if "dateTime" in ost:
         original_start = ost["dateTime"]
@@ -335,12 +380,13 @@ async def _ingest_instance(
                        status, version, is_recurring,
                        created_at, updated_at, last_seen_at, cancelled_at)
                    VALUES (?, ?, ?,
-                           'client', ?, ?, ?,
+                           ?, ?, ?, ?,
                            'cancelled', 1, 0,
                            ?, ?, ?, ?)""",
                 (
                     user_id, instance_canonical, parent_canonical,
-                    client_calendar_id, event["id"], original_start,
+                    source_type, source_calendar_id, event["id"],
+                    original_start,
                     when, when, when, when,
                 ),
             )
@@ -372,7 +418,7 @@ async def _ingest_instance(
                    status, is_recurring, version,
                    created_at, updated_at, last_seen_at)
                VALUES (?, ?, ?,
-                       'client', ?, ?, ?,
+                       ?, ?, ?, ?,
                        ?, ?,
                        ?, ?, ?,
                        ?, ?, ?,
@@ -383,7 +429,8 @@ async def _ingest_instance(
                        ?, ?, ?)""",
             (
                 user_id, instance_canonical, parent_canonical,
-                client_calendar_id, event["id"], original_start,
+                source_type, source_calendar_id, event["id"],
+                original_start,
                 event.get("etag"), event.get("updated"),
                 fields["summary"], fields["description"], fields["location"],
                 fields["start_at"], fields["end_at"], fields["is_all_day"],
