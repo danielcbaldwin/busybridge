@@ -112,7 +112,16 @@ async def reconcile_user_by_id(
 
     Returns the reconciler's counters dict.  Callers (webhook
     handler, scheduler) typically log the result and move on.
+
+    When ``settings.ledger_dry_run`` is True the outbox is never
+    drained regardless of the ``drain`` argument — the run
+    ingests + plans + diffs only, leaving pending outbox rows as
+    a preview of what WOULD be written to Google.
     """
+    from app.config import get_settings as _gs
+    if _gs().ledger_dry_run:
+        drain = False
+
     db = await get_database()
     user = await _load_user(db, user_id)
     if user is None:

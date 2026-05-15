@@ -37,6 +37,14 @@ class Settings(BaseSettings):
     # Setting this False stops the scheduler's drain job — useful
     # only as a temporary rollback switch during incident response.
     enable_ledger_jobs: bool = True
+    # Dry-run / shadow mode.  When True, the reconciler still
+    # ingests from Google and computes the full plan + outbox, but
+    # the outbox is NEVER drained — nothing is written back to
+    # Google.  Pending outbox rows are the preview of what WOULD
+    # be written.  Used for the Stage-4 staging-validation window
+    # (REWRITE_PLAN.md §13): point at real Google, watch what the
+    # new system would do, without touching anything.
+    ledger_dry_run: bool = False
 
     # Test mode controls
     test_mode: bool = False

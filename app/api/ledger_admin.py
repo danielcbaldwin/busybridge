@@ -225,3 +225,83 @@ async def reconcile_now(
     from app.ledger.runtime import reconcile_user_by_id
     out = await reconcile_user_by_id(user_id)
     return {"status": "done", "result": out}
+
+
+# ---------------------------------------------------------------------------
+# Stage-4 verification (read-only; safe against production / real Google)
+# ---------------------------------------------------------------------------
+async def _user_calendar_bindings(db, user_id: int):
+    """Return (main_google_id, {client_calendars.id: google_id}) for a user."""
+    user = await (await db.execute(
+        "SELECT main_calendar_id FROM users WHERE id = ?", (user_id,),
+    )).fetchone()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    rows = await (await db.execute(
+        "SELECT id, google_calendar_id FROM client_calendars WHERE user_id = ?",
+        (user_id,),
+    )).fetchall()
+    return (
+        user["main_calendar_id"],
+        {int(r["id"]): r["google_calendar_id"] for r in rows},
+    )
+
+
+@router.get("/users/{user_id}/verify")
+async def verify_against_google(
+    user_id: int,
+    _: User = Depends(require_admin),
+) -> dict:
+    """Compare the ledger's projection state against live Google.
+
+    Read-only: never writes to Google.  Returns the divergence
+    list.  This is the Stage-4 confidence check — run it during
+    the staging-validation window and before the production
+    cutover.  An empty ``divergences`` list means the ledger's
+    model matches reality.
+    """
+    from app.ledger.verify import verify_user
+    from app.ledger.runtime import _google_client_factory, _resolve_home_email
+
+    db = await get_database()
+    main_google_id, client_map = await _user_calendar_bindings(db, user_id)
+    if main_google_id is None:
+        return {"status": "skipped", "reason": "user has no main calendar"}
+    email = await _resolve_home_email(db, user_id)
+    if not email:
+        return {"status": "skipped", "reason": "no home OAuth token"}
+    google = await _google_client_factory(user_id, email)
+    result = await verify_user(
+        db, google,
+        user_id=user_id,
+        main_google_calendar_id=main_google_id,
+        google_calendar_id_for=client_map,
+    )
+    return {"status": "done", **result}
+
+
+@router.post("/users/{user_id}/dry-run")
+async def dry_run_preview(
+    user_id: int,
+    _: User = Depends(require_admin),
+) -> dict:
+    """Run an ingest + plan + diff pass with the outbox left
+    UNDRAINED, then return the pending operations: the exact list
+    of writes the system *would* send to Google.
+
+    Pure read against Google (ingest only); nothing is written.
+    Use this during the Stage-4 staging window to see what the
+    new system intends to do before letting it loose.
+    """
+    from app.ledger.runtime import reconcile_user_by_id
+    from app.ledger.verify import preview_pending_outbox
+
+    out = await reconcile_user_by_id(user_id, drain=False)
+    db = await get_database()
+    preview = await preview_pending_outbox(db, user_id=user_id)
+    return {
+        "status": "done",
+        "reconcile_counters": out,
+        "pending_operations": preview,
+        "pending_count": len(preview),
+    }

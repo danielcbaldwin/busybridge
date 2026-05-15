@@ -205,3 +205,137 @@ def test_bb_fake_google_recurring_cancellation_propagates(app_with_fake_google):
     assert len(cancelled_15th) == 1, (
         f"expected exactly one cancelled instance on 2026-06-15; got {statuses}"
     )
+
+def test_dry_run_previews_without_writing(app_with_fake_google):
+    """POST /dry-run ingests + plans + diffs but drains nothing.
+    The pending-operations preview lists what WOULD be written;
+    the main calendar stays empty."""
+    client, user_id = app_with_fake_google
+
+    # Plant a source event.
+    r = client.post(
+        "/_fake/calendars/client_a@cal.test/events",
+        json={
+            "summary": "Dry run candidate",
+            "start": {"dateTime": "2026-07-01T09:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-07-01T09:30:00Z", "timeZone": "UTC"},
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    # Dry-run.
+    r = client.post(f"/api/admin/ledger/users/{user_id}/dry-run")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "done"
+    # The system intends to write: 1 main copy + 1 busy block on client_b.
+    assert body["pending_count"] == 2, body
+    ops = {p["operation"] for p in body["pending_operations"]}
+    assert ops == {"create"}
+    summaries = {p["would_send_summary"] for p in body["pending_operations"]}
+    assert "Dry run candidate" in summaries  # the main copy
+    assert "Busy" in summaries               # the busy block
+
+    # Crucially: nothing was actually written to the main calendar.
+    main = client.get("/_fake/calendars/alice@example.com/events").json()["items"]
+    assert main == [], f"dry-run wrote to Google: {main}"
+    busy = client.get("/_fake/calendars/client_b@cal.test/events").json()["items"]
+    assert busy == [], f"dry-run wrote to Google: {busy}"
+
+
+def test_verify_reports_consistency_after_reconcile(app_with_fake_google):
+    """After a real reconcile, /verify reports zero divergences —
+    the ledger's model matches what's on the fake Google."""
+    client, user_id = app_with_fake_google
+
+    client.post(
+        "/_fake/calendars/client_a@cal.test/events",
+        json={
+            "summary": "Verify me",
+            "start": {"dateTime": "2026-07-02T09:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-07-02T09:30:00Z", "timeZone": "UTC"},
+        },
+    )
+    client.post(f"/api/admin/ledger/users/{user_id}/reconcile-now")
+
+    r = client.get(f"/api/admin/ledger/users/{user_id}/verify")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "done"
+    assert body["consistent"] is True, body["divergences"]
+    assert body["checked"] >= 2  # main copy + busy block
+    assert body["ok"] == body["checked"]
+
+
+def test_verify_detects_divergence(app_with_fake_google):
+    """If something deletes a ledger-tracked event behind the
+    system's back, /verify catches it."""
+    client, user_id = app_with_fake_google
+
+    client.post(
+        "/_fake/calendars/client_a@cal.test/events",
+        json={
+            "summary": "Will be tampered",
+            "start": {"dateTime": "2026-07-03T09:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-07-03T09:30:00Z", "timeZone": "UTC"},
+        },
+    )
+    client.post(f"/api/admin/ledger/users/{user_id}/reconcile-now")
+
+    # Sabotage: delete the main copy directly on Google.
+    main = client.get("/_fake/calendars/alice@example.com/events").json()["items"]
+    victim = next(e for e in main if e["summary"] == "Will be tampered")
+    client.delete(f"/_fake/calendars/alice@example.com/events/{victim['id']}")
+
+    r = client.get(f"/api/admin/ledger/users/{user_id}/verify")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["consistent"] is False
+    # The fake's delete marks status=cancelled (doesn't drop the row),
+    # so the divergence surfaces as "is CANCELLED"; a real hard-delete
+    # would surface as "MISSING".  Either is a caught divergence.
+    assert any(
+        ("MISSING" in d or "CANCELLED" in d) for d in body["divergences"]
+    ), body["divergences"]
+
+
+def test_ledger_dry_run_env_var_blocks_all_writes(app_with_fake_google, monkeypatch):
+    """With LEDGER_DRY_RUN=1, even a normal /reconcile-now ingests +
+    plans + diffs but never drains — nothing reaches Google.  This
+    is the Stage-4 shadow-mode deployment switch."""
+    client, user_id = app_with_fake_google
+
+    # Flip the dry-run flag and bust the settings cache.
+    monkeypatch.setenv("LEDGER_DRY_RUN", "1")
+    from app.config import get_settings
+    get_settings.cache_clear()
+    assert get_settings().ledger_dry_run is True
+
+    try:
+        client.post(
+            "/_fake/calendars/client_a@cal.test/events",
+            json={
+                "summary": "Shadow-mode event",
+                "start": {"dateTime": "2026-07-04T09:00:00Z", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-07-04T09:30:00Z", "timeZone": "UTC"},
+            },
+        )
+        r = client.post(f"/api/admin/ledger/users/{user_id}/reconcile-now")
+        assert r.status_code == 200, r.text
+        result = r.json()["result"]
+        # Ingest + plan + diff still ran...
+        assert result["planned"] >= 1
+        assert result["enqueued"] >= 1
+        # ...but the drain was a no-op.
+        assert result["drain"].get("processed", 0) == 0
+
+        # Nothing on Google.
+        main = client.get("/_fake/calendars/alice@example.com/events").json()["items"]
+        assert main == [], f"dry-run mode wrote to Google: {main}"
+
+        # The pending outbox is the preview.
+        h = client.get(f"/api/admin/ledger/health/{user_id}").json()
+        assert h["outbox"].get("pending", 0) >= 1
+    finally:
+        monkeypatch.delenv("LEDGER_DRY_RUN", raising=False)
+        get_settings.cache_clear()
