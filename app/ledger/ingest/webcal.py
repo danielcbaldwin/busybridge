@@ -30,7 +30,7 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import aiosqlite
 from icalendar import Calendar as ICalCalendar
@@ -54,9 +54,10 @@ _UUID_V4_RE = re.compile(
 
 
 # Type alias for the fetch hook (lets tests inject a fake fetcher).
-# Signature: (url, if_none_match) -> dict with keys
-#   'status' (int), 'etag' (Optional[str]), 'body' (Optional[bytes])
-FetchHook = Callable[[str, Optional[str]], dict]
+# An async callable (url, if_none_match) -> dict with keys
+#   'status' (int), 'etag' (Optional[str]), 'body' (Optional[bytes]).
+# Async so the SSRF-safe HTTP fetch does not block the event loop.
+FetchHook = Callable[[str, Optional[str]], Awaitable[dict]]
 
 
 async def ingest_webcal_subscription(
@@ -83,7 +84,7 @@ async def ingest_webcal_subscription(
         return counters
 
     try:
-        response = fetch(url, state["last_etag"])
+        response = await fetch(url, state["last_etag"])
     except Exception as e:
         logger.warning(
             "webcal fetch failed user_id=%s sub=%s: %s",

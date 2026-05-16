@@ -52,7 +52,7 @@ UTC = timezone.utc
 # Pluggable client factory (tests override this)
 # ---------------------------------------------------------------------------
 GoogleClientFactory = Callable[[int, str], Awaitable[Any]]
-WebcalFetcher = Callable[[str, Optional[str]], dict]
+WebcalFetcher = Callable[[str, Optional[str]], Awaitable[dict]]
 
 
 async def _default_google_client_factory(user_id: int, email: str):
@@ -324,27 +324,47 @@ async def _resolve_home_email(db: aiosqlite.Connection, user_id: int) -> Optiona
     return row["google_account_email"]
 
 
-def _default_webcal_fetcher():
-    """Build the default httpx-backed webcal fetch hook.
+def _default_webcal_fetcher() -> WebcalFetcher:
+    """Build the default SSRF-safe webcal fetch hook.
 
-    Implemented inline rather than imported eagerly so test
-    environments without httpx (or without SSRF guards configured)
-    can still import this module.
+    Delegates to :func:`app.utils.ics_fetch.fetch_ics_feed`, the
+    same SSRF-guarded fetch subscription-creation uses: it validates
+    the URL — and the post-redirect URL — against private / reserved
+    networks.  A raw ``httpx.get`` here would let a feed redirect or
+    DNS-rebind to internal infrastructure *after* the creation-time
+    check (the scheduled poll happens indefinitely later).
+
+    Async so the 30s HTTP fetch does not block the reconciler's
+    event loop.
     """
     import httpx
 
-    def fetch(url: str, if_none_match: Optional[str]) -> dict:
-        headers = {}
-        if if_none_match:
-            headers["If-None-Match"] = if_none_match
+    from app.utils.ics_fetch import fetch_ics_feed
+
+    async def fetch(url: str, if_none_match: Optional[str]) -> dict:
         try:
-            r = httpx.get(url, headers=headers, timeout=30, follow_redirects=True)
-        except httpx.HTTPError as e:
+            content, new_etag = await fetch_ics_feed(
+                url, etag=if_none_match, timeout=30.0,
+            )
+        except httpx.HTTPStatusError as e:
+            # A real HTTP error response — surface the status so the
+            # webcal ingest records a fetch failure.
+            return {
+                "status": e.response.status_code,
+                "etag": None,
+                "body": None,
+            }
+        except (httpx.HTTPError, ValueError) as e:
+            # ValueError → the URL was SSRF-blocked; HTTPError →
+            # transport failure.  Either way the poll failed.
             raise RuntimeError(f"webcal fetch failed: {e}") from e
+        if content is None:
+            # 304 Not Modified — keep the prior etag.
+            return {"status": 304, "etag": if_none_match, "body": None}
         return {
-            "status": r.status_code,
-            "etag": r.headers.get("ETag"),
-            "body": r.content if r.status_code == 200 else None,
+            "status": 200,
+            "etag": new_etag,
+            "body": content.encode("utf-8"),
         }
 
     return fetch

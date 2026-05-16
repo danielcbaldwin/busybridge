@@ -189,7 +189,7 @@ async def test_webcal_creates_main_copies_and_busy_blocks():
     })
     feed_state = {"body": ics_body, "etag": '"v1"'}
 
-    def fetch(url, if_none_match):
+    async def fetch(url, if_none_match):
         if if_none_match == feed_state["etag"]:
             return {"status": 304, "etag": feed_state["etag"], "body": None}
         return {"status": 200, "etag": feed_state["etag"], "body": feed_state["body"]}
@@ -223,7 +223,7 @@ async def test_webcal_rename_does_not_duplicate_for_unstable_uid_feed():
 
     fetch_iter = {"body": body1, "etag": None}
 
-    def fetch(url, if_none_match):
+    async def fetch(url, if_none_match):
         return {"status": 200, "etag": fetch_iter["etag"], "body": fetch_iter["body"]}
 
     await s.run_reconciler("alice", webcal_fetch=fetch)
@@ -259,7 +259,7 @@ async def test_webcal_304_not_modified_is_a_noop():
 
     poll_count = {"n": 0}
 
-    def fetch(url, if_none_match):
+    async def fetch(url, if_none_match):
         poll_count["n"] += 1
         if if_none_match == '"v1"':
             return {"status": 304, "etag": '"v1"', "body": None}

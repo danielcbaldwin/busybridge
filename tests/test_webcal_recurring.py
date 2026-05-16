@@ -92,7 +92,7 @@ async def test_recurrence_id_override_does_not_collide_with_parent():
         "STATUS:CANCELLED",
     )
 
-    def fetch(url, if_none_match):
+    async def fetch(url, if_none_match):
         return {"status": 200, "etag": '"v1"', "body": body}
 
     await s.run_reconciler("alice", webcal_fetch=fetch)
