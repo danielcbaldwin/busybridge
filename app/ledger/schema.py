@@ -91,6 +91,11 @@ CREATE TABLE IF NOT EXISTS ledger_projections (
     last_error TEXT,
     permanently_failed BOOLEAN DEFAULT FALSE,
 
+    -- Bumped when this projection's deterministic Google id is burned
+    -- by a cancelled tombstone; derive_google_event_id folds it in to
+    -- produce a fresh, still-deterministic id.
+    google_id_generation INTEGER NOT NULL DEFAULT 0,
+
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP,
 
@@ -152,18 +157,21 @@ CREATE TABLE IF NOT EXISTS reconcile_requests (
 );
 
 
--- Ledger events awaiting a replan.  One row per (user, event): the
--- ingest layer and admin ops INSERT OR IGNORE here, so concurrent
--- writers cannot lose each other's ids (the old sources_json JSON
--- blob did a racy read-merge-write).  The reconciler deletes a row
--- only AFTER that event's planning succeeds, so a crash mid-plan
--- re-plans next pass instead of stranding the work.
+-- Ledger events awaiting a replan.  APPEND-ONLY: every enqueue is a
+-- fresh row with its own autoincrement id, so there is no
+-- read-merge-write to race (the old sources_json blob) and no
+-- (user, event) primary key to make a re-enqueue an INSERT-OR-IGNORE
+-- no-op.  The reconciler reads the rows, plans the distinct events,
+-- and deletes ONLY the row ids it read — a row enqueued mid-pass has
+-- a higher id, is not in that set, and survives to the next pass.
 CREATE TABLE IF NOT EXISTS affected_ledger_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     ledger_event_id INTEGER NOT NULL REFERENCES ledger_events(id) ON DELETE CASCADE,
-    enqueued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (user_id, ledger_event_id)
+    enqueued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_affected_user
+    ON affected_ledger_events(user_id);
 
 
 -- Orphan guard (REWRITE_PLAN.md §18).  Hard-deleting a ledger_event
@@ -205,9 +213,37 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
     # error just means the migration already ran.
     for stmt in (
         "ALTER TABLE outbox_operations ADD COLUMN desired_payload_hash TEXT",
+        "ALTER TABLE ledger_projections "
+        "ADD COLUMN google_id_generation INTEGER NOT NULL DEFAULT 0",
     ):
         try:
             await db.execute(stmt)
             await db.commit()
         except Exception:
             pass
+
+    # affected_ledger_events was first shipped with a
+    # (user_id, ledger_event_id) primary key, which made a re-enqueue
+    # of the same event an INSERT-OR-IGNORE no-op — a lost update.
+    # Rebuild it with the append-only autoincrement-id shape.  The
+    # table holds only transient replan-queue state, so dropping it
+    # costs at most a re-derive on the next ingest.
+    cols = await (await db.execute(
+        "PRAGMA table_info(affected_ledger_events)"
+    )).fetchall()
+    if cols and not any(c[1] == "id" for c in cols):
+        await db.execute("DROP TABLE affected_ledger_events")
+        await db.executescript(
+            """
+            CREATE TABLE affected_ledger_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                ledger_event_id INTEGER NOT NULL
+                    REFERENCES ledger_events(id) ON DELETE CASCADE,
+                enqueued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_affected_user
+                ON affected_ledger_events(user_id);
+            """
+        )
+        await db.commit()

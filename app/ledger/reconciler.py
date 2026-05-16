@@ -264,16 +264,17 @@ async def reconcile_user(
             logger.warning("discovery scan failed user_id=%s: %s", user_id, e)
             out["ingest_errors"]["discovery"] = str(e)
 
-    # 3. Plan affected ledger rows.  The affected ids are READ first
-    #    and only cleared AFTER planning succeeds — a crash mid-plan
-    #    re-plans next pass instead of stranding the work.
-    affected = await _read_affected_ledger_ids(db, user_id=user_id)
-    for ledger_id in affected:
+    # 3. Plan affected ledger rows.  The queue rows are READ first and
+    #    cleared (by row id) only AFTER planning succeeds: a crash
+    #    mid-plan re-plans next pass, and a re-enqueue that lands
+    #    mid-pass gets a new row id that this clear leaves alone.
+    affected_rows = await _read_affected_ledger_rows(db, user_id=user_id)
+    for ledger_id in sorted({lid for _, lid in affected_rows}):
         await plan_for_ledger_event(db, ledger_event_id=ledger_id)
         out["planned"] += 1
-    if affected:
-        await _clear_affected_ledger_ids(
-            db, user_id=user_id, ledger_event_ids=affected,
+    if affected_rows:
+        await _clear_affected_ledger_rows(
+            db, row_ids=[rid for rid, _ in affected_rows],
         )
 
     # 4. Diff + drain + replan loop.  An etag-mismatch on update
@@ -343,34 +344,33 @@ async def _bump_failure(
     await db.commit()
 
 
-async def _read_affected_ledger_ids(
+async def _read_affected_ledger_rows(
     db: aiosqlite.Connection, *, user_id: int,
-) -> list[int]:
-    """The ledger events awaiting a replan for one user.
+) -> list[tuple[int, int]]:
+    """The replan queue for one user as ``(row_id, ledger_event_id)``
+    pairs.
 
-    Read-only: the rows are deleted by :func:`_clear_affected_ledger_ids`
-    only AFTER planning succeeds, so a crash mid-plan re-plans next
-    pass rather than stranding the work.
+    Read-only: the rows are deleted by :func:`_clear_affected_ledger_rows`
+    only AFTER planning succeeds, and only by row id — so a row
+    appended mid-pass (a re-enqueue of an event being planned right
+    now) keeps a fresh id, is not in the cleared set, and survives to
+    the next reconcile.
     """
     rows = await (await db.execute(
-        "SELECT ledger_event_id FROM affected_ledger_events WHERE user_id = ?",
+        """SELECT id, ledger_event_id FROM affected_ledger_events
+            WHERE user_id = ? ORDER BY id""",
         (user_id,),
     )).fetchall()
-    return [int(r["ledger_event_id"]) for r in rows]
+    return [(int(r["id"]), int(r["ledger_event_id"])) for r in rows]
 
 
-async def _clear_affected_ledger_ids(
-    db: aiosqlite.Connection, *, user_id: int, ledger_event_ids: list[int],
+async def _clear_affected_ledger_rows(
+    db: aiosqlite.Connection, *, row_ids: list[int],
 ) -> None:
-    """Delete affected-event rows once their planning has succeeded.
-
-    Only the ids actually planned are cleared — any added concurrently
-    during the pass survive for the next reconcile.
-    """
-    for lid in ledger_event_ids:
+    """Delete affected-event rows by id once their planning succeeded."""
+    for rid in row_ids:
         await db.execute(
-            """DELETE FROM affected_ledger_events
-                WHERE user_id = ? AND ledger_event_id = ?""",
-            (user_id, int(lid)),
+            "DELETE FROM affected_ledger_events WHERE id = ?", (int(rid),),
         )
+    await db.commit()
     await db.commit()

@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -16,6 +17,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["ui"])
 
 templates = Jinja2Templates(directory="app/ui/templates")
+
+# A Google calendar's backgroundColor is rendered into a CSS style
+# attribute; only a plain #rgb / #rrggbb(aa) hex value is allowed
+# through, everything else falls back to a safe default.
+_HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{3,8}$")
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -368,6 +374,12 @@ async def select_calendar_page(
         cal_request = service.calendarList().list()
         result = await asyncio.to_thread(cal_request.execute)
         for cal in result.get("items", []):
+            # backgroundColor is interpolated into a CSS style
+            # attribute in the template — validate it is a plain hex
+            # colour so a hostile value cannot break out of the rule.
+            bg = cal.get("backgroundColor")
+            if not (isinstance(bg, str) and _HEX_COLOR_RE.match(bg)):
+                cal["backgroundColor"] = "#4285f4"
             if calendar_type == "personal":
                 # Personal calendars: show all readable calendars
                 if cal.get("accessRole") in ["owner", "writer", "reader", "freeBusyReader"]:

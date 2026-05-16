@@ -95,7 +95,7 @@ def canonical_uid_for_instance(
 # ---------------------------------------------------------------------------
 # Deterministic Google event IDs
 # ---------------------------------------------------------------------------
-def derive_google_event_id(projection_id: int) -> str:
+def derive_google_event_id(projection_id: int, generation: int = 0) -> str:
     """Encode a projection ID as a Google-acceptable event ID.
 
     Used as ``body['id']`` on ``events.insert``: the same input
@@ -103,16 +103,31 @@ def derive_google_event_id(projection_id: int) -> str:
     calendar uniqueness constraint and returns 409 Conflict, which
     the outbox treats as success after a confirming GET.
 
-    Result: ``bb`` + base32hex(64-bit-big-endian projection_id),
-    lowercase, padding stripped.  ~15 chars total — well within
-    Google's 5–1024 limit.
+    ``generation`` defaults to 0 and then encodes ``projection_id``
+    directly — the original, stable scheme.  When a user deletes one
+    of our events, Google keeps a *cancelled tombstone* at that id
+    forever, so it can never be re-inserted.  The outbox then bumps
+    the projection's generation and derives a fresh id: ``generation``
+    > 0 hashes ``(projection_id, generation)`` into a distinct seed,
+    still fully deterministic so a retry of that create is idempotent.
+
+    Result: ``bb`` + base32hex(8-byte seed), lowercase, padding
+    stripped — ~15 chars, well within Google's 5–1024 limit.
     """
     if projection_id <= 0:
         raise ValueError(f"projection_id must be positive, got {projection_id}")
     if projection_id >= (1 << 64):
         raise ValueError(f"projection_id exceeds 64 bits: {projection_id}")
+    if generation < 0:
+        raise ValueError(f"generation must be >= 0, got {generation}")
+    if generation == 0:
+        seed = struct.pack(">Q", projection_id)
+    else:
+        seed = hashlib.sha256(
+            f"{projection_id}:{generation}".encode("ascii")
+        ).digest()[:8]
     encoded = (
-        base64.b32hexencode(struct.pack(">Q", projection_id))
+        base64.b32hexencode(seed)
         .decode("ascii")
         .lower()
         .rstrip("=")

@@ -176,6 +176,13 @@ async def restore_backup_endpoint(
         return RestoreResponse(**result)
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        # Bad request — e.g. user_ids not present in the backup.
+        # Operator error, not a server fault.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
     except Exception as e:
         logger.error(f"Restore failed: {e}")
         raise HTTPException(

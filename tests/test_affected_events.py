@@ -37,11 +37,20 @@ async def _event(db, user_id, canonical_uid):
 
 
 async def _affected(db, user_id):
+    """Distinct ledger-event ids currently queued for the user."""
     rows = await (await db.execute(
         "SELECT ledger_event_id FROM affected_ledger_events WHERE user_id = ?",
         (user_id,),
     )).fetchall()
-    return sorted(int(r["ledger_event_id"]) for r in rows)
+    return sorted({int(r["ledger_event_id"]) for r in rows})
+
+
+async def _row_count(db, user_id):
+    row = await (await db.execute(
+        "SELECT COUNT(*) AS n FROM affected_ledger_events WHERE user_id = ?",
+        (user_id,),
+    )).fetchone()
+    return int(row["n"])
 
 
 async def test_record_affected_events_merges_without_losing_ids():
@@ -110,6 +119,51 @@ async def test_reconcile_clears_affected_events_after_planning():
 
     assert await _affected(db, uid) == [], \
         "affected events were not cleared after a successful reconcile"
+    await s.close()
+
+
+async def test_mid_pass_requeue_survives_the_clear():
+    """A re-enqueue of an event WHILE it is being planned must not be
+    lost: the reconciler clears only the row ids it read, and the
+    re-enqueue is a fresh row with a higher id.
+
+    Simulates the race: read the queue, then (before clearing)
+    re-enqueue the same event, then clear the originally-read rows.
+    """
+    from app.ledger.reconciler import (
+        _clear_affected_ledger_rows,
+        _read_affected_ledger_rows,
+    )
+
+    s = Scenario()
+    s.given_calendar("main")
+    user = await s.given_user("alice", main="main")
+    db = await s.setup_db()
+    uid = user.user_id
+
+    e1 = await _event(db, uid, "client:1:a")
+    await db.commit()
+    await record_affected_events(db, user_id=uid, ledger_event_ids=[e1])
+    await db.commit()
+
+    # The reconciler reads the queue at the start of its pass.
+    read_rows = await _read_affected_ledger_rows(db, user_id=uid)
+    assert [lid for _, lid in read_rows] == [e1]
+
+    # While planning, the event changes again and is re-enqueued.
+    await record_affected_events(db, user_id=uid, ledger_event_ids=[e1])
+    await db.commit()
+
+    # The pass finishes and clears ONLY the rows it read.
+    await _clear_affected_ledger_rows(
+        db, row_ids=[rid for rid, _ in read_rows],
+    )
+
+    # The mid-pass re-enqueue survived — e1 is still queued.
+    assert await _affected(db, uid) == [e1], (
+        "the mid-pass re-enqueue was lost"
+    )
+    assert await _row_count(db, uid) == 1
     await s.close()
 
 

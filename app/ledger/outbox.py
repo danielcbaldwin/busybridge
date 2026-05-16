@@ -94,6 +94,12 @@ _BACKOFF_SECONDS = (1, 2, 4, 8, 16, 32, 60)
 # a single op is one Google API call.  Past it the op is reclaimed.
 _STALE_OP_TIMEOUT = timedelta(minutes=15)
 
+# Upper bound on how many times _do_create will derive a fresh
+# deterministic id past cancelled tombstones.  Each generation is a
+# distinct hash, so colliding even twice is already astronomically
+# unlikely; this is purely a guard against an unbounded loop.
+_MAX_ID_GENERATIONS = 8
+
 
 class OutboxDrainError(Exception):
     """Raised when the drain could not even read the queue."""
@@ -356,23 +362,49 @@ async def _do_create(
     *,
     now: datetime,
 ) -> None:
-    """Insert with a deterministic ID; treat 409 as success."""
+    """Insert with a deterministic ID; treat 409 as success.
+
+    If the 409 turns out to be a *cancelled tombstone* — a user
+    deleted one of our events, so Google keeps that id permanently
+    reserved — the deterministic id is burned: it can never be
+    re-inserted and ``events.update`` on it is unreliable.  We then
+    bump the projection's ``google_id_generation``, which yields a
+    fresh deterministic id, and retry the insert.  Bumping is
+    persisted before each retry so a crash mid-recreate is idempotent.
+    """
     if payload is None:
         raise ValueError(f"create op {op['id']} has no payload")
-    google_id = derive_google_event_id(int(op["projection_id"]))
+    proj = await _get_projection(db, op["projection_id"])
+    generation = int(proj["google_id_generation"] or 0)
     body = dict(payload)
-    body["id"] = google_id
-    try:
-        result = await google.insert_event(cal_id, body)
-    except Exception as e:
-        if getattr(e, "status", None) == 409:
-            # The ID is already on Google.  Two cases:
-            # * Retry-of-our-own-write: existing event matches our
-            #   intended payload → adopt and mark done.
-            # * Concurrent edit (e.g. user dragged our copy on main):
-            #   existing event differs from our intended payload.
-            #   We own this ID by construction; UPDATE to restore.
+
+    for _ in range(_MAX_ID_GENERATIONS):
+        google_id = derive_google_event_id(
+            int(op["projection_id"]), generation,
+        )
+        body["id"] = google_id
+        try:
+            result = await google.insert_event(cal_id, body)
+        except Exception as e:
+            if getattr(e, "status", None) != 409:
+                raise
+            # The ID is already on Google.  Three cases:
             existing = await google.get_event(cal_id, google_id)
+            if existing.get("status") == "cancelled":
+                # Cancelled tombstone — this id is burned.  Move to a
+                # fresh deterministic id and retry.
+                generation += 1
+                await db.execute(
+                    """UPDATE ledger_projections
+                          SET google_id_generation = ?
+                        WHERE id = ?""",
+                    (generation, int(op["projection_id"])),
+                )
+                await db.commit()
+                continue
+            # A live event sits at our id — a retry of our own write,
+            # or a concurrent edit of our copy.  We own this id by
+            # construction; UPDATE to restore the canonical payload.
             try:
                 result = await google.update_event(
                     cal_id, google_id, payload,
@@ -390,19 +422,17 @@ async def _do_create(
                     await _request_projection_replan(db, op["projection_id"])
                     return
                 raise
-            await _record_success(
-                db, op,
-                google_event_id=result["id"],
-                google_etag=result.get("etag", ""),
-                now=now,
-            )
-            return
-        raise
-    await _record_success(
-        db, op,
-        google_event_id=result["id"],
-        google_etag=result.get("etag", ""),
-        now=now,
+        await _record_success(
+            db, op,
+            google_event_id=result["id"],
+            google_etag=result.get("etag", ""),
+            now=now,
+        )
+        return
+
+    raise RuntimeError(
+        f"create op {op['id']}: exhausted {_MAX_ID_GENERATIONS} id "
+        f"generations for projection {op['projection_id']}"
     )
 
 

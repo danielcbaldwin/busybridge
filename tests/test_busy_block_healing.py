@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from app.ledger.identity import derive_google_event_id
 from app.ledger.outbox import drain_user
 from tests.fakes.google_calendar import FakeGoogleCalendar
 from tests.integration.framework import Scenario
@@ -76,4 +77,72 @@ async def test_update_404_resets_projection_for_recreate():
     assert row["current_state"] == "absent"
     assert row["google_event_id"] is None
     assert row["applied_ledger_version"] is None
+    await s.close()
+
+
+async def test_create_recreates_past_a_cancelled_tombstone():
+    """A CREATE whose deterministic id is a cancelled tombstone (the
+    user deleted that managed event) must succeed by moving to a fresh
+    generation id — not 409→get→update→404→poison-pill."""
+    s = Scenario()
+    s.given_calendar("main")
+    user = await s.given_user("alice", main="main")
+    db = await s.setup_db()
+
+    fake = FakeGoogleCalendar()
+    fake.add_calendar("main@cal", "Main")
+
+    ev = await (await db.execute(
+        """INSERT INTO ledger_events
+              (user_id, canonical_uid, source_type, status, version,
+               summary, created_at, updated_at)
+           VALUES (?, 'client:1:x', 'client', 'active', 1,
+                   'Busy', '2026-01-01', '2026-01-01') RETURNING id""",
+        (user.user_id,),
+    )).fetchone()
+    proj = await (await db.execute(
+        """INSERT INTO ledger_projections
+              (ledger_event_id, target_kind, desired_state,
+               desired_payload_hash, desired_ledger_version, current_state)
+           VALUES (?, 'main', 'present_full', 'h', 1, 'absent')
+           RETURNING id""",
+        (int(ev["id"]),),
+    )).fetchone()
+    pid = int(proj["id"])
+
+    # The generation-0 deterministic id was used once, then the user
+    # deleted it — Google now holds a cancelled tombstone there.
+    gen0_id = derive_google_event_id(pid, 0)
+    fake.insert_event("main@cal", {"id": gen0_id, "summary": "old"})
+    fake.delete_event("main@cal", gen0_id)
+
+    await db.execute(
+        """INSERT INTO outbox_operations
+              (user_id, projection_id, operation, idempotency_key,
+               ledger_version_at_enqueue, desired_payload_hash,
+               target_google_calendar_id, payload_json, status, attempts)
+           VALUES (?, ?, 'create', 'k1', 1, 'h', 'main@cal',
+                   '{"summary": "Busy"}', 'pending', 0)""",
+        (user.user_id, pid),
+    )
+    await db.commit()
+
+    counters = await drain_user(
+        db, fake, user_id=user.user_id, now=datetime.now(UTC),
+    )
+    assert counters["succeeded"] == 1, counters
+
+    row = await (await db.execute(
+        """SELECT current_state, google_event_id, google_id_generation
+             FROM ledger_projections WHERE id = ?""",
+        (pid,),
+    )).fetchone()
+    # The projection moved to a fresh generation and is present again.
+    assert row["google_id_generation"] == 1
+    gen1_id = derive_google_event_id(pid, 1)
+    assert row["google_event_id"] == gen1_id
+    assert row["current_state"] == "present"
+    # Google has a live event at the fresh id.
+    live = fake.get_event("main@cal", gen1_id)
+    assert live["status"] == "confirmed"
     await s.close()

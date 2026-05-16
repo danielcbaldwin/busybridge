@@ -105,16 +105,18 @@ async def record_affected_events(
 ) -> None:
     """Mark ledger events as needing a replan.
 
-    Each id is an independent ``INSERT OR IGNORE`` into
-    ``affected_ledger_events`` — there is no read-merge-write, so two
-    concurrent callers cannot clobber each other's ids (the failure
-    mode of the old ``reconcile_requests.sources_json`` JSON blob).
-    The reconciler reads these rows, plans each event, and deletes the
-    row only once planning has succeeded.
+    Every call appends fresh rows to ``affected_ledger_events`` — a
+    plain ``INSERT``, never a merge or an INSERT-OR-IGNORE.  So two
+    concurrent callers cannot clobber each other (the old
+    ``sources_json`` JSON blob did), and re-enqueuing an event that is
+    *already* queued is NOT swallowed: it gets a new row with a higher
+    id, which the reconciler's "delete only the ids I read" clear
+    leaves untouched.  The reconciler reads the rows, plans the
+    distinct events, and deletes only the row ids it read.
     """
     for lid in {int(x) for x in ledger_event_ids}:
         await db.execute(
-            """INSERT OR IGNORE INTO affected_ledger_events
+            """INSERT INTO affected_ledger_events
                   (user_id, ledger_event_id) VALUES (?, ?)""",
             (user_id, lid),
         )
