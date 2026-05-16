@@ -9,7 +9,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from app.config import get_settings
@@ -96,7 +95,12 @@ class GoogleCalendarClient:
             self.credentials = Credentials(token=access_token)
         else:
             raise ValueError("Either access_token or credentials must be provided")
-        self.service = build("calendar", "v3", credentials=self.credentials)
+        # Build through the shared helper so this service carries the
+        # same socket timeout as every other Google call — a hung
+        # connection must not tie up a worker thread indefinitely.
+        # (``timeout`` was previously accepted but never applied.)
+        from app.auth.google import build_calendar_service
+        self.service = build_calendar_service(self.credentials, timeout=timeout)
         self.settings = settings or get_settings()
         self._rate_limiter = _RateLimiter()
 

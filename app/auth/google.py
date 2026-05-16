@@ -322,20 +322,23 @@ async def build_user_credentials(user_id: int, email: str) -> Credentials:
 GOOGLE_HTTP_TIMEOUT = 30
 
 
-def build_calendar_service(credentials: Credentials):
+def build_calendar_service(
+    credentials: Credentials, timeout: int = GOOGLE_HTTP_TIMEOUT,
+):
     """Build a Calendar API service whose HTTP layer carries a socket
-    timeout, so a hung Google connection fails after
-    ``GOOGLE_HTTP_TIMEOUT`` seconds instead of hanging forever.
+    timeout, so a hung Google connection fails after ``timeout``
+    seconds instead of hanging forever.
 
     Every Google Calendar call in the app should go through a service
-    built here (directly, or via :class:`RealGoogleClient` / the
-    ``fetch_*`` helpers below) so they all share the timeout."""
+    built here (directly, or via :class:`RealGoogleClient`, the
+    legacy ``GoogleCalendarClient``, or the ``fetch_*`` helpers below)
+    so they all share the timeout."""
     import httplib2
     from google_auth_httplib2 import AuthorizedHttp
 
     authed_http = AuthorizedHttp(
         credentials,
-        http=httplib2.Http(timeout=GOOGLE_HTTP_TIMEOUT),
+        http=httplib2.Http(timeout=timeout),
     )
     return build(
         "calendar", "v3", http=authed_http, cache_discovery=False,

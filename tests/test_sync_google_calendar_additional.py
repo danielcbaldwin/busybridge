@@ -98,3 +98,26 @@ def test_can_user_edit_event_creator_self_branch():
         "organizer": {"email": "other@example.com"},
     }
     assert can_user_edit_event(event, "person@example.com") is True
+
+
+def test_google_calendar_client_service_carries_a_socket_timeout(monkeypatch):
+    """The legacy GoogleCalendarClient builds its service through the
+    shared timeout-bounded helper — a hung Google call must not tie up
+    a worker thread forever (it previously accepted a `timeout` arg
+    but never applied it)."""
+    from app.sync.google_calendar import GoogleCalendarClient
+
+    captured: dict = {}
+
+    def fake_build(*_args, **kwargs):
+        captured["http"] = kwargs.get("http")
+        return SimpleNamespace()
+
+    monkeypatch.setattr("app.auth.google.build", fake_build)
+
+    GoogleCalendarClient(access_token="tok", timeout=15)
+
+    authed_http = captured["http"]
+    assert authed_http is not None, "service built without a timeout http"
+    # AuthorizedHttp wraps the httplib2.Http that carries the timeout.
+    assert authed_http.http.timeout == 15
