@@ -346,14 +346,13 @@ async def _maybe_apply_main_edit_back(
     """User edited our copy on main.  Decide what to do per
     REWRITE_PLAN.md §9:
 
-    * Editable client event + RSVP changed → propagate the new
-      RSVP back to source (next reconcile will pick up the
-      version bump and the planner will route the change to the
-      origin client via ``present_full_rsvp_only`` projection).
-    * Editable + time changed → propagate time back.
-    * Non-editable + anything changed → bump version so the
-      planner re-renders the canonical payload and the outbox
-      reverts the drift on Google.
+    * RSVP changed → ALWAYS propagate.  A user may set their own
+      response on any event, editable or not; the planner routes it
+      back to the origin client via the ``present_full_rsvp_only``
+      projection (the outbox writes it with an ``events.patch``).
+    * Time changed + editable → propagate the new time to the source.
+    * Time changed + non-editable → bump the version so the planner
+      re-renders the canonical time and the outbox reverts the drift.
     """
     ledger = await (await db.execute(
         "SELECT * FROM ledger_events WHERE id = ?",
@@ -376,11 +375,17 @@ async def _maybe_apply_main_edit_back(
         return "our_writes_skipped"
 
     when = datetime.now(UTC).isoformat()
-    if user_can_edit:
-        # Forward-edit: update the ledger and let the planner push
-        # the change back to the source.  The desired_payload_hash
-        # changes on the source projection, so the outbox issues an
-        # update (RSVP or time).
+    # A time edit only propagates to the source when the user is
+    # allowed to move the event; otherwise it is drift to revert.
+    apply_time = time_changed and user_can_edit
+
+    if rsvp_changed or apply_time:
+        # Forward-edit: update the ledger so the planner re-renders
+        # and the outbox pushes the change back.  RSVP routes to the
+        # origin client; an editable time edit routes to every copy.
+        # The version bump also reverts any *non-editable* time drift
+        # bundled into the same edit (the planner re-renders the
+        # canonical time, the diff sees the main copy diverged).
         await db.execute(
             """UPDATE ledger_events
                   SET user_rsvp_status = COALESCE(?, user_rsvp_status),
@@ -391,22 +396,19 @@ async def _maybe_apply_main_edit_back(
                       updated_at = ?
                 WHERE id = ?""",
             (
-                new_rsvp,
-                new_start,
-                new_end,
-                is_all_day,
+                new_rsvp if rsvp_changed else None,
+                new_start if apply_time else None,
+                new_end if apply_time else None,
+                is_all_day if apply_time else None,
                 when, ledger_event_id,
             ),
         )
         return "main_edit_propagated"
 
-    # Non-editable: drift bumps the version but does NOT change
-    # the canonical content.  Next plan/diff pass will re-render
-    # the desired payload identically and notice that the projection
-    # still has applied_payload_hash matching, but the etag on
-    # Google is stale.  We force a re-write by bumping the version
-    # alone (no field changes) which makes the version-bump-only
-    # path advance desired_ledger_version past applied.
+    # Only a non-editable time drift remains: bump the version
+    # without changing canonical content.  The planner re-renders
+    # the desired payload and the diff issues an update that reverts
+    # the move on Google.
     await db.execute(
         """UPDATE ledger_events
               SET version = version + 1,

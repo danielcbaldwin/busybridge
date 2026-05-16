@@ -55,6 +55,8 @@ STATUS_SUPERSEDED = "superseded"
 OP_CREATE = "create"
 OP_UPDATE = "update"
 OP_DELETE = "delete"
+# RSVP-only patch back to the calendar that sourced the event.
+OP_PATCH = "patch"
 
 # Failure handling
 POISON_PILL_THRESHOLD = 5
@@ -92,7 +94,7 @@ async def enqueue(
 
     Returns the new outbox row id.
     """
-    if operation not in (OP_CREATE, OP_UPDATE, OP_DELETE):
+    if operation not in (OP_CREATE, OP_UPDATE, OP_DELETE, OP_PATCH):
         raise ValueError(f"unknown operation: {operation!r}")
     when = (now or datetime.now(UTC)).isoformat()
     idem = f"proj:{projection_id}:v{ledger_version}:{operation}"
@@ -252,6 +254,8 @@ async def _execute_op(
             return await _do_update(db, google, op, cal_id, payload, now=now)
         elif operation == OP_DELETE:
             await _do_delete(db, google, op, cal_id, now=now)
+        elif operation == OP_PATCH:
+            return await _do_patch(db, google, op, cal_id, payload, now=now)
         else:
             raise ValueError(f"unknown operation: {operation!r}")
     except Exception as e:
@@ -402,9 +406,92 @@ async def _do_delete(
     await _record_absent(db, op, now=now)
 
 
+async def _do_patch(
+    db: aiosqlite.Connection,
+    google: GoogleClient,
+    op: aiosqlite.Row,
+    cal_id: str,
+    payload: Optional[dict],
+    *,
+    now: datetime,
+) -> str:
+    """RSVP-only patch back onto the calendar that sourced the event.
+
+    The target is the user's real source event, addressed by the
+    ledger row's ``source_event_id`` — NOT a projection
+    ``google_event_id``.  The origin rsvp projection deliberately
+    keeps ``google_event_id`` NULL so ingest's loop-prevention does
+    not mistake the source event for one of our writes.
+
+    ``events.patch`` is field-scoped (only the attendees array is
+    sent), so no other field of the source event can be clobbered.
+    A 404/410 (source event gone) is treated as success — there is
+    nothing left to write back.
+    """
+    if payload is None:
+        raise ValueError(f"patch op {op['id']} has no payload")
+    proj = await _get_projection(db, op["projection_id"])
+    led = await (await db.execute(
+        "SELECT source_event_id FROM ledger_events WHERE id = ?",
+        (int(proj["ledger_event_id"]),),
+    )).fetchone()
+    if led is None or not led["source_event_id"]:
+        await _record_rsvp_applied(db, op, now=now)
+        return "succeeded"
+    try:
+        google.patch_event(cal_id, led["source_event_id"], payload)
+    except Exception as e:
+        if getattr(e, "status", None) in (404, 410):
+            await _record_rsvp_applied(db, op, now=now)
+            return "succeeded"
+        raise
+    await _record_rsvp_applied(db, op, now=now)
+    return "succeeded"
+
+
 # ---------------------------------------------------------------------------
 # State updates
 # ---------------------------------------------------------------------------
+async def _record_rsvp_applied(
+    db: aiosqlite.Connection,
+    op: aiosqlite.Row,
+    *,
+    now: datetime,
+) -> None:
+    """Mark an rsvp-only patch done.
+
+    Unlike :func:`_record_success` this does NOT write
+    ``google_event_id`` onto the projection — the origin rsvp
+    projection keeps it NULL so the next ingest of the source
+    calendar still processes the source event normally.
+    """
+    when = now.isoformat()
+    await db.execute(
+        """UPDATE ledger_projections
+              SET current_state = 'present',
+                  applied_payload_hash = desired_payload_hash,
+                  applied_ledger_version = ?,
+                  last_attempt_at = ?,
+                  next_attempt_at = NULL,
+                  attempts = attempts + 1,
+                  last_error = NULL,
+                  permanently_failed = 0,
+                  updated_at = ?
+            WHERE id = ?""",
+        (
+            int(op["ledger_version_at_enqueue"]),
+            when, when, int(op["projection_id"]),
+        ),
+    )
+    await db.execute(
+        """UPDATE outbox_operations
+              SET status = ?, completed_at = ?, last_http_status = 200
+            WHERE id = ?""",
+        (STATUS_DONE, when, op["id"]),
+    )
+    await db.commit()
+
+
 async def _record_success(
     db: aiosqlite.Connection,
     op: aiosqlite.Row,

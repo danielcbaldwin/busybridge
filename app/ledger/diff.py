@@ -26,8 +26,8 @@ import aiosqlite
 
 from app.ledger.google_client import GoogleClient
 from app.ledger.identity import derive_instance_google_event_id
-from app.ledger.outbox import OP_CREATE, OP_DELETE, OP_UPDATE, enqueue
-from app.ledger.payload import ABSENT, render_payload
+from app.ledger.outbox import OP_CREATE, OP_DELETE, OP_PATCH, OP_UPDATE, enqueue
+from app.ledger.payload import ABSENT, PRESENT_FULL_RSVP_ONLY, render_payload
 
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
@@ -59,8 +59,10 @@ async def diff_and_enqueue_for_user(
 
     for proj in rows_sorted:
         # Instance projections: derive google_event_id from the
-        # parent's projection on the same target.
-        if proj["parent_canonical_uid"]:
+        # parent's projection on the same target.  Origin rsvp-only
+        # projections are skipped here — they deliberately keep
+        # google_event_id NULL (see _is_origin_rsvp / _do_patch).
+        if proj["parent_canonical_uid"] and not _is_origin_rsvp(proj):
             parent_proj_google_id = await _parent_projection_google_id(
                 db,
                 user_id=user_id,
@@ -94,7 +96,9 @@ async def diff_and_enqueue_for_user(
                               e.color_id, e.user_can_edit, e.user_rsvp_status,
                               e.recurrence_rule_json, e.version AS ledger_version,
                               e.parent_canonical_uid,
-                              e.recurrence_instance_original_start
+                              e.recurrence_instance_original_start,
+                              e.source_type, e.source_calendar_id,
+                              e.attendees_json
                          FROM ledger_projections p
                          JOIN ledger_events e ON e.id = p.ledger_event_id
                         WHERE p.id = ?""",
@@ -168,7 +172,8 @@ async def _diverged_projections(
                   e.color_id, e.user_can_edit, e.user_rsvp_status,
                   e.recurrence_rule_json, e.version AS ledger_version,
                   e.parent_canonical_uid,
-                  e.recurrence_instance_original_start
+                  e.recurrence_instance_original_start,
+                  e.source_type, e.source_calendar_id, e.attendees_json
              FROM ledger_projections p
              JOIN ledger_events e ON e.id = p.ledger_event_id
             WHERE e.user_id = ?
@@ -180,6 +185,20 @@ async def _diverged_projections(
         (int(user_id),),
     )
     return await cursor.fetchall()
+
+
+def _is_origin_rsvp(proj) -> bool:
+    """True for the projection that writes the user's RSVP back to
+    the calendar that *sourced* the event (target calendar == origin
+    calendar).  It is rendered as an ``events.patch`` and never
+    creates or deletes the source event."""
+    if proj["target_kind"] != "client":
+        return False
+    if proj["source_type"] != "client":
+        return False
+    sc = proj["source_calendar_id"]
+    tc = proj["target_calendar_id"]
+    return sc is not None and tc is not None and int(sc) == int(tc)
 
 
 def _decide(
@@ -211,6 +230,16 @@ def _decide(
         ledger_version=int(proj["desired_ledger_version"]),
         target_kind=target_kind,
     )
+
+    # Origin rsvp-only projection: the target is the user's real
+    # source event.  It may only ever be PATCHed (write the RSVP) or
+    # be a no-op — never created or deleted.  When the event is
+    # cancelled / intentionally-deleted the planner sets desired to
+    # ABSENT; that must NOT delete the source event.
+    if _is_origin_rsvp(proj):
+        if desired == PRESENT_FULL_RSVP_ONLY:
+            return OP_PATCH, payload, target_cal
+        return None, None, target_cal
 
     if desired == ABSENT:
         # No google_event_id ever assigned → nothing to delete,
@@ -244,6 +273,7 @@ def _proj_row_to_ledger_dict(proj) -> dict:
         "user_can_edit": proj["user_can_edit"],
         "user_rsvp_status": proj["user_rsvp_status"],
         "recurrence_rule_json": proj["recurrence_rule_json"],
+        "attendees_json": proj["attendees_json"],
     }
 
 

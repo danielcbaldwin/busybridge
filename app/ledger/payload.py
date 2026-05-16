@@ -78,7 +78,7 @@ def render_payload(
         return None
 
     if desired_state == PRESENT_FULL:
-        body = _render_full_copy(ledger_row)
+        body = _render_full_copy(ledger_row, target_kind)
     elif desired_state == PRESENT_BUSY:
         body = _render_busy_block(ledger_row)
     elif desired_state == PRESENT_PERSONAL_BUSY:
@@ -112,7 +112,7 @@ def hash_payload(payload: Optional[dict]) -> str:
 # ---------------------------------------------------------------------------
 # Internal renderers
 # ---------------------------------------------------------------------------
-def _render_full_copy(row: dict) -> dict:
+def _render_full_copy(row: dict, target_kind: Optional[str] = None) -> dict:
     """Full-detail copy of a client / webcal event onto main."""
     body: dict[str, Any] = {}
     summary = row.get("summary") or "(no title)"
@@ -131,6 +131,14 @@ def _render_full_copy(row: dict) -> dict:
         body["transparency"] = "transparent"
     if row.get("recurrence_rule_json"):
         body["recurrence"] = json.loads(row["recurrence_rule_json"])
+    # On the main copy, carry the user as an attendee with their
+    # stored RSVP (REWRITE_PLAN.md §9) so they can see and change
+    # their response there.  An RSVP set on the main copy is
+    # detected at main-ingest and written back to the source event.
+    if target_kind == "main" and row.get("user_rsvp_status"):
+        body["attendees"] = [
+            {"self": True, "responseStatus": row["user_rsvp_status"]},
+        ]
     return body
 
 
@@ -164,11 +172,32 @@ def _render_personal_busy(row: dict) -> dict:
 
 
 def _render_rsvp_only(row: dict) -> dict:
-    """Patch-shape body that updates only the user's RSVP status."""
+    """Body for an ``events.patch`` that writes the user's RSVP back
+    to the calendar that sourced the event.
+
+    The COMPLETE attendee list is included: ``events.patch`` replaces
+    the ``attendees`` array wholesale, so sending only the user's
+    entry would drop every other guest.  Only the user's own entry
+    (``self=True``) has its ``responseStatus`` changed; all other
+    fields of the source event are untouched (patch is field-scoped).
+    """
     rsvp = row.get("user_rsvp_status") or "needsAction"
-    return {
-        "attendees": [{"self": True, "responseStatus": rsvp}],
-    }
+    raw = row.get("attendees_json")
+    try:
+        attendees = json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        attendees = []
+    out: list[dict] = []
+    found_self = False
+    for att in attendees:
+        att = dict(att)
+        if att.get("self"):
+            att["responseStatus"] = rsvp
+            found_self = True
+        out.append(att)
+    if not found_self:
+        out.append({"self": True, "responseStatus": rsvp})
+    return {"attendees": out}
 
 
 # ---------------------------------------------------------------------------

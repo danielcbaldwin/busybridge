@@ -26,6 +26,7 @@ from app.ledger.payload import (
     ABSENT,
     PRESENT_BUSY,
     PRESENT_FULL,
+    PRESENT_FULL_RSVP_ONLY,
     PRESENT_PERSONAL_BUSY,
     hash_payload,
     render_payload,
@@ -103,10 +104,21 @@ def _compute_desired_projections(ledger) -> dict[str, str]:
 
     if source == "client":
         peer = PRESENT_BUSY if show_as != "free" else ABSENT
+        # The origin client calendar holds the event natively, so it
+        # gets no busy block.  But when the user is an attendee with
+        # an RSVP, the origin gets a "phantom" rsvp-only projection
+        # (REWRITE_PLAN.md §9): an RSVP the user sets on the main
+        # copy is written back to the source event.  Rendered as an
+        # events.patch — it never creates or deletes the source.
+        origin = (
+            PRESENT_FULL_RSVP_ONLY
+            if ledger["user_rsvp_status"]
+            else ABSENT
+        )
         return {
             "main": PRESENT_FULL,
             "peer_clients": peer,
-            "origin_client": ABSENT,
+            "origin_client": origin,
         }
 
     if source == "personal":
