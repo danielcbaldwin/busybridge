@@ -247,6 +247,12 @@ async def create_backup(user_ids: Optional[list[int]] = None) -> dict:
         "backup_type": backup_type,
         "created_at": now.isoformat(),
         "user_ids_snapshotted": [u["id"] for u in users],
+        # True only for a whole-instance backup.  A backup scoped to
+        # specific user_ids still carries the complete database.db, so
+        # restore must NOT file-swap it (that would roll back users
+        # who were never part of the requested scope) — it does a
+        # per-user row restore instead.
+        "full_db_backup": user_ids is None,
         "total_events_snapshotted": total_events,
         "snapshot_errors": snapshot_errors,
     }
@@ -808,7 +814,16 @@ async def restore_from_backup(
         await wait_for_reconcile_quiescence()
         # Step 1: restore DB rows.
         if restore_db:
-            restore_all_users = set(target_user_ids) == set(backup_user_ids)
+            # A whole-database file swap is only safe for a backup
+            # taken of the whole instance AND a restore that targets
+            # every snapshotted user.  A scoped backup (or a scoped
+            # restore) goes row-by-row so users outside the scope are
+            # never rolled back.  Legacy backups lack the flag — treat
+            # them as scoped (the safe default).
+            restore_all_users = (
+                bool(metadata.get("full_db_backup"))
+                and set(target_user_ids) == set(backup_user_ids)
+            )
             with zipfile.ZipFile(zip_path, "r") as zf:
                 if restore_all_users:
                     await _restore_full_db(zf)

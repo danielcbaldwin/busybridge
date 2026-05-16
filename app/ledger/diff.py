@@ -129,6 +129,7 @@ async def diff_and_enqueue_for_user(
             ledger_version=int(proj["desired_ledger_version"]),
             target_google_calendar_id=target_cal,
             payload=payload,
+            desired_payload_hash=proj["desired_payload_hash"],
             now=now,
         )
         enqueued += 1

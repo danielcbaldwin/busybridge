@@ -110,6 +110,7 @@ async def enqueue(
     ledger_version: int,
     target_google_calendar_id: str,
     payload: Optional[dict],
+    desired_payload_hash: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> int:
     """Insert one outbox row, superseding any older pending ops
@@ -155,13 +156,14 @@ async def enqueue(
     cursor = await db.execute(
         """INSERT INTO outbox_operations
               (user_id, projection_id, operation, idempotency_key,
-               ledger_version_at_enqueue, target_google_calendar_id,
+               ledger_version_at_enqueue, desired_payload_hash,
+               target_google_calendar_id,
                payload_json, status, attempts, next_attempt_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
            ON CONFLICT(idempotency_key) DO NOTHING""",
         (
             user_id, projection_id, operation, idem,
-            ledger_version, target_google_calendar_id,
+            ledger_version, desired_payload_hash, target_google_calendar_id,
             payload_json, STATUS_PENDING, when, when,
         ),
     )
@@ -175,9 +177,10 @@ async def enqueue(
               SET status = ?, attempts = 0, next_attempt_at = ?,
                   last_error = NULL, last_http_status = NULL,
                   payload_json = ?, started_at = NULL, completed_at = NULL,
-                  ledger_version_at_enqueue = ?
+                  ledger_version_at_enqueue = ?, desired_payload_hash = ?
             WHERE idempotency_key = ?""",
-        (STATUS_PENDING, when, payload_json, ledger_version, idem),
+        (STATUS_PENDING, when, payload_json, ledger_version,
+         desired_payload_hash, idem),
     )
     row = await (await db.execute(
         "SELECT id FROM outbox_operations WHERE idempotency_key = ?",
@@ -537,6 +540,32 @@ async def _do_patch(
 # ---------------------------------------------------------------------------
 # State updates
 # ---------------------------------------------------------------------------
+async def _applied_hash_for(db: aiosqlite.Connection, op: aiosqlite.Row) -> str:
+    """The projection desired-hash this op was enqueued for.
+
+    Recorded as the projection's ``applied_payload_hash`` on success —
+    deliberately NOT the projection's *current* ``desired_payload_hash``.
+    A projection's desired state can change (e.g. cleanup / pause sets
+    it to absent, at the same ledger version) while an older op is
+    still in flight; recording the current desired hash would then
+    mark the projection "applied" at a state Google never received, so
+    the diff sees no divergence and never enqueues the corrective
+    delete.  The diff stamps each op with the desired hash it targeted
+    at enqueue time — that is what the op applied.
+
+    The op's own ``payload_json`` cannot be hashed for this: it is
+    rendered with the projection id baked in, so its hash would never
+    equal the planner's projection-id-free ``desired_payload_hash``.
+    """
+    stamped = op["desired_payload_hash"]
+    if stamped is not None:
+        return stamped
+    # Op enqueued before the desired_payload_hash column existed —
+    # fall back to the projection's current desired hash.
+    proj = await _get_projection(db, op["projection_id"])
+    return proj["desired_payload_hash"]
+
+
 async def _record_rsvp_applied(
     db: aiosqlite.Connection,
     op: aiosqlite.Row,
@@ -554,7 +583,7 @@ async def _record_rsvp_applied(
     await db.execute(
         """UPDATE ledger_projections
               SET current_state = 'present',
-                  applied_payload_hash = desired_payload_hash,
+                  applied_payload_hash = ?,
                   applied_ledger_version = ?,
                   last_attempt_at = ?,
                   next_attempt_at = NULL,
@@ -564,6 +593,7 @@ async def _record_rsvp_applied(
                   updated_at = ?
             WHERE id = ?""",
         (
+            await _applied_hash_for(db, op),
             int(op["ledger_version_at_enqueue"]),
             when, when, int(op["projection_id"]),
         ),
@@ -586,13 +616,12 @@ async def _record_success(
     now: datetime,
 ) -> None:
     when = now.isoformat()
-    proj = await _get_projection(db, op["projection_id"])
     await db.execute(
         """UPDATE ledger_projections
               SET current_state = 'present',
                   google_event_id = ?,
                   google_etag = ?,
-                  applied_payload_hash = desired_payload_hash,
+                  applied_payload_hash = ?,
                   applied_ledger_version = ?,
                   last_attempt_at = ?,
                   next_attempt_at = NULL,
@@ -603,6 +632,7 @@ async def _record_success(
             WHERE id = ?""",
         (
             google_event_id, google_etag,
+            await _applied_hash_for(db, op),
             int(op["ledger_version_at_enqueue"]),
             when, when, int(op["projection_id"]),
         ),

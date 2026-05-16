@@ -115,6 +115,12 @@ CREATE TABLE IF NOT EXISTS outbox_operations (
     operation TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     ledger_version_at_enqueue INTEGER NOT NULL,
+    -- The projection's desired_payload_hash at the moment this op was
+    -- enqueued.  On success the projection records THIS as its
+    -- applied_payload_hash — not its (possibly since-changed) current
+    -- desired hash — so a desired-state change while the op was in
+    -- flight is not silently masked.
+    desired_payload_hash TEXT,
     target_google_calendar_id TEXT NOT NULL,
     payload_json TEXT,
 
@@ -178,3 +184,16 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
     """
     await db.executescript(LEDGER_SCHEMA)
     await db.commit()
+
+    # Migrations for columns added after a table's initial release.
+    # CREATE TABLE IF NOT EXISTS above does not alter an existing
+    # table, so each added column needs an ALTER; a "duplicate column"
+    # error just means the migration already ran.
+    for stmt in (
+        "ALTER TABLE outbox_operations ADD COLUMN desired_payload_hash TEXT",
+    ):
+        try:
+            await db.execute(stmt)
+            await db.commit()
+        except Exception:
+            pass

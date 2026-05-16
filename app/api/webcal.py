@@ -203,23 +203,30 @@ async def delete_webcal_subscription(
     # Cancel every ledger row sourced from this subscription so
     # the next reconcile drains the deletes.
     now_iso = datetime.utcnow().isoformat()
-    await db.execute(
+    cancelled = await (await db.execute(
         """UPDATE ledger_events
               SET status = 'cancelled',
                   version = version + 1,
                   cancelled_at = ?, updated_at = ?
             WHERE user_id = ? AND source_type = 'webcal'
-              AND source_calendar_id = ? AND status = 'active'""",
+              AND source_calendar_id = ? AND status = 'active'
+           RETURNING id""",
         (now_iso, now_iso, user.id, subscription_id),
-    )
+    )).fetchall()
     await db.execute(
         "UPDATE webcal_subscriptions SET is_active = FALSE, updated_at = ? WHERE id = ?",
         (now_iso, subscription_id),
     )
     await db.commit()
-    # Enqueue reconcile so the planner sets projections to absent
-    # and the outbox drains.
+    # Record the cancelled rows as affected so the reconciler actually
+    # replans them — the trigger's source_hint is not persisted, so
+    # enqueue_manual alone leaves _consume_affected_ledger_ids empty
+    # and the planner would never flip these projections to absent.
+    from app.ledger.admin_ops import _append_affected
     from app.ledger.triggers import enqueue_manual
+    await _append_affected(
+        db, user_id=user.id, ledger_ids=[int(r["id"]) for r in cancelled],
+    )
     await enqueue_manual(db, user_id=user.id, source_hint="all")
 
     # Log
