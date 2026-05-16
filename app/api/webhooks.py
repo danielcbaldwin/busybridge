@@ -146,6 +146,14 @@ async def receive_google_calendar_webhook(
                 )
             return {"status": "ok", "message": "Channel expired and removed"}
 
+    # While maintenance mode is on (a DB restore is in progress) the
+    # sync engine is hard-frozen — don't enqueue or drain.  The
+    # webhook is still acked so Google does not retry-storm.
+    from app.maintenance import in_maintenance
+    if in_maintenance():
+        logger.info("Webhook ignored: maintenance mode active")
+        return {"status": "ok"}
+
     # Enqueue a debounced reconcile request and schedule an
     # immediate drain pass so latency matches the plan's 5s
     # debounce rather than the scheduler's 30s tick.

@@ -49,6 +49,10 @@ async def ledger_enqueue_periodic() -> None:
     active user.  ``enqueue_periodic`` preserves the earliest
     schedule so the drain doesn't get postponed.
     """
+    from app.maintenance import in_maintenance
+    if in_maintenance():
+        logger.debug("ledger_enqueue_periodic skipped: maintenance mode")
+        return
     global_pause = await get_setting("sync_paused")
     if global_pause and global_pause.get("value_plain") == "true":
         logger.debug("ledger_enqueue_periodic skipped: global sync pause on")

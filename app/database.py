@@ -265,6 +265,38 @@ async def close_database() -> None:
             logger.info("Database connection closed")
 
 
+async def replace_database_file(source_db_path: str) -> None:
+    """Swap the live database file for the contents of ``source_db_path``.
+
+    The shared connection is closed first and reopens lazily on the
+    new file via :func:`get_database`.  The close + file swap happen
+    under ``_db_lock``, so no concurrent ``get_database`` can reopen a
+    connection on a half-written file.
+
+    Callers MUST be holding maintenance mode (see :mod:`app.maintenance`)
+    so the scheduler / reconciler / webhook paths are frozen and no
+    in-flight query is racing the swap.  Stale ``-wal`` / ``-shm``
+    sidecars from the old database are removed so SQLite cannot apply
+    a mismatched write-ahead log to the new file.
+    """
+    import os
+    import shutil
+
+    global _db_connection
+    async with _db_lock:
+        if _db_connection is not None:
+            await _db_connection.close()
+            _db_connection = None
+        dst = get_settings().database_path
+        for suffix in ("-wal", "-shm"):
+            try:
+                os.remove(dst + suffix)
+            except FileNotFoundError:
+                pass
+        shutil.copyfile(source_db_path, dst)
+        logger.info("Database file replaced from %s", source_db_path)
+
+
 @asynccontextmanager
 async def get_db() -> AsyncGenerator[aiosqlite.Connection, None]:
     """Context manager for getting database connection."""

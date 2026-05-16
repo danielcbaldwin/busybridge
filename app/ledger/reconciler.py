@@ -36,37 +36,43 @@ logger = logging.getLogger(__name__)
 UTC = timezone.utc
 
 
-async def _sync_is_paused(db: aiosqlite.Connection, user_id: int) -> bool:
-    """True when sync must not pull new state for this user.
+async def _pause_mode(
+    db: aiosqlite.Connection, user_id: int,
+) -> Optional[str]:
+    """Return the active pause mode for a user, or ``None``.
 
-    Two independent pause switches exist and both must be honoured:
+    * ``"global"`` — the ``settings`` row keyed ``sync_paused``: a
+      HARD freeze (the admin "pause everything" emergency stop).  No
+      ingest, diff, or drain — nothing is written to Google.
+    * ``"user"`` — ``users.sync_paused``: a SOFT pause (the circuit
+      breaker, or ``cleanup_and_pause``).  Ingest is skipped, but the
+      outbox still drains so staged cleanup work converges.
 
-    * per-user — ``users.sync_paused``, flipped by the circuit breaker
-      or an admin pausing one account;
-    * global — the ``settings`` row keyed ``sync_paused``, flipped by
-      the admin "pause everything" switch and, critically, by the
-      backup job to freeze writes for a consistent snapshot.
-
-    The reconciler historically read only the per-user flag, so the
-    global switch silently did nothing to the ledger engine — backups
-    ran concurrently with sync.  Both flags are read from the passed
-    connection (in production the single shared connection ``settings``
-    also lives on).
+    A global pause outranks a per-user one.  Both flags are read from
+    the passed connection (in production the single shared connection
+    that ``settings`` lives on).
     """
-    user_row = await (await db.execute(
-        "SELECT sync_paused FROM users WHERE id = ?", (user_id,),
-    )).fetchone()
-    if user_row and user_row["sync_paused"]:
-        return True
     try:
         global_row = await (await db.execute(
             "SELECT value_plain FROM settings WHERE key = 'sync_paused'",
         )).fetchone()
     except Exception:
-        # Minimal test databases may omit the settings table; absence
-        # of the table means no global pause is configured.
-        return False
-    return bool(global_row and global_row["value_plain"] == "true")
+        # Minimal test databases may omit the settings table.
+        global_row = None
+    if global_row and global_row["value_plain"] == "true":
+        return "global"
+    user_row = await (await db.execute(
+        "SELECT sync_paused FROM users WHERE id = ?", (user_id,),
+    )).fetchone()
+    if user_row and user_row["sync_paused"]:
+        return "user"
+    return None
+
+
+async def _sync_is_paused(db: aiosqlite.Connection, user_id: int) -> bool:
+    """True when sync is paused in either mode — the plain-boolean
+    view of :func:`_pause_mode`."""
+    return await _pause_mode(db, user_id) is not None
 
 
 async def reconcile_user(
@@ -104,10 +110,19 @@ async def reconcile_user(
 
     Returns a counters dict aggregating each phase.
     """
-    # If sync is paused, skip ingest/planning entirely — the outbox
-    # should still drain (so a paused user's pending deletes complete)
-    # but we don't pull new state in.
-    paused = await _sync_is_paused(db, user_id)
+    # Pause handling has two modes (see _pause_mode):
+    #  * global  — a HARD freeze: skip ingest AND diff AND drain.
+    #               Nothing is written to Google at all.
+    #  * per-user — a SOFT pause: skip ingest, but still diff + drain
+    #               so a paused user's staged cleanup converges.
+    mode = await _pause_mode(db, user_id)
+    if mode == "global":
+        return {
+            "ingest": {}, "ingest_errors": {},
+            "planned": 0, "enqueued": 0, "drain": {},
+            "paused": True,
+        }
+    paused = mode == "user"
 
     out: dict = {
         "ingest": {}, "ingest_errors": {},

@@ -489,20 +489,24 @@ async def _restore_db_for_users(backup_zip: zipfile.ZipFile, user_ids: list[int]
 
 
 async def _restore_full_db(backup_zip: zipfile.ZipFile) -> None:
-    """Replace the entire live database with the backup DB (sqlite3 backup API)."""
-    settings = get_settings()
+    """Replace the entire live database with the backup's database.db.
+
+    Goes through :func:`app.database.replace_database_file`, which
+    closes the app's shared connection, swaps the file, and lets the
+    next ``get_database()`` reopen on the new file — so the swap never
+    races a live connection.  At startup (no connection open yet) it
+    simply copies the file.  Runtime callers MUST hold maintenance
+    mode so the scheduler cannot reopen a connection mid-swap.
+    """
+    from app.database import replace_database_file
+
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         tmp_path = tmp.name
     try:
         with backup_zip.open("database.db") as src:
             with open(tmp_path, "wb") as dst:
                 dst.write(src.read())
-
-        src_conn = sqlite3.connect(tmp_path)
-        dst_conn = sqlite3.connect(settings.database_path)
-        src_conn.backup(dst_conn)
-        src_conn.close()
-        dst_conn.close()
+        await replace_database_file(tmp_path)
     finally:
         os.unlink(tmp_path)
 
@@ -646,7 +650,11 @@ async def _reconverge_user(user_id: int, since_iso: str) -> dict:
     report how many create/update/delete ops it completed."""
     from app.ledger.runtime import reconcile_user_by_id
 
-    await reconcile_user_by_id(user_id, run_discovery=True)
+    # allow_in_maintenance: the restore holds maintenance mode to keep
+    # the scheduler out, but its own re-converge pass must still run.
+    await reconcile_user_by_id(
+        user_id, run_discovery=True, allow_in_maintenance=True,
+    )
 
     db = await get_database()
     rows = await (await db.execute(
@@ -748,8 +756,6 @@ async def restore_from_backup(
 
     Returns a summary dict.
     """
-    from app.database import get_setting, set_setting
-
     zip_path = _backup_filepath(backup_id)
     if not os.path.exists(zip_path):
         raise FileNotFoundError(f"Backup not found: {backup_id}")
@@ -779,14 +785,15 @@ async def restore_from_backup(
         summary["users_restored"] = list(target_user_ids)
         return summary
 
-    # Pause the scheduler for the duration of a real restore.
-    paused_setting = await get_setting("sync_paused")
-    originally_paused = bool(
-        paused_setting and paused_setting.get("value_plain") == "true"
-    )
-    if not originally_paused:
-        await set_setting("sync_paused", "true")
-        logger.info("Restore: sync paused")
+    # Hard-freeze the sync engine for the duration of a real restore.
+    # Maintenance mode (in-process) — not settings.sync_paused — is
+    # used deliberately: a full restore swaps the database file out,
+    # so the flag that guards the swap must live outside the DB, and
+    # the restore's own re-converge pass can still run by bypassing it.
+    from app.maintenance import enter_maintenance, exit_maintenance
+
+    enter_maintenance()
+    logger.info("Restore: maintenance mode engaged")
 
     restore_started = datetime.now(UTC).isoformat()
     try:
@@ -845,8 +852,7 @@ async def restore_from_backup(
         await db.commit()
 
     finally:
-        if not originally_paused:
-            await set_setting("sync_paused", "false")
-            logger.info("Restore: sync resumed")
+        exit_maintenance()
+        logger.info("Restore: maintenance mode released")
 
     return summary

@@ -115,8 +115,15 @@ async def reconcile_user_by_id(
     include_main: bool = True,
     drain: bool = True,
     run_discovery: bool = False,
+    allow_in_maintenance: bool = False,
 ) -> dict:
     """Run one reconciliation pass for a user, under the per-user lock.
+
+    While maintenance mode is on (a DB restore is in progress) the
+    sync engine is hard-frozen: this returns immediately without
+    touching Google or the DB.  ``allow_in_maintenance=True`` is the
+    single exception — the restore's own re-converge pass passes it so
+    it can run *while* it holds maintenance mode.
 
     Enforces REWRITE_PLAN.md §3's "one author at a time per user":
     no matter how many triggers fire concurrently — a webhook's
@@ -136,6 +143,9 @@ async def reconcile_user_by_id(
     DB-level advisory lock around the *whole* reconcile pass; the
     asyncio lock alone is not enough there.
     """
+    from app.maintenance import in_maintenance
+    if in_maintenance() and not allow_in_maintenance:
+        return {"skipped": "maintenance"}
     async with _user_lock(user_id):
         return await _reconcile_user_once(
             user_id,
@@ -372,6 +382,10 @@ async def drain_all_due_users(*, now: Optional[datetime] = None) -> dict:
     Returns ``{user_id: counters}`` for every user processed
     (empty when nothing is due).
     """
+    from app.maintenance import in_maintenance
+    if in_maintenance():
+        # Hard freeze: a DB restore is replacing the database under us.
+        return {}
     now = now or datetime.now(UTC)
     db = await get_database()
     # Free any claim a crashed process abandoned; otherwise its row
