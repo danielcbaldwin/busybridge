@@ -8,7 +8,6 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.auth.session import get_current_user, User
-from app.auth.google import get_valid_access_token
 from app.database import get_database
 
 logger = logging.getLogger(__name__)
@@ -145,15 +144,14 @@ async def connect_client_calendar(
 
     # Verify calendar exists and is accessible
     try:
-        from googleapiclient.discovery import build
-        from google.oauth2.credentials import Credentials
+        from app.auth.google import fetch_calendar
 
-        access_token = await get_valid_access_token(user.id, token["google_account_email"])
-        credentials = Credentials(token=access_token)
-        service = build("calendar", "v3", credentials=credentials)
-
-        cal_info = service.calendars().get(calendarId=request.calendar_id).execute()
-        display_name = request.display_name or cal_info.get("summary", request.calendar_id)
+        cal_info = await fetch_calendar(
+            user.id, token["google_account_email"], request.calendar_id,
+        )
+        display_name = request.display_name or cal_info.get(
+            "summary", request.calendar_id,
+        )
 
     except Exception as e:
         logger.error(f"Failed to verify calendar: {e}")

@@ -41,14 +41,12 @@ async def test_list_my_calendars_error_path(test_db, monkeypatch):
     user_id = await _insert_user("users-extra@example.com", "users-extra-google")
     user = _user_model(user_id, "users-extra@example.com")
 
-    async def fake_get_valid_access_token(_user_id: int, _email: str) -> str:
-        return "token"
-
-    def exploding_build(*_args, **_kwargs):
+    async def exploding_fetch(*_args, **_kwargs):
         raise RuntimeError("google down")
 
-    monkeypatch.setattr("app.api.users.get_valid_access_token", fake_get_valid_access_token)
-    monkeypatch.setattr("googleapiclient.discovery.build", exploding_build)
+    monkeypatch.setattr(
+        "app.auth.google.fetch_calendar_list", exploding_fetch,
+    )
 
     with pytest.raises(HTTPException) as exc:
         await list_my_calendars(user=user)

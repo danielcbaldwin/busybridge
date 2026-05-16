@@ -9,7 +9,6 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.auth.session import get_current_user, User
-from app.auth.google import get_valid_access_token
 from app.database import get_database
 
 logger = logging.getLogger(__name__)
@@ -120,26 +119,7 @@ async def connect_personal_calendars(
             ),
         )
 
-    # Build a Google client once to verify each calendar is reachable
-    # with this token — mirrors the client-calendar connect flow, so an
-    # inaccessible or bogus calendar id is rejected rather than stored.
-    try:
-        from googleapiclient.discovery import build
-        from google.oauth2.credentials import Credentials
-
-        access_token = await get_valid_access_token(
-            user.id, token["google_account_email"],
-        )
-        service = build(
-            "calendar", "v3",
-            credentials=Credentials(token=access_token),
-        )
-    except Exception as e:
-        logger.error(f"Failed to build Google client for personal connect: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot access the personal account",
-        )
+    from app.auth.google import fetch_calendar
 
     results = []
     for cal_info in request.calendars:
@@ -161,7 +141,9 @@ async def connect_personal_calendars(
         # Verify the calendar is reachable with this token before
         # storing it — an unreachable id would just fail every sync.
         try:
-            service.calendars().get(calendarId=calendar_id).execute()
+            await fetch_calendar(
+                user.id, token["google_account_email"], calendar_id,
+            )
         except Exception as e:
             logger.warning(
                 "skipping inaccessible personal calendar %s: %s",

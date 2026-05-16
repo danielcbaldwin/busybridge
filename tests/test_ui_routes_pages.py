@@ -199,33 +199,24 @@ async def test_settings_logs_and_calendar_select_paths(test_db, monkeypatch):
     monkeypatch.setattr("app.ui.routes.get_current_user_optional", auth_user)
 
     # settings page success
-    async def fake_get_valid_access_token(_user_id: int, _email: str):
-        return "token"
+    async def fake_fetch_calendar_list(_user_id, _email):
+        return [
+            {"id": "c1", "summary": "Cal 1", "accessRole": "owner"},
+            {"id": "c2", "summary": "Cal 2", "accessRole": "reader"},
+        ]
 
-    class FakeService:
-        def calendarList(self):
-            return SimpleNamespace(
-                list=lambda: SimpleNamespace(
-                    execute=lambda: {
-                        "items": [
-                            {"id": "c1", "summary": "Cal 1", "accessRole": "owner"},
-                            {"id": "c2", "summary": "Cal 2", "accessRole": "reader"},
-                        ]
-                    }
-                )
-            )
+    async def failing_fetch(_user_id, _email):
+        raise RuntimeError("no token")
 
-    monkeypatch.setattr("app.auth.google.get_valid_access_token", fake_get_valid_access_token)
-    monkeypatch.setattr("googleapiclient.discovery.build", lambda *_args, **_kwargs: FakeService())
+    monkeypatch.setattr(
+        "app.auth.google.fetch_calendar_list", fake_fetch_calendar_list,
+    )
     settings_ok = await settings_page(_request("/app/settings"))
     assert settings_ok.status_code == 200
     assert len(settings_ok.context["calendars"]) == 2
 
     # settings page failure should still render
-    async def failing_token(_user_id: int, _email: str):
-        raise RuntimeError("no token")
-
-    monkeypatch.setattr("app.auth.google.get_valid_access_token", failing_token)
+    monkeypatch.setattr("app.auth.google.fetch_calendar_list", failing_fetch)
     settings_fail = await settings_page(_request("/app/settings"))
     assert settings_fail.status_code == 200
     assert settings_fail.context["calendars"] == []
@@ -249,7 +240,7 @@ async def test_settings_logs_and_calendar_select_paths(test_db, monkeypatch):
     assert "invalid_token" in invalid_select.headers["location"]
 
     # valid token and calendar fetch/filter
-    monkeypatch.setattr("app.auth.google.get_valid_access_token", fake_get_valid_access_token)
+    monkeypatch.setattr("app.auth.google.fetch_calendar_list", fake_fetch_calendar_list)
     select_ok = await select_calendar_page(
         _request("/app/calendars/select"),
         token_id=token_id,
@@ -259,7 +250,7 @@ async def test_settings_logs_and_calendar_select_paths(test_db, monkeypatch):
     # Filtered to owner/writer only.
     assert len(select_ok.context["calendars"]) == 1
 
-    monkeypatch.setattr("app.auth.google.get_valid_access_token", failing_token)
+    monkeypatch.setattr("app.auth.google.fetch_calendar_list", failing_fetch)
     select_fail = await select_calendar_page(
         _request("/app/calendars/select"),
         token_id=token_id,

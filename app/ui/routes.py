@@ -1,6 +1,5 @@
 """UI page routes."""
 
-import asyncio
 import logging
 import re
 from typing import Optional
@@ -208,17 +207,9 @@ async def settings_page(request: Request):
     # Get user's calendars from Google
     calendars = []
     try:
-        from app.auth.google import get_valid_access_token
-        from googleapiclient.discovery import build
-        from google.oauth2.credentials import Credentials
+        from app.auth.google import fetch_calendar_list
 
-        access_token = await get_valid_access_token(user.id, user.email)
-        credentials = Credentials(token=access_token)
-        service = build("calendar", "v3", credentials=credentials)
-
-        cal_request = service.calendarList().list()
-        result = await asyncio.to_thread(cal_request.execute)
-        calendars = result.get("items", [])
+        calendars = await fetch_calendar_list(user.id, user.email)
     except Exception as e:
         logger.error(f"Failed to get calendars: {e}")
 
@@ -363,17 +354,9 @@ async def select_calendar_page(
     # Get calendars from the account
     calendars = []
     try:
-        from app.auth.google import get_valid_access_token
-        from googleapiclient.discovery import build
-        from google.oauth2.credentials import Credentials
+        from app.auth.google import fetch_calendar_list
 
-        access_token = await get_valid_access_token(user.id, email)
-        credentials = Credentials(token=access_token)
-        service = build("calendar", "v3", credentials=credentials)
-
-        cal_request = service.calendarList().list()
-        result = await asyncio.to_thread(cal_request.execute)
-        for cal in result.get("items", []):
+        for cal in await fetch_calendar_list(user.id, email):
             # backgroundColor is interpolated into a CSS style
             # attribute in the template — validate it is a plain hex
             # colour so a hostile value cannot break out of the rule.

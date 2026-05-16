@@ -109,14 +109,10 @@ async def test_connect_calendar_token_missing_and_calendar_verify_failure(test_d
 
     token_id = await _insert_token(user_id, "connect-client@example.com")
 
-    async def fake_get_valid_access_token(_user_id: int, _email: str) -> str:
-        return "token"
-
-    def exploding_build(*_args, **_kwargs):
+    async def exploding_fetch(*_args, **_kwargs):
         raise RuntimeError("google unavailable")
 
-    monkeypatch.setattr("app.api.calendars.get_valid_access_token", fake_get_valid_access_token)
-    monkeypatch.setattr("googleapiclient.discovery.build", exploding_build)
+    monkeypatch.setattr("app.auth.google.fetch_calendar", exploding_fetch)
 
     with pytest.raises(HTTPException) as verify_exc:
         await connect_client_calendar(
@@ -136,29 +132,13 @@ async def test_color_auto_assignment_on_connect(test_db, monkeypatch):
     token_id = await _insert_token(user_id, "color-client@example.com")
     user = _user_model(user_id, "color@example.com")
 
-    async def fake_get_valid_access_token(_user_id, _email):
-        return "token"
-
     cal_counter = {"n": 0}
 
-    def fake_build(*_a, **_kw):
-        svc = type("Svc", (), {})()
+    async def fake_fetch_calendar(_user_id, _email, _calendar_id):
+        cal_counter["n"] += 1
+        return {"summary": f"Cal {cal_counter['n']}"}
 
-        def calendars():
-            c = type("C", (), {})()
-
-            def get(calendarId=""):
-                g = type("G", (), {})()
-                cal_counter["n"] += 1
-                g.execute = lambda: {"summary": f"Cal {cal_counter['n']}"}
-                return g
-            c.get = get
-            return c
-        svc.calendars = calendars
-        return svc
-
-    monkeypatch.setattr("app.api.calendars.get_valid_access_token", fake_get_valid_access_token)
-    monkeypatch.setattr("googleapiclient.discovery.build", fake_build)
+    monkeypatch.setattr("app.auth.google.fetch_calendar", fake_fetch_calendar)
     monkeypatch.setattr("app.utils.tasks.create_background_task", lambda coro, *a, **kw: coro.close())
 
     # Connect three calendars

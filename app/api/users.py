@@ -7,7 +7,6 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.auth.session import get_current_user, User
-from app.auth.google import get_valid_access_token
 from app.database import get_database, get_setting, set_setting
 from app.encryption import decrypt_value, encrypt_value
 
@@ -59,17 +58,12 @@ async def get_me(user: User = Depends(get_current_user)):
 async def list_my_calendars(user: User = Depends(get_current_user)):
     """List user's Google calendars for selection."""
     try:
-        from googleapiclient.discovery import build
-        from google.oauth2.credentials import Credentials
+        from app.auth.google import fetch_calendar_list
 
-        access_token = await get_valid_access_token(user.id, user.email)
-        credentials = Credentials(token=access_token)
-        service = build("calendar", "v3", credentials=credentials)
-
-        result = service.calendarList().list().execute()
+        items = await fetch_calendar_list(user.id, user.email)
         calendars = []
 
-        for cal in result.get("items", []):
+        for cal in items:
             calendars.append(CalendarInfo(
                 id=cal["id"],
                 summary=cal.get("summary", cal["id"]),
@@ -117,15 +111,10 @@ async def set_main_calendar(
 
     # Verify the calendar exists and user has access
     try:
-        from googleapiclient.discovery import build
-        from google.oauth2.credentials import Credentials
+        from app.auth.google import fetch_calendar
 
-        access_token = await get_valid_access_token(user.id, user.email)
-        credentials = Credentials(token=access_token)
-        service = build("calendar", "v3", credentials=credentials)
-
-        # This will raise if calendar doesn't exist or no access
-        service.calendars().get(calendarId=request.calendar_id).execute()
+        # Raises if the calendar doesn't exist or is not accessible.
+        await fetch_calendar(user.id, user.email, request.calendar_id)
 
     except Exception as e:
         logger.error(f"Failed to verify calendar: {e}")

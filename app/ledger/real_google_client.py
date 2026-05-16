@@ -32,17 +32,10 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
 
 logger = logging.getLogger(__name__)
-
-# Socket timeout for every Google HTTP call.  googleapiclient is
-# synchronous, so without this a hung connection blocks the event
-# loop forever; with it the worst case is a bounded stall then a
-# retry.
-GOOGLE_HTTP_TIMEOUT = 30
 
 
 # ---------------------------------------------------------------------------
@@ -116,24 +109,13 @@ class RealGoogleClient:
     """
 
     def __init__(self, credentials: Credentials):
-        # Bound every Google HTTP call with a socket timeout.  These
-        # calls are synchronous (googleapiclient), so a hung TCP
-        # connection would otherwise block the single event loop
-        # indefinitely.  The timeout caps that at GOOGLE_HTTP_TIMEOUT
-        # seconds, after which the call raises and the outbox / ingest
-        # retry path takes over.
-        import httplib2
-        from google_auth_httplib2 import AuthorizedHttp
+        # build_calendar_service gives the service a socket timeout —
+        # googleapiclient is synchronous, so a hung connection would
+        # otherwise block indefinitely.  Shared with the setup-flow
+        # API helpers so every Google call has the same timeout.
+        from app.auth.google import build_calendar_service
 
-        authed_http = AuthorizedHttp(
-            credentials,
-            http=httplib2.Http(timeout=GOOGLE_HTTP_TIMEOUT),
-        )
-        self._service = build(
-            "calendar", "v3",
-            http=authed_http,
-            cache_discovery=False,
-        )
+        self._service = build_calendar_service(credentials)
 
     # ------------------------------------------------------------------
     # Events

@@ -129,40 +129,35 @@ async def test_get_valid_access_token_raises_after_retry_exhaustion(test_db, tes
 
 @pytest.mark.asyncio
 async def test_calendar_service_helpers(test_db, monkeypatch):
-    """Calendar service helper wrappers should delegate correctly."""
-    from app.auth.google import get_calendar_service, get_calendar_service_for_user
+    """Calendar service helpers build a timeout-bounded service and
+    delegate through refresh-capable credentials."""
+    from app.auth.google import (
+        get_calendar_service,
+        get_calendar_service_for_user,
+    )
 
-    calls = {"build": 0, "token": 0}
+    seen = {"http": None}
 
-    def fake_build(_service: str, _version: str, credentials):
-        calls["build"] += 1
-        return {"service": "calendar", "credentials": credentials}
+    def fake_build(*_args, **kwargs):
+        # build_calendar_service must pass a timeout-bounded http
+        # (an AuthorizedHttp), never a plain credentials= kwarg.
+        seen["http"] = kwargs.get("http")
+        return {"service": "calendar"}
 
     monkeypatch.setattr("app.auth.google.build", fake_build)
 
-    class DummyCreds:
-        pass
+    class _Creds:
+        token = "tok"
 
-    creds = DummyCreds()
-    service = get_calendar_service(creds)
-    assert service["service"] == "calendar"
-    assert service["credentials"] is creds
+    service = get_calendar_service(_Creds())
+    assert service == {"service": "calendar"}
+    assert seen["http"] is not None, "service built without a timeout http"
 
-    async def fake_get_valid_access_token(_user_id: int, _email: str) -> str:
-        calls["token"] += 1
-        return "access-token"
+    async def fake_build_user_credentials(_user_id, _email):
+        return _Creds()
 
-    monkeypatch.setattr("app.auth.google.get_valid_access_token", fake_get_valid_access_token)
-
-    wrapper_calls = {"count": 0}
-
-    def fake_get_calendar_service(credentials):
-        wrapper_calls["count"] += 1
-        return {"wrapped": credentials.token}
-
-    monkeypatch.setattr("app.auth.google.get_calendar_service", fake_get_calendar_service)
-
+    monkeypatch.setattr(
+        "app.auth.google.build_user_credentials", fake_build_user_credentials,
+    )
     wrapped = await get_calendar_service_for_user(1, "user@example.com")
-    assert calls["token"] == 1
-    assert wrapper_calls["count"] == 1
-    assert wrapped == {"wrapped": "access-token"}
+    assert wrapped == {"service": "calendar"}

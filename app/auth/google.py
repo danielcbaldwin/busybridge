@@ -1,5 +1,6 @@
 """Google OAuth helpers."""
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -316,16 +317,67 @@ async def build_user_credentials(user_id: int, email: str) -> Credentials:
     return credentials
 
 
+# Socket timeout for every Google HTTP call.  googleapiclient is
+# synchronous; without this a hung connection blocks indefinitely.
+GOOGLE_HTTP_TIMEOUT = 30
+
+
+def build_calendar_service(credentials: Credentials):
+    """Build a Calendar API service whose HTTP layer carries a socket
+    timeout, so a hung Google connection fails after
+    ``GOOGLE_HTTP_TIMEOUT`` seconds instead of hanging forever.
+
+    Every Google Calendar call in the app should go through a service
+    built here (directly, or via :class:`RealGoogleClient` / the
+    ``fetch_*`` helpers below) so they all share the timeout."""
+    import httplib2
+    from google_auth_httplib2 import AuthorizedHttp
+
+    authed_http = AuthorizedHttp(
+        credentials,
+        http=httplib2.Http(timeout=GOOGLE_HTTP_TIMEOUT),
+    )
+    return build(
+        "calendar", "v3", http=authed_http, cache_discovery=False,
+    )
+
+
 def get_calendar_service(credentials: Credentials):
-    """Build Google Calendar API service."""
-    return build("calendar", "v3", credentials=credentials)
+    """Build Google Calendar API service (with the socket timeout)."""
+    return build_calendar_service(credentials)
 
 
 async def get_calendar_service_for_user(user_id: int, email: str):
     """Get Calendar service for a user's account."""
-    access_token = await get_valid_access_token(user_id, email)
-    credentials = Credentials(token=access_token)
-    return get_calendar_service(credentials)
+    credentials = await build_user_credentials(user_id, email)
+    return build_calendar_service(credentials)
+
+
+async def fetch_calendar_list(user_id: int, email: str) -> list[dict]:
+    """List a Google account's calendars.
+
+    Uses refresh-capable credentials and a timeout-bounded service,
+    and runs the blocking ``execute()`` off the event loop with
+    :func:`asyncio.to_thread` — safe to call from an async route.
+    """
+    service = await get_calendar_service_for_user(user_id, email)
+    result = await asyncio.to_thread(
+        lambda: service.calendarList().list().execute()
+    )
+    return result.get("items", [])
+
+
+async def fetch_calendar(
+    user_id: int, email: str, calendar_id: str,
+) -> dict:
+    """Fetch one calendar's metadata; raises if it is inaccessible.
+
+    Same guarantees as :func:`fetch_calendar_list` — timeout-bounded
+    and offloaded off the event loop."""
+    service = await get_calendar_service_for_user(user_id, email)
+    return await asyncio.to_thread(
+        lambda: service.calendars().get(calendarId=calendar_id).execute()
+    )
 
 
 async def test_oauth_credentials(client_id: str, client_secret: str) -> bool:

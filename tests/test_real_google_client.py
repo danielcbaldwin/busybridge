@@ -39,7 +39,7 @@ def _client(monkeypatch, *, verbs: dict):
         req = _FakeRequest(result)
         requests[verb] = req
         getattr(service.events.return_value, verb).return_value = req
-    monkeypatch.setattr(rgc, "build", lambda *a, **k: service)
+    monkeypatch.setattr("app.auth.google.build", lambda *a, **k: service)
     client = rgc.RealGoogleClient(MagicMock())
     return client, service, requests
 
