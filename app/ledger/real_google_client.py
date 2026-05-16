@@ -11,12 +11,12 @@ Two non-trivial mappings happen here:
   whereas the ledger code reads ``e.status``.  We wrap every
   ``HttpError`` in our own :class:`GoogleApiError` (shape-
   compatible with the fake's) before bubbling.
-* ``If-Match`` is sent via the request's HTTP headers, which
-  googleapiclient exposes through the underlying ``http`` object.
-  We pass it on the per-call ``HttpRequest`` using the
-  ``execute(...).resp`` mechanism is not available — instead we
-  set ``etag`` on the body which Google accepts as an equivalent
-  precondition for update/patch/delete.
+* Conditional modification uses the ``If-Match`` HTTP **header**
+  (Google Calendar API "version resources" guide): the request
+  proceeds only if the event's current ETag matches, else 412.
+  We set it on the per-call ``HttpRequest.headers`` dict before
+  ``execute()``.  The resource's body-level ``etag`` field is
+  output-only and is NOT honoured as a write precondition.
 
 The wrapper is intentionally thin; idempotent retry and backoff
 already live in the existing ``app/sync/google_calendar.py``.
@@ -115,21 +115,16 @@ class RealGoogleClient:
         body: dict,
         if_match: Optional[str] = None,
     ) -> dict:
-        # Google honours the body-level ``etag`` field as an
-        # ``If-Match`` precondition — we put it there because
-        # googleapiclient doesn't expose per-call HTTP headers
-        # cleanly.  An empty or absent value disables the check.
-        body = dict(body)
-        if if_match:
-            body["etag"] = if_match
         try:
-            return self._service.events().update(
+            request = self._service.events().update(
                 calendarId=calendar_id,
                 eventId=event_id,
                 body=body,
                 conferenceDataVersion=1,
                 sendNotifications=False,
-            ).execute()
+            )
+            _apply_if_match(request, if_match)
+            return request.execute()
         except HttpError as e:
             raise _wrap(e) from e
 
@@ -140,17 +135,16 @@ class RealGoogleClient:
         body: dict,
         if_match: Optional[str] = None,
     ) -> dict:
-        body = dict(body)
-        if if_match:
-            body["etag"] = if_match
         try:
-            return self._service.events().patch(
+            request = self._service.events().patch(
                 calendarId=calendar_id,
                 eventId=event_id,
                 body=body,
                 conferenceDataVersion=1,
                 sendNotifications=False,
-            ).execute()
+            )
+            _apply_if_match(request, if_match)
+            return request.execute()
         except HttpError as e:
             raise _wrap(e) from e
 
@@ -161,11 +155,13 @@ class RealGoogleClient:
         if_match: Optional[str] = None,
     ) -> None:
         try:
-            self._service.events().delete(
+            request = self._service.events().delete(
                 calendarId=calendar_id,
                 eventId=event_id,
                 sendNotifications=False,
-            ).execute()
+            )
+            _apply_if_match(request, if_match)
+            request.execute()
         except HttpError as e:
             raise _wrap(e) from e
 
@@ -224,6 +220,20 @@ class RealGoogleClient:
             return self._service.calendarList().list().execute()
         except HttpError as e:
             raise _wrap(e) from e
+
+
+def _apply_if_match(request, if_match: Optional[str]) -> None:
+    """Attach an ``If-Match`` precondition header to a googleapiclient
+    request.  Google applies the write only if the event's current
+    ETag matches ``if_match``, otherwise returns 412 — which the
+    outbox turns into a supersede + replan."""
+    if not if_match:
+        return
+    headers = getattr(request, "headers", None)
+    if headers is None:  # pragma: no cover - defensive
+        request.headers = {}
+        headers = request.headers
+    headers["If-Match"] = if_match
 
 
 def _to_iso(v: datetime | str) -> str:
