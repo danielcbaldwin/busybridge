@@ -282,9 +282,16 @@ async def replace_database_file(source_db_path: str, dest_db_path: str) -> None:
 
     ``dest_db_path`` must be a real filesystem path — an in-memory
     (``:memory:``) database has no file to replace.
+
+    The swap is crash-safe: the backup is copied to a staging file in
+    the destination's own directory, fsync'd, then ``os.replace``'d
+    over the destination — an atomic rename.  A crash mid-copy leaves
+    the original database intact; only a fully-written file ever
+    appears at ``dest_db_path``.
     """
     import os
     import shutil
+    import tempfile
 
     if not dest_db_path or dest_db_path == ":memory:":
         raise RuntimeError(
@@ -302,7 +309,29 @@ async def replace_database_file(source_db_path: str, dest_db_path: str) -> None:
                 os.remove(dest_db_path + suffix)
             except FileNotFoundError:
                 pass
-        shutil.copyfile(source_db_path, dest_db_path)
+        dest_dir = os.path.dirname(os.path.abspath(dest_db_path)) or "."
+        fd, staging = tempfile.mkstemp(dir=dest_dir, suffix=".restore")
+        os.close(fd)
+        try:
+            shutil.copyfile(source_db_path, staging)
+            with open(staging, "rb") as f:
+                os.fsync(f.fileno())
+            os.replace(staging, dest_db_path)
+        except BaseException:
+            try:
+                os.remove(staging)
+            except FileNotFoundError:
+                pass
+            raise
+        # fsync the directory so the rename itself is durable.
+        try:
+            dir_fd = os.open(dest_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
         logger.info("Database file replaced from %s", source_db_path)
 
 

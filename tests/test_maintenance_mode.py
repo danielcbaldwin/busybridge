@@ -13,6 +13,8 @@ Pause modes are also pinned here: a global pause is a HARD freeze
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from app.maintenance import enter_maintenance, exit_maintenance, in_maintenance
@@ -108,3 +110,49 @@ async def test_global_pause_is_a_hard_freeze_but_per_user_drains():
     assert hard["paused"] is True
     assert hard["drain"] == {}, "a global pause must not drain"
     await s.close()
+
+
+async def test_quiescence_returns_immediately_when_no_reconcile_runs():
+    from app.maintenance import wait_for_reconcile_quiescence
+
+    await wait_for_reconcile_quiescence(timeout=1.0)
+
+
+async def test_quiescence_times_out_while_a_reconcile_is_in_flight():
+    from app.maintenance import (
+        active_reconcile_count,
+        track_reconcile,
+        wait_for_reconcile_quiescence,
+    )
+
+    with track_reconcile():
+        assert active_reconcile_count() == 1
+        with pytest.raises(TimeoutError):
+            await wait_for_reconcile_quiescence(timeout=0.2, poll=0.02)
+    # The guard exited — the engine is quiescent again.
+    assert active_reconcile_count() == 0
+    await wait_for_reconcile_quiescence(timeout=1.0)
+
+
+async def test_quiescence_drains_a_concurrent_reconcile():
+    """A reconcile already running when a restore begins must be
+    waited out — quiescence is reached only once it releases."""
+    from app.maintenance import track_reconcile, wait_for_reconcile_quiescence
+
+    released = asyncio.Event()
+
+    async def _fake_reconcile():
+        with track_reconcile():
+            await released.wait()
+
+    task = asyncio.create_task(_fake_reconcile())
+    await asyncio.sleep(0.05)  # let it register as in-flight
+
+    # Not quiescent yet — the fake reconcile is still holding its slot.
+    with pytest.raises(TimeoutError):
+        await wait_for_reconcile_quiescence(timeout=0.15, poll=0.02)
+
+    released.set()
+    await task
+    # Now it has finished — quiescence is reached.
+    await wait_for_reconcile_quiescence(timeout=1.0)

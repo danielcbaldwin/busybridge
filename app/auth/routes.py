@@ -492,8 +492,15 @@ async def connect_personal_callback(
             expires_in=tokens.get("expires_in")
         )
 
+        # URL-encode the query parameters — a raw '+', '&' or space in
+        # the email would otherwise break the query string.
+        query = urlencode({
+            "token_id": token_id,
+            "email": personal_email,
+            "calendar_type": "personal",
+        })
         return RedirectResponse(
-            url=f"/app/calendars/select?token_id={token_id}&email={personal_email}&calendar_type=personal",
+            url=f"/app/calendars/select?{query}",
             status_code=status.HTTP_302_FOUND
         )
 

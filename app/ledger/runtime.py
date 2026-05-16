@@ -143,16 +143,20 @@ async def reconcile_user_by_id(
     DB-level advisory lock around the *whole* reconcile pass; the
     asyncio lock alone is not enough there.
     """
-    from app.maintenance import in_maintenance
+    from app.maintenance import in_maintenance, track_reconcile
     if in_maintenance() and not allow_in_maintenance:
         return {"skipped": "maintenance"}
-    async with _user_lock(user_id):
-        return await _reconcile_user_once(
-            user_id,
-            include_main=include_main,
-            drain=drain,
-            run_discovery=run_discovery,
-        )
+    # Register as in-flight synchronously — no await between the
+    # maintenance check and this — so a restore cannot start swapping
+    # the DB after we pass the gate but before we are counted.
+    with track_reconcile():
+        async with _user_lock(user_id):
+            return await _reconcile_user_once(
+                user_id,
+                include_main=include_main,
+                drain=drain,
+                run_discovery=run_discovery,
+            )
 
 
 # Per-user reconcile mutex.  Keyed by ``(event-loop id, user_id)`` so

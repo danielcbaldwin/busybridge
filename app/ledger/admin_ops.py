@@ -78,12 +78,18 @@ async def cleanup_one_calendar(
     when = datetime.now(UTC).isoformat()
 
     # 1. Source-side: cancel every ledger row that came from this calendar.
+    #    The source_type filter is essential: client/personal calendars
+    #    and webcal subscriptions are numbered in SEPARATE tables, so a
+    #    webcal subscription id can equal this client_calendar_id.
+    #    Without the filter the cancel would also hit unrelated webcal
+    #    events that merely share the numeric id.
     await db.execute(
         """UPDATE ledger_events
               SET status = 'cancelled',
                   version = version + 1,
                   cancelled_at = ?, updated_at = ?
             WHERE user_id = ?
+              AND source_type IN ('client', 'personal')
               AND source_calendar_id = ?
               AND status = 'active'""",
         (when, when, user_id, client_calendar_id),

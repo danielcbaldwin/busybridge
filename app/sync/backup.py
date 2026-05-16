@@ -791,13 +791,21 @@ async def restore_from_backup(
     # used deliberately: a full restore swaps the database file out,
     # so the flag that guards the swap must live outside the DB, and
     # the restore's own re-converge pass can still run by bypassing it.
-    from app.maintenance import enter_maintenance, exit_maintenance
+    from app.maintenance import (
+        enter_maintenance,
+        exit_maintenance,
+        wait_for_reconcile_quiescence,
+    )
 
     enter_maintenance()
     logger.info("Restore: maintenance mode engaged")
 
     restore_started = datetime.now(UTC).isoformat()
     try:
+        # Drain any reconcile pass that was already running before we
+        # touch the database file — maintenance mode stops new passes,
+        # but not one already in flight.
+        await wait_for_reconcile_quiescence()
         # Step 1: restore DB rows.
         if restore_db:
             restore_all_users = set(target_user_ids) == set(backup_user_ids)

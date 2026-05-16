@@ -22,11 +22,15 @@ restore, and is bypassed only by the restore's own re-converge pass.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
 _maintenance_active = False
+_active_reconciles = 0
 
 
 def enter_maintenance() -> None:
@@ -47,3 +51,51 @@ def in_maintenance() -> bool:
     """True while a maintenance operation (e.g. DB restore) holds the
     sync engine frozen."""
     return _maintenance_active
+
+
+@contextmanager
+def track_reconcile():
+    """Mark a reconcile pass as in-flight for quiescence tracking.
+
+    Entering ``maintenance`` mode stops *new* passes, but a pass that
+    was already running must finish before a DB restore swaps the
+    database file.  ``reconcile_user_by_id`` enters this guard
+    synchronously, immediately after clearing the maintenance gate and
+    before its first ``await`` — so a restore either sees the
+    maintenance flag (and the pass never starts) or sees a non-zero
+    in-flight count (and waits for it).  There is no window between.
+    """
+    global _active_reconciles
+    _active_reconciles += 1
+    try:
+        yield
+    finally:
+        _active_reconciles -= 1
+
+
+def active_reconcile_count() -> int:
+    """Number of reconcile passes currently in flight."""
+    return _active_reconciles
+
+
+async def wait_for_reconcile_quiescence(
+    timeout: float = 60.0, poll: float = 0.05,
+) -> None:
+    """Block until no reconcile pass is in flight.
+
+    :func:`enter_maintenance` must already be set so no *new* pass can
+    start; this drains the passes already running before the caller
+    (a DB restore) touches the database file.  Raises
+    :class:`TimeoutError` if a pass does not finish within ``timeout``
+    — the restore must then abort rather than swap the DB out from
+    under a live reconcile.
+    """
+    deadline = time.monotonic() + timeout
+    while _active_reconciles > 0:
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"{_active_reconciles} reconcile pass(es) still running "
+                f"after {timeout}s — cannot safely enter maintenance"
+            )
+        await asyncio.sleep(poll)
+

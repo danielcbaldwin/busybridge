@@ -173,9 +173,15 @@ async def ingest_webcal_subscription(
         counters["stale_cancelled"] += 1
         affected_ledger_ids.append(int(row["id"]))
 
-    await _record_fetch_success(db, subscription_id, etag=etag, now=now)
+    # Record affected ledger ids BEFORE marking the fetch successful.
+    # _record_fetch_success advances last_etag; the DB is autocommit,
+    # so a crash between the two would leave the etag advanced (next
+    # poll gets 304) with the affected ids never recorded — stranding
+    # those ICS changes.  Recording affected first makes the etag
+    # write the last durable write of the poll.
     if affected_ledger_ids:
         await _record_affected(db, user_id=user_id, ledger_ids=affected_ledger_ids)
+    await _record_fetch_success(db, subscription_id, etag=etag, now=now)
     await db.commit()
     return counters
 
