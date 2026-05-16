@@ -35,6 +35,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+from typing import Optional
 
 import aiosqlite
 
@@ -67,7 +68,9 @@ class DbSizeSample:
 class InvariantChecker:
     db: aiosqlite.Connection
     google: FakeGoogleCalendar
-    oracle: Oracle
+    # The ground-truth oracle backs invariants 6 & 7.  Soaks that do
+    # not model an oracle pass ``None`` and use ``check_oracle_free``.
+    oracle: Optional[Oracle]
     user_id: int
     main_google_id: str
     # nickname -> google id (kept for reference) AND nickname -> db id
@@ -79,20 +82,41 @@ class InvariantChecker:
         """Run every point-in-time invariant; return the combined
         violation list."""
         out: list[str] = []
+        out += await self.check_oracle_free()
+        out += await self.check_6_main_copy_count_matches_oracle()
+        out += await self.check_7_busy_block_counts_match_oracle()
+        return out
+
+    async def check_oracle_free(self) -> list[str]:
+        """Run the invariants that need no ground-truth oracle
+        (1-5, 8).  Used by soaks — e.g. the recurring soak — whose
+        per-instance state the simple Oracle does not model."""
+        out: list[str] = []
         out += await self.check_1_projections_match_ledger()
         out += await self.check_2_present_projections_exist_on_google()
         out += await self.check_3_no_orphan_google_events()
         out += await self.check_4_no_duplicate_google_event_ids()
         out += await self.check_5_no_duplicate_canonical_uids()
-        out += await self.check_6_main_copy_count_matches_oracle()
-        out += await self.check_7_busy_block_counts_match_oracle()
         out += await self.check_8_outbox_drains()
         return out
 
     # ------------------------------------------------------------------
-    # 1. Every active ledger event has the expected projection set.
+    # 1. Every active ledger event has the expected projection set —
+    #    a projection on main + on every active client (no missing),
+    #    and no projection pointing at a calendar that is not this
+    #    user's (no spurious).  A disconnected calendar's projection
+    #    is tolerated: its client_calendars row still exists and the
+    #    planner deliberately keeps the row to drive the delete.
     # ------------------------------------------------------------------
     async def check_1_projections_match_ledger(self) -> list[str]:
+        active = await (await self.db.execute(
+            """SELECT id FROM client_calendars
+                WHERE user_id = ? AND is_active = 1
+                  AND calendar_type = 'client'""",
+            (self.user_id,),
+        )).fetchall()
+        expected_client_ids = {int(r["id"]) for r in active}
+
         rows = await (await self.db.execute(
             """SELECT id, source_type FROM ledger_events
                 WHERE user_id = ?
@@ -100,16 +124,41 @@ class InvariantChecker:
                   AND user_intentionally_deleted = 0""",
             (self.user_id,),
         )).fetchall()
-        out = []
+        out: list[str] = []
         for r in rows:
-            proj_count = (await (await self.db.execute(
-                "SELECT COUNT(*) AS n FROM ledger_projections WHERE ledger_event_id = ?",
+            projs = await (await self.db.execute(
+                """SELECT target_kind, target_calendar_id
+                     FROM ledger_projections WHERE ledger_event_id = ?""",
                 (int(r["id"]),),
-            )).fetchone())["n"]
-            if proj_count == 0:
+            )).fetchall()
+            have_main = any(p["target_kind"] == "main" for p in projs)
+            have_clients = {
+                int(p["target_calendar_id"])
+                for p in projs
+                if p["target_kind"] == "client"
+                and p["target_calendar_id"] is not None
+            }
+            if not have_main:
                 out.append(
-                    f"INV-1: ledger_event {r['id']} ({r['source_type']}) has no projections",
+                    f"INV-1: ledger_event {r['id']} ({r['source_type']}) "
+                    f"has no main projection",
                 )
+            missing = expected_client_ids - have_clients
+            if missing:
+                out.append(
+                    f"INV-1: ledger_event {r['id']} ({r['source_type']}) "
+                    f"is missing client projections for {sorted(missing)}",
+                )
+            for cid in have_clients - expected_client_ids:
+                exists = await (await self.db.execute(
+                    "SELECT 1 FROM client_calendars WHERE id = ? AND user_id = ?",
+                    (cid, self.user_id),
+                )).fetchone()
+                if exists is None:
+                    out.append(
+                        f"INV-1: ledger_event {r['id']} has a spurious "
+                        f"projection for unknown client calendar {cid}",
+                    )
         return out
 
     # ------------------------------------------------------------------

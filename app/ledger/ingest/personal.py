@@ -118,7 +118,7 @@ async def ingest_personal_calendar(
                 user_email=user_email,
                 event=inst,
             )
-        await scan_full_sync_recurring_cancellations(
+        scan_failures = await scan_full_sync_recurring_cancellations(
             db, google,
             google_calendar_id=google_calendar_id,
             recurring_parent_ids=recurring_parent_ids,
@@ -126,6 +126,10 @@ async def ingest_personal_calendar(
             affected_ledger_ids=affected_ledger_ids,
             ingest_one=_ingest,
         )
+        if scan_failures:
+            # Hold the sync token back so the next reconcile re-runs
+            # a full sync and retries the scan.
+            new_sync_token = None
 
     when = datetime.now(UTC).isoformat()
     await db.execute(

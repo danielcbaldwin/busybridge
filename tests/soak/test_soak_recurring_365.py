@@ -22,13 +22,44 @@ test completes in well under a minute while still crossing the
 from __future__ import annotations
 
 import random
+import time
 from datetime import timedelta
 
 import pytest
 
 from tests.integration.framework import Scenario
+from tests.soak.chaos import recover_to_clean, set_injection
+from tests.soak.invariants import (
+    DbSizeSample,
+    InvariantChecker,
+    LatencySample,
+    sample_db_size,
+)
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.slow]
+
+
+async def _oracle_free_invariants(s: Scenario) -> list[str]:
+    """Run soak invariants 1-5 + 8 (the ones that need no oracle).
+
+    The recurring soak does not model a ground-truth Oracle — per-
+    instance recurring state is the ghost-check's job — so the
+    oracle-backed invariants 6/7 are skipped here."""
+    user = s.user("alice")
+    db = await s.setup_db()
+    checker = InvariantChecker(
+        db=db,
+        google=s.google,
+        oracle=None,
+        user_id=user.user_id,
+        main_google_id=user.main_google_calendar_id,
+        client_google_ids={
+            "client_a": s.cal("client_a"),
+            "client_b": s.cal("client_b"),
+        },
+        client_db_ids=dict(user.client_calendar_ids),
+    )
+    return await checker.check_oracle_free()
 
 
 # A weekly Monday series; COUNT keeps the fake's RRULE expansion bounded.
@@ -137,6 +168,9 @@ async def _run_recurring_soak(seed: int, days: int = 365) -> dict:
         d = date.fromordinal(d.toordinal() + 7)
 
     cycle = 0
+    latency_samples: list[LatencySample] = []
+    db_samples: list[DbSizeSample] = []
+    worst_recovery = 0
     for day in range(1, days + 1):
         # Every ~10 days, cancel a random instance of a random series.
         if day % 10 == 0:
@@ -167,10 +201,45 @@ async def _run_recurring_soak(seed: int, days: int = 365) -> dict:
                 except Exception:
                     pass
 
-        # Reconcile every 7 days.
+        # Reconcile every 7 days: chaos phase, then recovery phase.
         if day % 7 == 0:
             cycle += 1
-            await s.run_reconciler_until_quiescent("alice", max_passes=3)
+            set_injection(s, True)
+            try:
+                await s.run_reconciler_until_quiescent("alice", max_passes=3)
+            except Exception:
+                pass
+            set_injection(s, False)
+
+            cycles_to_clean = await recover_to_clean(
+                s, "alice", s.user("alice").user_id,
+            )
+            db_sample = await sample_db_size(
+                await s.setup_db(), "", s.user("alice").user_id,
+            )
+            db_samples.append(db_sample)
+            # Time a CLEAN steady-state reconcile for the latency
+            # sample (the recovery phase's wall time is too noisy).
+            t0 = time.perf_counter()
+            await s.run_reconciler("alice")
+            latency_samples.append(LatencySample(
+                event_count=max(1, db_sample.ledger_row_count),
+                wall_seconds=time.perf_counter() - t0,
+            ))
+            if cycles_to_clean is not None:
+                worst_recovery = max(worst_recovery, cycles_to_clean)
+
+            # Point-in-time invariants 1-5/8 + recovery (INV-11).
+            inv = await _oracle_free_invariants(s)
+            inv += InvariantChecker.check_11_recovery_within_cycles(
+                cycles_to_clean,
+            )
+            if inv:
+                return {
+                    "passed": False,
+                    "day": day, "cycle": cycle, "series": "-",
+                    "reason": "; ".join(inv),
+                }
 
             # INVARIANT: every cancelled date is absent on main; every
             # NOT-cancelled date is still present.  This is the
@@ -210,12 +279,19 @@ async def _run_recurring_soak(seed: int, days: int = 365) -> dict:
         s.scenario_advance_one_day(day) if False else s.advance(timedelta(days=1))
 
     total_cancellations = sum(len(v) for v in cancelled.values())
+    # Final runtime invariants 9 (latency) + 10 (db growth).
+    runtime = (
+        InvariantChecker.check_9_reconcile_latency_bounded(latency_samples)
+        + InvariantChecker.check_10_db_size_sub_linear(db_samples)
+    )
     await s.close()
     return {
-        "passed": True,
+        "passed": not runtime,
         "days": days,
         "cycles": cycle,
         "total_cancellations": total_cancellations,
+        "worst_recovery": worst_recovery,
+        "reason": "; ".join(runtime) if runtime else None,
     }
 
 

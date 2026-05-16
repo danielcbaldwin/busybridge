@@ -42,6 +42,7 @@ async def discover_orphans(
     user_id: int,
     main_google_calendar_id: str,
     client_google_calendar_ids: dict[int, str],
+    now: Optional[datetime] = None,
 ) -> dict:
     """Scan every connected calendar for events that look like ours.
 
@@ -73,6 +74,7 @@ async def discover_orphans(
                 target_google_calendar_id=google_cal,
                 target_calendar_db_id=client_cal_db_id,
                 event=event,
+                now=now,
             )
             counters[outcome] = counters.get(outcome, 0) + 1
 
@@ -120,6 +122,7 @@ async def _classify_and_handle(
     target_google_calendar_id: str,
     target_calendar_db_id: Optional[int],
     event: dict,
+    now: Optional[datetime] = None,
 ) -> str:
     """Decide if a candidate is live, re-linkable, or orphaned.
 
@@ -173,6 +176,7 @@ async def _classify_and_handle(
         target_google_calendar_id=target_google_calendar_id,
         target_calendar_db_id=target_calendar_db_id,
         event_id=eid,
+        now=now,
     )
     return "orphans_deleted"
 
@@ -185,6 +189,7 @@ async def _schedule_orphan_delete(
     target_google_calendar_id: str,
     target_calendar_db_id: Optional[int],
     event_id: str,
+    now: Optional[datetime] = None,
 ) -> None:
     """Insert a synthetic ledger row + projection so the outbox
     can issue a clean idempotent delete.
@@ -248,5 +253,6 @@ async def _schedule_orphan_delete(
         ledger_version=1,
         target_google_calendar_id=target_google_calendar_id,
         payload=None,
+        now=now,
     )
     await db.commit()

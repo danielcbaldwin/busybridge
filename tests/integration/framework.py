@@ -737,6 +737,9 @@ async def _scenario_run_reconciler(
         include_main=include_main,
         drain=drain,
         run_discovery=run_discovery,
+        # Drive outbox timestamps off the simulated clock so backoff
+        # is deterministic and advancing the clock fires retries.
+        now=self.clock.now(),
     )
 
 

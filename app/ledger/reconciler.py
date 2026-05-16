@@ -51,6 +51,7 @@ async def reconcile_user(
     include_main: bool = True,
     drain: bool = True,
     run_discovery: bool = False,
+    now: Optional[datetime] = None,
 ) -> dict:
     """Run one full reconciliation pass for one user.
 
@@ -105,12 +106,13 @@ async def reconcile_user(
                 db, user_id=user_id,
                 main_calendar_id=main_google_calendar_id,
                 google_calendar_id_for=google_id_for,
+                now=now,
             )
             out["enqueued"] += enq
             await db.commit()
             if not drain:
                 break
-            counters = await drain_user(db, google, user_id=user_id)
+            counters = await drain_user(db, google, user_id=user_id, now=now)
             for k, v in counters.items():
                 out["drain"][k] = out["drain"].get(k, 0) + v
             if counters["processed"] == 0 and counters["superseded"] == 0:
@@ -204,6 +206,7 @@ async def reconcile_user(
                 user_id=user_id,
                 main_google_calendar_id=main_google_calendar_id,
                 client_google_calendar_ids=google_id_for,
+                now=now,
             )
         except Exception as e:
             logger.warning("discovery scan failed user_id=%s: %s", user_id, e)
@@ -232,12 +235,13 @@ async def reconcile_user(
             user_id=user_id,
             main_calendar_id=main_google_calendar_id,
             google_calendar_id_for=google_id_for,
+            now=now,
         )
         out["enqueued"] += enq
         await db.commit()
         if not drain:
             break
-        drain_counters = await drain_user(db, google, user_id=user_id)
+        drain_counters = await drain_user(db, google, user_id=user_id, now=now)
         for k, v in drain_counters.items():
             out["drain"][k] = out["drain"].get(k, 0) + v
         # If nothing was processed AND nothing was superseded

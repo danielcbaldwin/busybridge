@@ -39,6 +39,7 @@ async def diff_and_enqueue_for_user(
     user_id: int,
     main_calendar_id: str,
     google_calendar_id_for: dict[int, str],
+    now: Optional[datetime] = None,
 ) -> int:
     """Scan diverged projections and enqueue outbox ops.
 
@@ -47,6 +48,8 @@ async def diff_and_enqueue_for_user(
         main_calendar_id: the Google calendar ID for the user's main.
         google_calendar_id_for: map from ``client_calendars.id``
             to its Google calendar ID.
+        now: clock for outbox timestamps; defaults to wall-clock.
+            Tests pass a simulated clock so backoff is deterministic.
 
     Returns the number of ops enqueued.
     """
@@ -126,6 +129,7 @@ async def diff_and_enqueue_for_user(
             ledger_version=int(proj["desired_ledger_version"]),
             target_google_calendar_id=target_cal,
             payload=payload,
+            now=now,
         )
         enqueued += 1
     await db.commit()

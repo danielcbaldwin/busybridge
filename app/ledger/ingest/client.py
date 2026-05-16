@@ -122,7 +122,7 @@ async def ingest_client_calendar(
                 user_email=user_email,
                 event=inst,
             )
-        await scan_full_sync_recurring_cancellations(
+        scan_failures = await scan_full_sync_recurring_cancellations(
             db, google,
             google_calendar_id=google_calendar_id,
             recurring_parent_ids=recurring_parent_ids,
@@ -130,6 +130,11 @@ async def ingest_client_calendar(
             affected_ledger_ids=affected_ledger_ids,
             ingest_one=_ingest,
         )
+        if scan_failures:
+            # Hold the sync token back so the next reconcile re-runs
+            # a full sync and retries the scan — otherwise the
+            # un-scanned cancellations are stranded.
+            new_sync_token = None
 
     when = datetime.now(UTC).isoformat()
     await db.execute(
@@ -177,7 +182,7 @@ async def scan_full_sync_recurring_cancellations(
     counters: dict,
     affected_ledger_ids: list[int],
     ingest_one: Callable[[dict], Awaitable[tuple[str, Optional[int]]]],
-) -> None:
+) -> int:
     """Recover cancelled recurring instances that a full sync omits.
 
     Full ``events.list`` does NOT return cancelled instance
@@ -189,7 +194,15 @@ async def scan_full_sync_recurring_cancellations(
     instances through ``ingest_one``.  Closes the
     recurring-cancellation-amnesia bug (REWRITE_PLAN.md §8) for
     every source type — client, personal, and native main.
+
+    Returns the number of parents whose instance scan FAILED.  A
+    non-zero return means the caller MUST NOT advance the sync
+    token: the un-scanned cancellations would otherwise be stranded
+    (invisible to the next incremental sync) until the next token
+    expiry.  Keeping the token NULL forces a fresh full sync — which
+    is idempotent — that re-attempts the scan.
     """
+    failed = 0
     for parent_id in recurring_parent_ids:
         try:
             inst_resp = google.list_instances(
@@ -198,9 +211,11 @@ async def scan_full_sync_recurring_cancellations(
             )
         except Exception as e:
             logger.warning(
-                "instance scan failed for %s/%s: %s",
+                "instance scan failed for %s/%s: %s — sync token will "
+                "be held back so the next full sync retries",
                 google_calendar_id, parent_id, e,
             )
+            failed += 1
             continue
         for inst in inst_resp.get("items", []):
             if inst.get("status") != "cancelled":
@@ -212,6 +227,7 @@ async def scan_full_sync_recurring_cancellations(
             counters[outcome] = counters.get(outcome, 0) + 1
             if ledger_id is not None:
                 affected_ledger_ids.append(ledger_id)
+    return failed
 
 
 # ---------------------------------------------------------------------------
