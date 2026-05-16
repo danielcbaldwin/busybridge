@@ -131,7 +131,13 @@ async def ingest_personal_calendar(
             # a full sync and retries the scan.
             new_sync_token = None
 
+    # Record affected ledger ids BEFORE advancing the sync token, so
+    # the token write is the last durable write of the pass (the DB
+    # runs in autocommit).  A crash after this point but before the
+    # token advances just re-ingests idempotently next pass.
     when = datetime.now(UTC).isoformat()
+    if affected_ledger_ids:
+        await _record_affected(db, user_id=user_id, ledger_ids=affected_ledger_ids)
     await db.execute(
         """UPDATE calendar_sync_state
               SET sync_token = ?,
@@ -146,8 +152,6 @@ async def ingest_personal_calendar(
             when, personal_calendar_id,
         ),
     )
-    if affected_ledger_ids:
-        await _record_affected(db, user_id=user_id, ledger_ids=affected_ledger_ids)
     await db.commit()
     return counters
 

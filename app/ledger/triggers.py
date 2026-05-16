@@ -141,10 +141,16 @@ async def claim_due_request(
     # Compare-and-claim: the row is claimable when it is not in-flight,
     # or its in-flight claim is older than STALE_CLAIM_TIMEOUT (a
     # crashed process never released it).
+    #
+    # sources_json is deliberately NOT cleared here.  It carries the
+    # integer ledger-event ids an admin mutation staged via
+    # _append_affected; the reconciler's _consume_affected_ledger_ids
+    # is the sole consumer and clears it once the rows are planned.
+    # Clearing it at claim time silently dropped scheduled admin work.
     stale_cutoff = (now - STALE_CLAIM_TIMEOUT).isoformat()
     cursor = await db.execute(
         """UPDATE reconcile_requests
-              SET in_flight = 1, sources_json = NULL, last_run_at = ?
+              SET in_flight = 1, last_run_at = ?
             WHERE user_id = ?
               AND (in_flight = 0
                    OR last_run_at IS NULL

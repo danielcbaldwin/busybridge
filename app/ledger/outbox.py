@@ -89,6 +89,10 @@ def _is_rate_limited(error: Exception) -> bool:
 # app/sync/google_calendar.py.  Capped at 60s.
 _BACKOFF_SECONDS = (1, 2, 4, 8, 16, 32, 60)
 
+# An op in_flight longer than this was abandoned by a crashed drain:
+# a single op is one Google API call.  Past it the op is reclaimed.
+_STALE_OP_TIMEOUT = timedelta(minutes=15)
+
 
 class OutboxDrainError(Exception):
     """Raised when the drain could not even read the queue."""
@@ -213,6 +217,11 @@ async def drain_user(
         "superseded": 0,
     }
 
+    # Free any op a crashed drain left stuck in_flight; _claim_next
+    # only ever selects pending rows, so without this such an op is
+    # never retried.
+    await _reclaim_stale_operations(db, user_id=user_id, now=now)
+
     for _ in range(max_ops):
         op = await _claim_next(db, user_id=user_id, now=now)
         if op is None:
@@ -227,6 +236,41 @@ async def drain_user(
             continue
         counters[outcome] = counters.get(outcome, 0) + 1
     return counters
+
+
+async def _reclaim_stale_operations(
+    db: aiosqlite.Connection,
+    *,
+    user_id: int,
+    now: datetime,
+) -> int:
+    """Reset outbox ops stuck ``in_flight`` by a crashed drain back to
+    ``pending`` so they are retried.
+
+    ``_claim_next`` only ever selects ``pending`` rows; an op claimed
+    (status ``in_flight``, ``started_at`` stamped) whose drain then
+    died is otherwise stranded forever.  Anything in-flight longer
+    than ``_STALE_OP_TIMEOUT`` — far longer than one Google call — is
+    treated as abandoned.  ``attempts`` was already bumped at claim
+    time, so the reclaimed op simply re-enters the queue.  Returns the
+    number reclaimed.
+    """
+    cutoff = (now - _STALE_OP_TIMEOUT).isoformat()
+    cursor = await db.execute(
+        """UPDATE outbox_operations
+              SET status = ?
+            WHERE user_id = ?
+              AND status = ?
+              AND (started_at IS NULL OR started_at < ?)""",
+        (STATUS_PENDING, user_id, STATUS_IN_FLIGHT, cutoff),
+    )
+    await db.commit()
+    n = cursor.rowcount or 0
+    if n:
+        logger.warning(
+            "reclaimed %s stale in-flight outbox op(s) for user %s", n, user_id,
+        )
+    return n
 
 
 async def _claim_next(

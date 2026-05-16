@@ -53,6 +53,36 @@ async def test_webhook_after_ingest_recorded_ids_does_not_crash():
     await s.close()
 
 
+async def test_claim_preserves_admin_staged_affected_ids():
+    """claim_due_request must NOT clear sources_json.  The reconciler's
+    _consume_affected_ledger_ids is the sole consumer, so the integer
+    ledger ids an admin mutation staged must survive the claim — else
+    scheduled admin work (recolor, cleanup) is silently dropped."""
+    from app.ledger.admin_ops import _append_affected
+    from app.ledger.triggers import claim_due_request
+
+    s = Scenario()
+    s.given_calendar("main")
+    user = await s.given_user("alice", main="main")
+    db = await s.setup_db()
+    uid = user.user_id
+
+    await _append_affected(db, user_id=uid, ledger_ids=[5, 6, 7])
+    await db.commit()
+
+    claimed = await claim_due_request(db, user_id=uid)
+    assert claimed is not None, "the staged request should be claimable"
+
+    row = await (await db.execute(
+        "SELECT sources_json FROM reconcile_requests WHERE user_id = ?",
+        (uid,),
+    )).fetchone()
+    assert row["sources_json"] is not None, \
+        "claim_due_request wrongly cleared the admin-staged affected ids"
+    assert sorted(json.loads(row["sources_json"])) == [5, 6, 7]
+    await s.close()
+
+
 async def test_trigger_path_does_not_write_sources_json():
     """A bare trigger (no prior ingest) leaves sources_json NULL."""
     s = Scenario()

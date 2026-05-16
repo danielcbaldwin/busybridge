@@ -136,7 +136,15 @@ async def ingest_client_calendar(
             # un-scanned cancellations are stranded.
             new_sync_token = None
 
+    # Record affected ledger ids BEFORE advancing the sync token.
+    # The DB runs in autocommit, so the token write must be the last
+    # durable write of the pass: a crash after recording affected ids
+    # but before the token advances simply re-ingests from the old
+    # token next pass (idempotent).  The reverse order would advance
+    # the token first and strand any not-yet-recorded affected ids.
     when = datetime.now(UTC).isoformat()
+    if affected_ledger_ids:
+        await _record_affected(db, user_id=user_id, ledger_ids=affected_ledger_ids)
     await db.execute(
         """UPDATE calendar_sync_state
               SET sync_token = ?,
@@ -152,8 +160,6 @@ async def ingest_client_calendar(
             client_calendar_id,
         ),
     )
-    if affected_ledger_ids:
-        await _record_affected(db, user_id=user_id, ledger_ids=affected_ledger_ids)
     await db.commit()
     return counters
 
