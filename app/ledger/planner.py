@@ -51,7 +51,13 @@ async def plan_for_ledger_event(
     """
     ledger = await _get_ledger_row(db, ledger_event_id)
     user_id = int(ledger["user_id"])
-    desired = _compute_desired_projections(ledger)
+
+    # A modified-instance row's desired state also depends on its
+    # parent series: if the whole series was cancelled or the user
+    # deleted it, the instance must go absent too (REWRITE_PLAN.md
+    # §6) — otherwise it lingers as a ghost.
+    parent_inactive = await _parent_is_inactive(db, ledger)
+    desired = _compute_desired_projections(ledger, parent_inactive=parent_inactive)
 
     active_clients = await _active_client_calendars(db, user_id)
     targets = _resolve_targets(ledger, desired, active_clients)
@@ -78,19 +84,75 @@ async def plan_for_ledger_event(
         keep=written_targets,
         ledger_version=int(ledger["version"]),
     )
+
+    # Cascade: re-plan this series' modified-instance rows so a
+    # change to the parent's lifecycle (e.g. the whole series being
+    # cancelled) propagates to every instance.
+    written += await _replan_instance_children(db, ledger)
+    return written
+
+
+async def _parent_is_inactive(db: aiosqlite.Connection, ledger) -> bool:
+    """For a modified-instance row, True when its parent series has
+    been cancelled or intentionally deleted."""
+    parent_uid = ledger["parent_canonical_uid"]
+    if not parent_uid:
+        return False
+    parent = await (await db.execute(
+        """SELECT status, user_intentionally_deleted
+             FROM ledger_events
+            WHERE user_id = ? AND canonical_uid = ?""",
+        (int(ledger["user_id"]), parent_uid),
+    )).fetchone()
+    if parent is None:
+        return False
+    return (
+        parent["status"] == "cancelled"
+        or bool(parent["user_intentionally_deleted"])
+    )
+
+
+async def _replan_instance_children(db: aiosqlite.Connection, ledger) -> int:
+    """Re-plan every modified-instance row of this series master.
+
+    A no-op for instance rows themselves (no grandchildren) and for
+    non-recurring events.  Depth is bounded at one level.
+    """
+    if ledger["parent_canonical_uid"] is not None:
+        return 0  # this IS an instance — it has no children
+    if not ledger["is_recurring"]:
+        return 0
+    children = await (await db.execute(
+        """SELECT id FROM ledger_events
+            WHERE user_id = ? AND parent_canonical_uid = ?""",
+        (int(ledger["user_id"]), ledger["canonical_uid"]),
+    )).fetchall()
+    written = 0
+    for child in children:
+        written += await plan_for_ledger_event(
+            db, ledger_event_id=int(child["id"]),
+        )
     return written
 
 
 # ---------------------------------------------------------------------------
 # Internal: compute desired
 # ---------------------------------------------------------------------------
-def _compute_desired_projections(ledger) -> dict[str, str]:
+def _compute_desired_projections(
+    ledger, *, parent_inactive: bool = False,
+) -> dict[str, str]:
     """Return ``{role: desired_state}`` keys: 'main', 'peer_clients',
     'origin_client'.  The caller resolves 'peer_clients' against
-    the active client list."""
+    the active client list.
+
+    ``parent_inactive`` carries the lifecycle of a modified
+    instance's parent series — when the series is gone, the
+    instance is too.
+    """
     if (
         bool(ledger["user_intentionally_deleted"])
         or ledger["status"] == "cancelled"
+        or parent_inactive
     ):
         return {"main": ABSENT, "peer_clients": ABSENT, "origin_client": ABSENT}
 
