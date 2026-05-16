@@ -357,9 +357,17 @@ async def force_user_reauth(
 @router.delete("/users/{user_id}")
 async def delete_user(
     user_id: int,
+    force: bool = False,
     admin: User = Depends(require_admin),
 ):
-    """Delete a user and all their data."""
+    """Delete a user and all their data.
+
+    The user's BusyBridge-managed Google events are drained first.  If
+    that drain cannot complete (e.g. a revoked token) the deletion is
+    refused with HTTP 409 — unless ``force=true`` is passed, which
+    deletes the user anyway and accepts that those events are left
+    orphaned on Google.
+    """
     if user_id == admin.id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -396,7 +404,6 @@ async def delete_user(
     # inside a reconcile pass.  Without this, DELETE FROM users
     # cascades the ledger/outbox away and the BusyBridge-managed
     # events are orphaned on Google with nothing left to track them.
-    # Best-effort: a revoked token must not block the user deletion.
     try:
         from app.ledger.runtime import reconcile_user_by_id
         await reconcile_user_by_id(user_id)
@@ -404,6 +411,33 @@ async def delete_user(
         logger.warning(
             "could not drain Google deletes before deleting user %s: %s",
             user_id, e,
+        )
+
+    # Verify the managed events were actually removed.  A projection
+    # still 'present' means the delete did not reach Google (typically
+    # a revoked token) — refuse the deletion unless the admin
+    # explicitly forces it and accepts the orphans.
+    remaining = await (await db.execute(
+        """SELECT COUNT(*) AS n FROM ledger_projections p
+             JOIN ledger_events e ON e.id = p.ledger_event_id
+            WHERE e.user_id = ? AND p.current_state = 'present'""",
+        (user_id,),
+    )).fetchone()
+    orphan_count = int(remaining["n"] or 0)
+    if orphan_count and not force:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"{orphan_count} BusyBridge-managed event(s) could not be "
+                f"removed from Google (likely a revoked token). Resolve the "
+                f"account and retry, or pass force=true to delete the user "
+                f"anyway and leave those events orphaned on Google."
+            ),
+        )
+    if orphan_count:
+        logger.warning(
+            "force-deleting user %s leaves %d orphaned Google event(s)",
+            user_id, orphan_count,
         )
 
     # Delete user (cascades to related records)
@@ -596,7 +630,9 @@ async def trigger_consistency_check(
                  JOIN ledger_events e ON e.id = p.ledger_event_id
                 WHERE e.user_id = ?
                   AND (p.applied_ledger_version IS NULL
-                       OR p.applied_ledger_version != p.desired_ledger_version)""",
+                       OR p.applied_ledger_version != p.desired_ledger_version
+                       OR p.applied_payload_hash IS NULL
+                       OR p.applied_payload_hash != p.desired_payload_hash)""",
             (uid,),
         )).fetchone()
         summary["diverged_projections"] += int(row["n"] or 0)

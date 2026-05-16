@@ -181,6 +181,10 @@ async def integrity_status_for_user(
     """
     ob = await outbox_summary(db, user_id=user_id)
     permanent_failures = int(ob.get("permanent_failure", 0))
+    # Mirror the diff's own divergence test: a same-version payload
+    # change (e.g. a cleanup setting desired to absent) diverges via
+    # the hash even when the ledger version is unchanged.  Checking
+    # only the version would leave such changes invisible here.
     diverged_row = await (await db.execute(
         """SELECT COUNT(*) AS n
              FROM ledger_projections p
@@ -188,7 +192,9 @@ async def integrity_status_for_user(
             WHERE e.user_id = ?
               AND p.permanently_failed = 0
               AND (p.applied_ledger_version IS NULL
-                   OR p.applied_ledger_version != p.desired_ledger_version)""",
+                   OR p.applied_ledger_version != p.desired_ledger_version
+                   OR p.applied_payload_hash IS NULL
+                   OR p.applied_payload_hash != p.desired_payload_hash)""",
         (user_id,),
     )).fetchone()
     diverged = int(diverged_row["n"] or 0)

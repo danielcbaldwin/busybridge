@@ -183,6 +183,7 @@ async def store_oauth_tokens(
             access_token_encrypted, refresh_token_encrypted, token_expiry, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(user_id, google_account_email) DO UPDATE SET
+           account_type = excluded.account_type,
            access_token_encrypted = excluded.access_token_encrypted,
            refresh_token_encrypted = excluded.refresh_token_encrypted,
            token_expiry = excluded.token_expiry,

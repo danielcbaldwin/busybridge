@@ -78,6 +78,34 @@ async def test_integrity_warning_on_a_diverged_projection():
     await s.close()
 
 
+async def test_integrity_warns_on_a_hash_only_divergence():
+    """A projection at the same ledger version but a changed payload
+    hash (e.g. cleanup set desired to absent) is still diverged — the
+    integrity check must count it, not just version mismatches."""
+    s = Scenario()
+    s.given_calendar("main")
+    user = await s.given_user("alice", main="main")
+    db = await s.setup_db()
+
+    ev = await _event(db, user.user_id)
+    await db.execute(
+        """INSERT INTO ledger_projections
+              (ledger_event_id, target_kind, desired_state,
+               desired_payload_hash, desired_ledger_version,
+               applied_ledger_version, applied_payload_hash,
+               current_state, permanently_failed)
+           VALUES (?, 'main', 'absent', 'absent', 1, 1,
+                   'stale-create-hash', 'present', 0)""",
+        (ev,),
+    )
+    await db.commit()
+
+    out = await facade.integrity_status_for_user(db, user_id=user.user_id)
+    assert out["status"] == "warning"
+    assert out["diverged"] == 1
+    await s.close()
+
+
 async def test_integrity_error_on_a_permanent_failure():
     s = Scenario()
     s.given_calendar("main")

@@ -105,6 +105,28 @@ async def list_permanent_failures(
 # ---------------------------------------------------------------------------
 # Admin operations
 # ---------------------------------------------------------------------------
+async def _verify_calendar_owner(
+    db, user_id: int, client_calendar_id: int,
+) -> None:
+    """Reject the request unless ``client_calendar_id`` belongs to
+    ``user_id``.
+
+    The low-level admin ops (recolor / cleanup / disconnect) update
+    ``client_calendars`` by id alone, with no user predicate — so a
+    mistyped ``{user_id}``/``{client_calendar_id}`` pair must not be
+    allowed to mutate another user's calendar.
+    """
+    row = await (await db.execute(
+        "SELECT 1 FROM client_calendars WHERE id = ? AND user_id = ?",
+        (client_calendar_id, user_id),
+    )).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Calendar {client_calendar_id} not found for user {user_id}"
+            ),
+        )
 @router.post("/users/{user_id}/recolor-calendar/{client_calendar_id}")
 async def recolor_calendar(
     user_id: int,
@@ -115,6 +137,7 @@ async def recolor_calendar(
     """Change a client calendar's color and bump every sourced
     ledger row so projections re-render on the next reconcile."""
     db = await get_database()
+    await _verify_calendar_owner(db, user_id, client_calendar_id)
     n = await admin_ops.recolor_client_calendar(
         db,
         client_calendar_id=client_calendar_id,
@@ -133,6 +156,7 @@ async def cleanup_calendar(
     targeting it to absent + clear sync token.  The next reconcile
     drains the deletes then full-syncs back."""
     db = await get_database()
+    await _verify_calendar_owner(db, user_id, client_calendar_id)
     await admin_ops.cleanup_one_calendar(
         db, user_id=user_id, client_calendar_id=client_calendar_id,
     )
@@ -204,6 +228,7 @@ async def disconnect_calendar(
     ingested or written to.  Stronger than cleanup-calendar
     (which leaves the calendar active for future re-sync)."""
     db = await get_database()
+    await _verify_calendar_owner(db, user_id, client_calendar_id)
     await admin_ops.disconnect_calendar(
         db, user_id=user_id, client_calendar_id=client_calendar_id,
     )

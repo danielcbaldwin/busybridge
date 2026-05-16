@@ -530,6 +530,24 @@ def test_e2e_delete_user_drains_google_events(authed_client, seeded_app):
     assert main_after == [], "managed event orphaned after user deletion"
 
 
+def test_e2e_ledger_admin_rejects_a_foreign_calendar(
+    authed_client, seeded_app,
+):
+    """A ledger-admin calendar mutation must reject a {user_id} /
+    {client_calendar_id} pair that do not belong together — the
+    low-level ops update by calendar id with no user predicate."""
+    client_a = seeded_app["client_a_id"]
+    # User 99999 does not own client_a.
+    r = authed_client.post(
+        f"/api/admin/ledger/users/99999/cleanup-calendar/{client_a}"
+    )
+    assert r.status_code == 404, r.text
+    r = authed_client.post(
+        f"/api/admin/ledger/users/99999/disconnect-calendar/{client_a}"
+    )
+    assert r.status_code == 404, r.text
+
+
 def test_e2e_client_calendar_list_handles_unsynced_calendars(
     authed_client, seeded_app,
 ):

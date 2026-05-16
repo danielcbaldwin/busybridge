@@ -541,6 +541,17 @@ async def _scenario_setup_db(self: Scenario) -> aiosqlite.Connection:
             is_sensitive BOOLEAN DEFAULT FALSE,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE webhook_channels (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            calendar_type TEXT NOT NULL,
+            client_calendar_id INTEGER REFERENCES client_calendars(id),
+            channel_id TEXT NOT NULL UNIQUE,
+            resource_id TEXT NOT NULL,
+            token TEXT NOT NULL DEFAULT '',
+            expiration TIMESTAMP NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE client_calendars (
             id INTEGER PRIMARY KEY,
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

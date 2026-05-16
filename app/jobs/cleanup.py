@@ -136,11 +136,25 @@ async def run_retention_cleanup() -> dict:
     calendar_cutoff = (
         now - timedelta(days=settings.disconnected_calendar_retention_days)
     ).isoformat()
+    # Only purge a disconnected calendar once nothing in the ledger
+    # still needs its google_calendar_id mapping: a projection that is
+    # still present on Google, permanently failed, or diverged still
+    # owes a delete that the outbox routes via this calendar.  Purging
+    # early would strand that delete (and may trip an FK).
     cursor = await db.execute(
         """DELETE FROM client_calendars
             WHERE is_active = FALSE
               AND disconnected_at IS NOT NULL
               AND disconnected_at < ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM ledger_projections p
+                   WHERE p.target_calendar_id = client_calendars.id
+                     AND (p.current_state = 'present'
+                          OR p.permanently_failed = 1
+                          OR p.applied_ledger_version IS NULL
+                          OR p.applied_ledger_version != p.desired_ledger_version
+                          OR p.applied_payload_hash != p.desired_payload_hash)
+              )
             RETURNING id""",
         (calendar_cutoff,),
     )
