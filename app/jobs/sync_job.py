@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from app.database import get_database, get_setting, set_setting
+from app.database import get_database, get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -97,10 +97,21 @@ async def _alert_failing_calendars() -> None:
 
 
 async def _check_circuit_breaker() -> None:
-    """Auto-pause sync if every active calendar is consistently failing."""
+    """Auto-pause an individual user's sync when every one of their
+    active calendars is consistently failing.
+
+    The pause is PER-USER (``users.sync_paused``) — one user's dead
+    calendars must never stop sync for every other user.  Each
+    affected user is paused independently; users already paused are
+    skipped so the breaker does not re-alert them every tick.
+    """
     db = await get_database()
     cursor = await db.execute(
-        "SELECT DISTINCT user_id FROM client_calendars WHERE is_active = TRUE",
+        """SELECT DISTINCT cc.user_id
+             FROM client_calendars cc
+             JOIN users u ON u.id = cc.user_id
+            WHERE cc.is_active = TRUE
+              AND COALESCE(u.sync_paused, 0) = 0""",
     )
     user_ids = [row["user_id"] for row in await cursor.fetchall()]
 
@@ -120,22 +131,27 @@ async def _check_circuit_breaker() -> None:
         if total == 0 or failing < total:
             continue
         logger.error(
-            "Circuit breaker: ALL %d calendars for user %d have %d+ consecutive failures. "
-            "Auto-pausing sync.",
+            "Circuit breaker: all %d calendars for user %d have %d+ "
+            "consecutive failures — pausing this user's sync.",
             total, user_id, _CIRCUIT_BREAKER_THRESHOLD,
         )
-        await set_setting("sync_paused", "true")
+        await db.execute(
+            "UPDATE users SET sync_paused = 1 WHERE id = ?", (user_id,),
+        )
+        await db.commit()
         from app.alerts.email import queue_alert
         await queue_alert(
             alert_type="circuit_breaker",
             user_id=user_id,
             details=(
-                f"Sync has been automatically paused because all {total} calendars "
-                f"have failed {_CIRCUIT_BREAKER_THRESHOLD}+ times consecutively. "
-                f"Check your connected accounts and resume sync from the settings page."
+                f"Sync has been automatically paused for your account "
+                f"because all {total} of your connected calendars have "
+                f"failed {_CIRCUIT_BREAKER_THRESHOLD}+ times in a row. "
+                f"Check your connected accounts and resume sync from the "
+                f"settings page."
             ),
         )
-        return
+        # Do NOT return — pause every affected user, not just the first.
 
 
 async def run_consistency_check_job() -> None:

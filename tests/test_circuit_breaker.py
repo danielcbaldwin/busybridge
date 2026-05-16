@@ -1,8 +1,10 @@
 """Circuit breaker (REWRITE_PLAN.md §12).
 
-When EVERY active calendar for a user has failed to sync 3+ times
-in a row, the circuit breaker auto-pauses sync globally and emails
-the user.  A single healthy calendar keeps the breaker open.
+When EVERY active calendar for a user has failed 3+ times in a row,
+the breaker auto-pauses THAT USER's sync (the per-user
+``users.sync_paused`` flag) and emails them.  It is per-user: one
+user's dead calendars must never pause sync for everyone else, and
+a single healthy calendar keeps a user's breaker open.
 """
 
 from __future__ import annotations
@@ -47,12 +49,14 @@ async def _calendar(db, user_id: int, gid: str, *, failures: int) -> None:
     )
 
 
-async def _is_paused() -> bool:
-    setting = await get_setting("sync_paused")
-    return bool(setting and setting.get("value_plain") == "true")
+async def _is_paused(db, user_id: int) -> bool:
+    row = await (await db.execute(
+        "SELECT sync_paused FROM users WHERE id = ?", (user_id,),
+    )).fetchone()
+    return bool(row and row["sync_paused"])
 
 
-async def test_circuit_breaker_pauses_when_all_calendars_failing(
+async def test_circuit_breaker_pauses_only_the_failing_user(
     test_db, monkeypatch,
 ):
     db = await get_database()
@@ -69,10 +73,39 @@ async def test_circuit_breaker_pauses_when_all_calendars_failing(
     monkeypatch.setattr("app.alerts.email.queue_alert", fake_queue_alert)
     await _check_circuit_breaker()
 
-    assert await _is_paused(), "sync was not paused when all calendars fail"
+    assert await _is_paused(db, uid)
     assert len(alerts) == 1
     assert alerts[0]["alert_type"] == "circuit_breaker"
     assert alerts[0]["user_id"] == uid
+    # The GLOBAL pause switch must NOT be flipped — only this user.
+    assert await get_setting("sync_paused") is None
+
+
+async def test_circuit_breaker_does_not_pause_other_users(
+    test_db, monkeypatch,
+):
+    """One user's all-failing calendars must not pause anyone else —
+    the per-user-detection / global-effect bug."""
+    db = await get_database()
+    failing = await _user(db, "failing@example.com")
+    await _calendar(db, failing, "f1@g", failures=4)
+    await _calendar(db, failing, "f2@g", failures=4)
+    healthy = await _user(db, "healthy@example.com")
+    await _calendar(db, healthy, "h1@g", failures=0)
+    await _calendar(db, healthy, "h2@g", failures=0)
+    await db.commit()
+
+    async def fake_queue_alert(**kwargs):
+        pass
+
+    monkeypatch.setattr("app.alerts.email.queue_alert", fake_queue_alert)
+    await _check_circuit_breaker()
+
+    assert await _is_paused(db, failing)
+    assert not await _is_paused(db, healthy), (
+        "a healthy user was paused by another user's circuit breaker"
+    )
+    assert await get_setting("sync_paused") is None
 
 
 async def test_circuit_breaker_stays_open_when_one_calendar_is_healthy(
@@ -92,7 +125,5 @@ async def test_circuit_breaker_stays_open_when_one_calendar_is_healthy(
     monkeypatch.setattr("app.alerts.email.queue_alert", fake_queue_alert)
     await _check_circuit_breaker()
 
-    assert not await _is_paused(), (
-        "sync was paused despite a healthy calendar"
-    )
+    assert not await _is_paused(db, uid)
     assert alerts == []
