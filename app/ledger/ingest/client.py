@@ -230,19 +230,20 @@ async def _ingest_one_event(
     status = event.get("status", "confirmed")
 
     # 1. Loop-prevention: skip events we wrote (deterministic IDs
-    # plus an exact projection lookup as defence-in-depth).
-    if is_managed_google_event_id(event_id):
-        # Even if we wrote it, ingest needs to see status=cancelled
-        # for our own deletes — but those should already be removed
-        # from the source by definition.  Skip silently.
-        return "skipped", None
+    # plus an exact projection lookup as defence-in-depth).  Before
+    # skipping, check whether one of our busy blocks has drifted —
+    # the user moved or edited it on the client calendar — and if so
+    # re-assert our canonical payload (revert-on-drift, now uniform
+    # on client targets too; REWRITE_PLAN.md §9).
     proj_match = await (await db.execute(
-        """SELECT id FROM ledger_projections
+        """SELECT id, google_etag FROM ledger_projections
             WHERE google_event_id = ?
             LIMIT 1""",
         (event_id,),
     )).fetchone()
-    if proj_match is not None:
+    if proj_match is not None or is_managed_google_event_id(event_id):
+        if proj_match is not None:
+            await _maybe_revert_client_drift(db, proj_match, event)
         return "skipped", None
 
     # 2. Recurring-event INSTANCE (modified or cancelled).  Route
@@ -321,6 +322,36 @@ async def _ingest_one_event(
         user_email=user_email,
     )
     return ("updated" if changed else "skipped"), int(existing["id"])
+
+
+async def _maybe_revert_client_drift(
+    db: aiosqlite.Connection, proj_match, event: dict,
+) -> None:
+    """Revert-on-drift for one of our own writes on a client calendar.
+
+    A busy block we wrote carries the etag Google returned, stored on
+    the projection.  If the etag delivered by a later sync differs,
+    the user moved or edited the busy block — clear the projection's
+    ``applied_ledger_version`` so the diff re-asserts our canonical
+    payload, and refresh ``google_etag`` so the corrective
+    ``events.update`` is not rejected by ``If-Match``
+    (REWRITE_PLAN.md §9; uniform with the main-copy revert).
+
+    A user-deleted busy block (status=cancelled) is left alone here —
+    re-creation on demand is out of this path's scope.
+    """
+    if event.get("status") == "cancelled":
+        return
+    ev_etag = event.get("etag")
+    stored = proj_match["google_etag"]
+    if ev_etag and stored and ev_etag != stored:
+        await db.execute(
+            """UPDATE ledger_projections
+                  SET applied_ledger_version = NULL,
+                      google_etag = ?
+                WHERE id = ?""",
+            (ev_etag, int(proj_match["id"])),
+        )
 
 
 # ---------------------------------------------------------------------------
