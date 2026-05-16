@@ -14,6 +14,29 @@ router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
 _wh_limit = f"{get_settings().webhook_rate_limit_per_minute}/minute"
 
+# User ids with a webhook-triggered delayed drain already scheduled.
+# enqueue_webhook already debounces the reconcile request itself, so a
+# burst of webhooks for one user must collapse into a SINGLE delayed
+# drain task — otherwise every POST spawns its own sleep-then-reconcile
+# coroutine and a flood stacks them without bound.
+_pending_webhook_drains: set[int] = set()
+
+
+def _claim_webhook_drain(user_id: int) -> bool:
+    """Return True when the caller should spawn a delayed drain for
+    this user, False when one is already pending (the new webhook
+    folds into it via the debounced reconcile request)."""
+    if user_id in _pending_webhook_drains:
+        return False
+    _pending_webhook_drains.add(user_id)
+    return True
+
+
+def _release_webhook_drain(user_id: int) -> None:
+    """Mark a user's delayed drain as finished so the next webhook can
+    schedule a fresh one."""
+    _pending_webhook_drains.discard(user_id)
+
 
 @router.post("/google-calendar")
 @limiter.limit(_wh_limit)
@@ -136,25 +159,35 @@ async def receive_google_calendar_webhook(
             hint = f"personal:{channel['client_calendar_id']}"
         else:
             hint = f"client:{channel['client_calendar_id']}"
-        await enqueue_webhook(db, user_id=channel["user_id"], source_hint=hint)
+        user_id = channel["user_id"]
+        await enqueue_webhook(db, user_id=user_id, source_hint=hint)
 
         # Sleep ~5s, then drain.  Run as a background task so the
         # webhook ack is fast; the sleep gives Google's eventual-
-        # consistency window time to settle before we ingest.
-        async def _delayed_drain(user_id: int) -> None:
-            import asyncio
-            await asyncio.sleep(5)
-            try:
-                await reconcile_user_by_id(user_id)
-            except Exception:
-                logger.exception(
-                    "webhook-triggered reconcile failed for user %s", user_id,
-                )
+        # consistency window time to settle before we ingest.  At most
+        # one such task per user is in flight — a webhook arriving
+        # while one is pending folds into the debounced request above.
+        if _claim_webhook_drain(user_id):
+            async def _delayed_drain(uid: int) -> None:
+                import asyncio
+                try:
+                    await asyncio.sleep(5)
+                    await reconcile_user_by_id(uid)
+                except Exception:
+                    logger.exception(
+                        "webhook-triggered reconcile failed for user %s", uid,
+                    )
+                finally:
+                    _release_webhook_drain(uid)
 
-        create_background_task(
-            _delayed_drain(channel["user_id"]),
-            f"webhook_drain_user_{channel['user_id']}",
-        )
+            create_background_task(
+                _delayed_drain(user_id),
+                f"webhook_drain_user_{user_id}",
+            )
+        else:
+            logger.debug(
+                "webhook drain already pending for user %s — folded", user_id,
+            )
     except Exception as e:
         logger.warning("ledger webhook enqueue/drain failed: %s", e)
 
