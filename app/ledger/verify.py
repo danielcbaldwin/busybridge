@@ -28,6 +28,7 @@ from typing import Any, Optional
 
 import aiosqlite
 
+from app.ledger.async_google import as_async_google
 from app.ledger.google_client import GoogleClient
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,7 @@ async def verify_user(
           "divergences": [str],    # human-readable mismatch list
         }
     """
+    google = as_async_google(google)
     rows = await (await db.execute(
         """SELECT p.id, p.target_kind, p.target_calendar_id,
                   p.current_state, p.google_event_id,
@@ -84,7 +86,7 @@ async def verify_user(
         if current == "present" and gid:
             checked += 1
             try:
-                ev = google.get_event(target_cal, gid)
+                ev = await google.get_event(target_cal, gid)
             except Exception as e:
                 if getattr(e, "status", None) in (404, 410):
                     divergences.append(
@@ -108,7 +110,7 @@ async def verify_user(
             checked += 1
             # Ledger believes it deleted this; confirm Google agrees.
             try:
-                ev = google.get_event(target_cal, gid)
+                ev = await google.get_event(target_cal, gid)
                 if ev.get("status") != "cancelled":
                     divergences.append(
                         f"projection {r['id']} ({r['summary']!r}): ledger "

@@ -24,6 +24,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 import aiosqlite
 
+from app.ledger.async_google import as_async_google
 from app.ledger.google_client import GoogleClient
 from app.ledger.identity import (
     canonical_uid_client,
@@ -51,6 +52,7 @@ async def ingest_client_calendar(
     ``reconcile_requests.sources_json`` so the reconciler picks
     them up for planning.
     """
+    google = as_async_google(google)
     state = await _get_or_create_sync_state(db, client_calendar_id)
     sync_token: Optional[str] = state["sync_token"]
     counters = {
@@ -68,7 +70,7 @@ async def ingest_client_calendar(
 
     while True:
         try:
-            page = google.list_events(
+            page = await google.list_events(
                 google_calendar_id,
                 # Google's sync guide: every page of an incremental
                 # sync carries the SAME syncToken (plus pageToken for
@@ -215,7 +217,7 @@ async def scan_full_sync_recurring_cancellations(
     failed = 0
     for parent_id in recurring_parent_ids:
         try:
-            inst_resp = google.list_instances(
+            inst_resp = await google.list_instances(
                 google_calendar_id, parent_id,
                 show_deleted=True, max_results=2500,
             )

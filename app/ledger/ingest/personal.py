@@ -20,6 +20,7 @@ from typing import Optional
 
 import aiosqlite
 
+from app.ledger.async_google import as_async_google
 from app.ledger.google_client import GoogleClient
 from app.ledger.identity import (
     canonical_uid_personal,
@@ -56,6 +57,7 @@ async def ingest_personal_calendar(
     ``calendar_type='personal'``; the sync state lives on the same
     ``calendar_sync_state`` row keyed by client_calendar_id.
     """
+    google = as_async_google(google)
     state = await _get_or_create_sync_state(db, personal_calendar_id)
     sync_token: Optional[str] = state["sync_token"]
     counters: dict[str, int] = {
@@ -70,7 +72,7 @@ async def ingest_personal_calendar(
 
     while True:
         try:
-            page = google.list_events(
+            page = await google.list_events(
                 google_calendar_id,
                 # Google's sync guide: every page of an incremental
                 # sync carries the SAME syncToken (plus pageToken for

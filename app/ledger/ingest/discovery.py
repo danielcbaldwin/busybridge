@@ -26,6 +26,7 @@ from typing import Iterable, Optional
 
 import aiosqlite
 
+from app.ledger.async_google import as_async_google
 from app.ledger.google_client import GoogleClient
 from app.ledger.identity import is_managed_google_event_id
 from app.ledger.outbox import OP_DELETE, enqueue
@@ -49,6 +50,7 @@ async def discover_orphans(
     Returns counters: ``{scanned_calendars, candidates_seen,
     relinked, orphans_deleted}``.
     """
+    google = as_async_google(google)
     counters = {
         "scanned_calendars": 0,
         "candidates_seen": 0,
@@ -62,9 +64,9 @@ async def discover_orphans(
 
     for google_cal, client_cal_db_id in targets:
         counters["scanned_calendars"] += 1
-        candidates = list(
-            _iter_candidates_on_calendar(google, google_cal),
-        )
+        candidates = [
+            c async for c in _iter_candidates_on_calendar(google, google_cal)
+        ]
         counters["candidates_seen"] += len(candidates)
 
         for event in candidates:
@@ -81,16 +83,18 @@ async def discover_orphans(
     return counters
 
 
-def _iter_candidates_on_calendar(
-    google: GoogleClient, calendar_id: str,
-) -> Iterable[dict]:
+async def _iter_candidates_on_calendar(
+    google, calendar_id: str,
+):
     """Pull all events from ``calendar_id`` that match either of
     our two ownership signals (deterministic ID prefix OR
-    ``bb_proj_id`` private extended property)."""
+    ``bb_proj_id`` private extended property).
+
+    An async generator: ``google`` is the awaitable client adapter."""
     page_token = None
     while True:
         try:
-            page = google.list_events(
+            page = await google.list_events(
                 calendar_id,
                 page_token=page_token,
                 show_deleted=False,

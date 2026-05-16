@@ -37,6 +37,7 @@ from typing import Any, Optional
 
 import aiosqlite
 
+from app.ledger.async_google import as_async_google
 from app.ledger.google_client import GoogleClient
 from app.ledger.identity import derive_google_event_id
 
@@ -211,6 +212,9 @@ async def drain_user(
     Returns a dict of counters: ``{processed, succeeded, retried,
     failed_permanent, superseded}``.
     """
+    # Google calls are offloaded to worker threads (see async_google)
+    # so a slow request cannot block the event loop.  Idempotent.
+    google = as_async_google(google)
     now = now or datetime.now(UTC)
     counters = {
         "processed": 0,
@@ -359,7 +363,7 @@ async def _do_create(
     body = dict(payload)
     body["id"] = google_id
     try:
-        result = google.insert_event(cal_id, body)
+        result = await google.insert_event(cal_id, body)
     except Exception as e:
         if getattr(e, "status", None) == 409:
             # The ID is already on Google.  Two cases:
@@ -368,9 +372,9 @@ async def _do_create(
             # * Concurrent edit (e.g. user dragged our copy on main):
             #   existing event differs from our intended payload.
             #   We own this ID by construction; UPDATE to restore.
-            existing = google.get_event(cal_id, google_id)
+            existing = await google.get_event(cal_id, google_id)
             try:
-                result = google.update_event(
+                result = await google.update_event(
                     cal_id, google_id, payload,
                     if_match=existing.get("etag"),
                 )
@@ -421,7 +425,7 @@ async def _do_update(
             "the create must succeed first"
         )
     try:
-        result = google.update_event(
+        result = await google.update_event(
             cal_id,
             proj["google_event_id"],
             payload,
@@ -433,7 +437,7 @@ async def _do_update(
             # the correct If-Match.  Without this, we'd ping-pong on
             # 412 forever.
             try:
-                fresh = google.get_event(cal_id, proj["google_event_id"])
+                fresh = await google.get_event(cal_id, proj["google_event_id"])
                 await db.execute(
                     """UPDATE ledger_projections
                           SET google_etag = ?
@@ -509,7 +513,7 @@ async def _do_delete(
         await _record_absent(db, op, now=now)
         return
     try:
-        google.delete_event(cal_id, proj["google_event_id"])
+        await google.delete_event(cal_id, proj["google_event_id"])
     except Exception as e:
         if getattr(e, "status", None) in (404, 410):
             pass  # already gone
@@ -551,7 +555,7 @@ async def _do_patch(
         await _record_rsvp_applied(db, op, now=now)
         return "succeeded"
     try:
-        google.patch_event(cal_id, led["source_event_id"], payload)
+        await google.patch_event(cal_id, led["source_event_id"], payload)
     except Exception as e:
         if getattr(e, "status", None) in (404, 410):
             await _record_rsvp_applied(db, op, now=now)

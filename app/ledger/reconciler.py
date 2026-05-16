@@ -20,6 +20,7 @@ from typing import Optional
 
 import aiosqlite
 
+from app.ledger.async_google import as_async_google
 from app.ledger.diff import diff_and_enqueue_for_user
 from app.ledger.google_client import GoogleClient
 from app.ledger.ingest import (
@@ -110,6 +111,12 @@ async def reconcile_user(
 
     Returns a counters dict aggregating each phase.
     """
+    # Offload every Google call to a worker thread (see async_google):
+    # the GoogleClient protocol is synchronous, so a blocking call
+    # would otherwise freeze the event loop.  Idempotent if already
+    # wrapped.
+    google = as_async_google(google)
+
     # Pause handling has two modes (see _pause_mode):
     #  * global  — a HARD freeze: skip ingest AND diff AND drain.
     #               Nothing is written to Google at all.

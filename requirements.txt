@@ -9,6 +9,10 @@ httpx==0.28.1
 google-api-python-client==2.196.0
 google-auth==2.52.0
 google-auth-oauthlib==1.4.0
+# Imported directly by app/ledger/real_google_client.py (the socket
+# timeout), so pinned explicitly rather than relied on transitively.
+google-auth-httplib2==0.4.0
+httplib2==0.20.4
 apscheduler==3.11.2
 cryptography==48.0.0
 pydantic==2.13.4
