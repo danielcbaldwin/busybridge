@@ -49,6 +49,15 @@ async def _calendar(db, user_id: int, gid: str, *, failures: int) -> None:
     )
 
 
+async def _webcal(db, user_id: int, url: str, *, failures: int) -> None:
+    await db.execute(
+        """INSERT INTO webcal_subscriptions
+              (user_id, url, is_active, consecutive_failures)
+           VALUES (?, ?, 1, ?)""",
+        (user_id, url, failures),
+    )
+
+
 async def _is_paused(db, user_id: int) -> bool:
     row = await (await db.execute(
         "SELECT sync_paused FROM users WHERE id = ?", (user_id,),
@@ -127,3 +136,67 @@ async def test_circuit_breaker_stays_open_when_one_calendar_is_healthy(
 
     assert not await _is_paused(db, uid)
     assert alerts == []
+
+
+async def test_webcal_only_user_trips_the_breaker(test_db, monkeypatch):
+    """A user whose only sync sources are webcal feeds must still be
+    caught — webcal feeds carry their own failure counter, and the
+    breaker used to count Google calendars exclusively."""
+    db = await get_database()
+    uid = await _user(db, "webcal-only@example.com")
+    await _webcal(db, uid, "https://feed.example/a.ics", failures=3)
+    await _webcal(db, uid, "https://feed.example/b.ics", failures=7)
+    await db.commit()
+
+    alerts: list[dict] = []
+
+    async def fake_queue_alert(**kwargs):
+        alerts.append(kwargs)
+
+    monkeypatch.setattr("app.alerts.email.queue_alert", fake_queue_alert)
+    await _check_circuit_breaker()
+
+    assert await _is_paused(db, uid)
+    assert len(alerts) == 1 and alerts[0]["alert_type"] == "circuit_breaker"
+
+
+async def test_healthy_webcal_keeps_the_breaker_open(test_db, monkeypatch):
+    """One healthy webcal feed counts as a working source — the user's
+    breaker must stay open even though every Google calendar fails."""
+    db = await get_database()
+    uid = await _user(db, "mixed@example.com")
+    await _calendar(db, uid, "c1@g", failures=9)   # failing
+    await _webcal(db, uid, "https://feed.example/ok.ics", failures=0)  # healthy
+    await db.commit()
+
+    alerts: list[dict] = []
+
+    async def fake_queue_alert(**kwargs):
+        alerts.append(kwargs)
+
+    monkeypatch.setattr("app.alerts.email.queue_alert", fake_queue_alert)
+    await _check_circuit_breaker()
+
+    assert not await _is_paused(db, uid), (
+        "a working webcal feed should keep the breaker open"
+    )
+    assert alerts == []
+
+
+async def test_failing_webcal_trips_breaker_with_failing_calendars(
+    test_db, monkeypatch,
+):
+    """Calendars and feeds are tallied together: all failing → pause."""
+    db = await get_database()
+    uid = await _user(db, "alldead@example.com")
+    await _calendar(db, uid, "c1@g", failures=4)
+    await _webcal(db, uid, "https://feed.example/dead.ics", failures=4)
+    await db.commit()
+
+    async def fake_queue_alert(**kwargs):
+        pass
+
+    monkeypatch.setattr("app.alerts.email.queue_alert", fake_queue_alert)
+    await _check_circuit_breaker()
+
+    assert await _is_paused(db, uid)

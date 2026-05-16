@@ -98,25 +98,36 @@ async def _alert_failing_calendars() -> None:
 
 async def _check_circuit_breaker() -> None:
     """Auto-pause an individual user's sync when every one of their
-    active calendars is consistently failing.
+    active sync sources is consistently failing.
 
     The pause is PER-USER (``users.sync_paused``) — one user's dead
     calendars must never stop sync for every other user.  Each
     affected user is paused independently; users already paused are
     skipped so the breaker does not re-alert them every tick.
+
+    "Every sync source" spans both Google calendars
+    (``client_calendars`` — client + personal) and webcal
+    subscriptions (``webcal_subscriptions``).  Webcal feeds carry
+    their own ``consecutive_failures`` counter; counting only the
+    Google calendars would let a user whose every webcal feed is dead
+    (or who has only webcal feeds) slip past the breaker entirely.
     """
     db = await get_database()
     cursor = await db.execute(
-        """SELECT DISTINCT cc.user_id
-             FROM client_calendars cc
-             JOIN users u ON u.id = cc.user_id
-            WHERE cc.is_active = TRUE
-              AND COALESCE(u.sync_paused, 0) = 0""",
+        """SELECT DISTINCT u.id AS user_id
+             FROM users u
+            WHERE COALESCE(u.sync_paused, 0) = 0
+              AND (
+                  EXISTS (SELECT 1 FROM client_calendars cc
+                           WHERE cc.user_id = u.id AND cc.is_active = TRUE)
+               OR EXISTS (SELECT 1 FROM webcal_subscriptions ws
+                           WHERE ws.user_id = u.id AND ws.is_active = TRUE)
+              )""",
     )
     user_ids = [row["user_id"] for row in await cursor.fetchall()]
 
     for user_id in user_ids:
-        cursor = await db.execute(
+        cal_row = await (await db.execute(
             """SELECT COUNT(*) as total,
                       SUM(CASE WHEN COALESCE(css.consecutive_failures, 0) >= ?
                                THEN 1 ELSE 0 END) as failing
@@ -124,10 +135,17 @@ async def _check_circuit_breaker() -> None:
                LEFT JOIN calendar_sync_state css ON cc.id = css.client_calendar_id
                WHERE cc.user_id = ? AND cc.is_active = TRUE""",
             (_CIRCUIT_BREAKER_THRESHOLD, user_id),
-        )
-        row = await cursor.fetchone()
-        total = row["total"] or 0
-        failing = row["failing"] or 0
+        )).fetchone()
+        webcal_row = await (await db.execute(
+            """SELECT COUNT(*) as total,
+                      SUM(CASE WHEN COALESCE(consecutive_failures, 0) >= ?
+                               THEN 1 ELSE 0 END) as failing
+               FROM webcal_subscriptions
+               WHERE user_id = ? AND is_active = TRUE""",
+            (_CIRCUIT_BREAKER_THRESHOLD, user_id),
+        )).fetchone()
+        total = (cal_row["total"] or 0) + (webcal_row["total"] or 0)
+        failing = (cal_row["failing"] or 0) + (webcal_row["failing"] or 0)
         if total == 0 or failing < total:
             continue
         logger.error(
@@ -145,10 +163,10 @@ async def _check_circuit_breaker() -> None:
             user_id=user_id,
             details=(
                 f"Sync has been automatically paused for your account "
-                f"because all {total} of your connected calendars have "
-                f"failed {_CIRCUIT_BREAKER_THRESHOLD}+ times in a row. "
-                f"Check your connected accounts and resume sync from the "
-                f"settings page."
+                f"because all {total} of your connected calendars and "
+                f"feeds have failed {_CIRCUIT_BREAKER_THRESHOLD}+ times "
+                f"in a row. Check your connected accounts and resume sync "
+                f"from the settings page."
             ),
         )
         # Do NOT return — pause every affected user, not just the first.
