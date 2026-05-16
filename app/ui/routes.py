@@ -114,19 +114,18 @@ async def dashboard(request: Request, error: Optional[str] = None):
     user_paused = bool(user_pause_row and user_pause_row["sync_paused"])
     sync_paused = global_paused or user_paused
 
-    # Integrity check status
-    cursor = await db.execute(
-        "SELECT * FROM integrity_status WHERE user_id = ?", (user.id,)
-    )
-    integrity_row = await cursor.fetchone()
-    integrity = None
-    if integrity_row:
-        integrity = {
-            "last_check_at": integrity_row["last_check_at"],
-            "unresolved_issues": integrity_row["unresolved_issues"] or 0,
-            "issues_auto_fixed": integrity_row["issues_auto_fixed"] or 0,
-            "consecutive_check_failures": integrity_row["consecutive_check_failures"] or 0,
-        }
+    # Integrity check status — computed live from ledger state.  The
+    # legacy integrity_status table is never written post-cutover, so
+    # reading it left this panel permanently blank.
+    from app.ledger import facade as _facade
+    _integrity = await _facade.integrity_status_for_user(db, user_id=user.id)
+    integrity = {
+        "last_check_at": None,  # the ledger is continuously checked
+        "unresolved_issues": _integrity["unresolved_issues"],
+        "issues_auto_fixed": 0,
+        "consecutive_check_failures": 0,
+        "status": _integrity["status"],
+    }
 
     # Get webcal subscriptions (event counts merged in from the
     # ledger).

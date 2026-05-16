@@ -106,26 +106,14 @@ async def get_sync_status(user: User = Depends(get_current_user)):
     user_paused = bool(user_row and user_row["sync_paused"])
     sync_paused = global_paused or user_paused
 
-    # Integrity status: in the ledger model, the equivalent signal
-    # is the count of permanently-failed projections.  The
-    # legacy ``integrity_status`` table is still populated by the
-    # old jobs during the parallel-run period; we surface whichever
-    # is non-zero.
-    integrity_status_val: Optional[str] = None
-    integrity_last_check: Optional[str] = None
-    integrity_unresolved = 0
-    irow = await (await db.execute(
-        "SELECT * FROM integrity_status WHERE user_id = ?", (user.id,),
-    )).fetchone()
-    if irow:
-        integrity_last_check = irow["last_check_at"]
-        integrity_unresolved = irow["unresolved_issues"] or 0
-        if (irow["consecutive_check_failures"] or 0) >= 3:
-            integrity_status_val = "error"
-        elif integrity_unresolved > 0:
-            integrity_status_val = "warning"
-        elif irow["last_check_at"]:
-            integrity_status_val = "ok"
+    # Integrity status is computed live from ledger state.  The
+    # legacy ``integrity_status`` table is never written under the
+    # ledger architecture (its consistency-check job is a no-op), so
+    # reading it would leave the panel permanently blank.
+    integrity = await facade.integrity_status_for_user(db, user_id=user.id)
+    integrity_status_val: Optional[str] = integrity["status"]
+    integrity_last_check: Optional[str] = None  # continuously checked
+    integrity_unresolved = integrity["unresolved_issues"]
 
     return SyncStatusResponse(
         calendars_connected=total,
@@ -327,35 +315,17 @@ async def get_integrity_status(user: User = Depends(get_current_user)):
     projections + permanently-failed projections.  We compose a
     legacy-shaped response so existing dashboards keep rendering."""
     db = await get_database()
-    ob = await facade.outbox_summary(db, user_id=user.id)
-    permanent_failures = int(ob.get("permanent_failure", 0))
-    diverged_row = await (await db.execute(
-        """SELECT COUNT(*) AS n FROM ledger_projections p
-             JOIN ledger_events e ON e.id = p.ledger_event_id
-            WHERE e.user_id = ?
-              AND (p.applied_ledger_version IS NULL
-                   OR p.applied_ledger_version != p.desired_ledger_version)""",
-        (user.id,),
-    )).fetchone()
-    diverged = int(diverged_row["n"] or 0)
-
-    if permanent_failures > 0:
-        status_value = "error"
-    elif diverged > 0:
-        status_value = "warning"
-    else:
-        status_value = "ok"
-
+    integrity = await facade.integrity_status_for_user(db, user_id=user.id)
     return {
-        "status": status_value,
+        "status": integrity["status"],
         "last_check_at": None,  # the ledger is continuously checked
-        "issues_found": diverged + permanent_failures,
+        "issues_found": integrity["issues_found"],
         "issues_auto_fixed": 0,
-        "unresolved_issues": permanent_failures,
+        "unresolved_issues": integrity["unresolved_issues"],
         "consecutive_check_failures": 0,
         "details": {
-            "diverged_projections": diverged,
-            "permanently_failed_projections": permanent_failures,
+            "diverged_projections": integrity["diverged"],
+            "permanently_failed_projections": integrity["permanent_failures"],
         },
     }
 

@@ -164,6 +164,49 @@ async def outbox_summary(
     return {row["status"]: int(row["n"]) for row in rows}
 
 
+async def integrity_status_for_user(
+    db: aiosqlite.Connection, *, user_id: int,
+) -> dict:
+    """Compute integrity health from live ledger state.
+
+    Replaces the legacy ``integrity_status`` table, which the old
+    consistency-check job populated.  Under the ledger architecture
+    that job is a no-op, so the table is never written — any dashboard
+    still reading it shows a permanently blank integrity panel.
+
+    "Issues" map onto ledger reality: a ``permanently_failed``
+    projection is a hard error; a merely diverged projection
+    (``applied`` behind ``desired``) is in-progress work, surfaced as
+    a warning.
+    """
+    ob = await outbox_summary(db, user_id=user_id)
+    permanent_failures = int(ob.get("permanent_failure", 0))
+    diverged_row = await (await db.execute(
+        """SELECT COUNT(*) AS n
+             FROM ledger_projections p
+             JOIN ledger_events e ON e.id = p.ledger_event_id
+            WHERE e.user_id = ?
+              AND p.permanently_failed = 0
+              AND (p.applied_ledger_version IS NULL
+                   OR p.applied_ledger_version != p.desired_ledger_version)""",
+        (user_id,),
+    )).fetchone()
+    diverged = int(diverged_row["n"] or 0)
+    if permanent_failures > 0:
+        status = "error"
+    elif diverged > 0:
+        status = "warning"
+    else:
+        status = "ok"
+    return {
+        "status": status,
+        "diverged": diverged,
+        "permanent_failures": permanent_failures,
+        "unresolved_issues": permanent_failures,
+        "issues_found": diverged + permanent_failures,
+    }
+
+
 async def list_permanent_failures(
     db: aiosqlite.Connection, *, user_id: int, limit: int = 50,
 ) -> list[dict]:
