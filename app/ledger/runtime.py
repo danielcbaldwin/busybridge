@@ -30,6 +30,7 @@ Test injection:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
@@ -108,8 +109,54 @@ async def reconcile_user_by_id(
     drain: bool = True,
     run_discovery: bool = False,
 ) -> dict:
-    """Load this user's calendars + tokens, build a RealGoogleClient,
-    and run one reconciliation pass.
+    """Run one reconciliation pass for a user, under the per-user lock.
+
+    Enforces REWRITE_PLAN.md §3's "one author at a time per user":
+    no matter how many triggers fire concurrently — a webhook's
+    delayed drain, the periodic scheduler, a manual sync — only one
+    reconcile runs for a given user at a time.  Other callers wait
+    on the lock rather than interleaving (which would mean two
+    ingest/diff/drain passes racing over the same calendars).
+
+    The app is single-process (one event loop), so an in-process
+    :class:`asyncio.Lock` per user is complete enforcement.
+    """
+    async with _user_lock(user_id):
+        return await _reconcile_user_once(
+            user_id,
+            include_main=include_main,
+            drain=drain,
+            run_discovery=run_discovery,
+        )
+
+
+# Per-user reconcile mutex.  Keyed by ``(event-loop id, user_id)`` so
+# tests — each of which runs in a fresh event loop — never reuse a
+# lock across loops (asyncio primitives bind to the loop they are
+# awaited on).  In production there is one loop for the process's
+# lifetime, so the loop component is constant.
+_user_locks: dict[tuple[int, int], "asyncio.Lock"] = {}
+
+
+def _user_lock(user_id: int) -> "asyncio.Lock":
+    key = (id(asyncio.get_running_loop()), user_id)
+    lock = _user_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _user_locks[key] = lock
+    return lock
+
+
+async def _reconcile_user_once(
+    user_id: int,
+    *,
+    include_main: bool = True,
+    drain: bool = True,
+    run_discovery: bool = False,
+) -> dict:
+    """Load this user's calendars + tokens, build a router, and run
+    one reconciliation pass.  Always invoked under the per-user lock
+    via :func:`reconcile_user_by_id`.
 
     Returns the reconciler's counters dict.  Callers (webhook
     handler, scheduler) typically log the result and move on.
