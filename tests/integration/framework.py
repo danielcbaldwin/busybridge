@@ -534,6 +534,13 @@ async def _scenario_setup_db(self: Scenario) -> aiosqlite.Connection:
             sync_paused BOOLEAN DEFAULT FALSE,
             main_calendar_id TEXT
         );
+        CREATE TABLE settings (
+            key TEXT PRIMARY KEY,
+            value_encrypted BLOB,
+            value_plain TEXT,
+            is_sensitive BOOLEAN DEFAULT FALSE,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE client_calendars (
             id INTEGER PRIMARY KEY,
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

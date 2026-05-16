@@ -36,6 +36,39 @@ logger = logging.getLogger(__name__)
 UTC = timezone.utc
 
 
+async def _sync_is_paused(db: aiosqlite.Connection, user_id: int) -> bool:
+    """True when sync must not pull new state for this user.
+
+    Two independent pause switches exist and both must be honoured:
+
+    * per-user — ``users.sync_paused``, flipped by the circuit breaker
+      or an admin pausing one account;
+    * global — the ``settings`` row keyed ``sync_paused``, flipped by
+      the admin "pause everything" switch and, critically, by the
+      backup job to freeze writes for a consistent snapshot.
+
+    The reconciler historically read only the per-user flag, so the
+    global switch silently did nothing to the ledger engine — backups
+    ran concurrently with sync.  Both flags are read from the passed
+    connection (in production the single shared connection ``settings``
+    also lives on).
+    """
+    user_row = await (await db.execute(
+        "SELECT sync_paused FROM users WHERE id = ?", (user_id,),
+    )).fetchone()
+    if user_row and user_row["sync_paused"]:
+        return True
+    try:
+        global_row = await (await db.execute(
+            "SELECT value_plain FROM settings WHERE key = 'sync_paused'",
+        )).fetchone()
+    except Exception:
+        # Minimal test databases may omit the settings table; absence
+        # of the table means no global pause is configured.
+        return False
+    return bool(global_row and global_row["value_plain"] == "true")
+
+
 async def reconcile_user(
     db: aiosqlite.Connection,
     google: GoogleClient,
@@ -71,13 +104,10 @@ async def reconcile_user(
 
     Returns a counters dict aggregating each phase.
     """
-    # If the user is paused, skip ingest/planning entirely — the
-    # outbox should still drain (so a paused user's pending deletes
-    # complete) but we don't pull new state in.
-    paused_row = await (await db.execute(
-        "SELECT sync_paused FROM users WHERE id = ?", (user_id,),
-    )).fetchone()
-    paused = bool(paused_row and paused_row["sync_paused"])
+    # If sync is paused, skip ingest/planning entirely — the outbox
+    # should still drain (so a paused user's pending deletes complete)
+    # but we don't pull new state in.
+    paused = await _sync_is_paused(db, user_id)
 
     out: dict = {
         "ingest": {}, "ingest_errors": {},

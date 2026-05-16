@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 
-from app.database import get_database
+from app.database import get_database, get_setting
 from app.ledger.runtime import drain_all_due_users
 from app.ledger.triggers import enqueue_periodic
 
@@ -49,6 +49,10 @@ async def ledger_enqueue_periodic() -> None:
     active user.  ``enqueue_periodic`` preserves the earliest
     schedule so the drain doesn't get postponed.
     """
+    global_pause = await get_setting("sync_paused")
+    if global_pause and global_pause.get("value_plain") == "true":
+        logger.debug("ledger_enqueue_periodic skipped: global sync pause on")
+        return
     db = await get_database()
     rows = await (await db.execute(
         """SELECT id FROM users
