@@ -653,6 +653,7 @@ async def _try_rekey_R_parent(
     if not rows:
         return None
     target = rows[0]
+    old_canonical = target["canonical_uid"]
     new_canonical = canonical_for(new_event_id)
     when = datetime.now(UTC).isoformat()
     await db.execute(
@@ -663,10 +664,26 @@ async def _try_rekey_R_parent(
             WHERE id = ?""",
         (new_canonical, new_event_id, when, int(target["id"])),
     )
+    # Re-parent any modified-instance ledger rows that pointed at the
+    # old series canonical, so they stay attached to the re-keyed
+    # parent (REWRITE_PLAN.md §8 — "old instance rows get their
+    # parent_canonical_uid updated").  Without this the diff's
+    # parent-projection lookup resolves to nothing and the instance
+    # is orphaned.  Post-boundary instance overrides that the source
+    # cancels are handled by the normal cancelled-instance path.
+    cur = await db.execute(
+        """UPDATE ledger_events
+              SET parent_canonical_uid = ?,
+                  updated_at = ?
+            WHERE user_id = ?
+              AND parent_canonical_uid = ?""",
+        (new_canonical, when, user_id, old_canonical),
+    )
     logger.info(
         "re-keyed ledger_event %s from source_event_id=%s to %s "
-        "(_R reschedule)",
+        "(_R reschedule); re-parented %s instance row(s)",
         target["id"], target["source_event_id"], new_event_id,
+        getattr(cur, "rowcount", "?"),
     )
     return int(target["id"])
 

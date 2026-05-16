@@ -149,6 +149,58 @@ async def test_rekey_R_parent_client_regression():
     await s.close()
 
 
+async def test_rekey_R_parent_reparents_instance_rows():
+    """A re-key must move modified-instance rows onto the new parent
+    canonical (REWRITE_PLAN.md §8) — otherwise the diff's parent
+    lookup resolves to nothing and the instance is orphaned."""
+    s = Scenario()
+    s.given_calendar("main")
+    s.given_calendar("client_a")
+    user = await s.given_user("alice", main="main", clients=["client_a"])
+    db = await s.setup_db()
+    ccid = user.client_calendar_ids["client_a"]
+    base = "clirec000099"
+    parent_canonical = canonical_uid_client(ccid, base)
+    await _insert_series(
+        db, user_id=user.user_id,
+        canonical_uid=parent_canonical, source_type="client",
+        source_calendar_id=ccid, source_event_id=base,
+    )
+    # A modified-instance ledger row attached to that parent.
+    inst_canonical = f"{parent_canonical}:inst:2026-02-09T09:00:00Z"
+    cur = await db.execute(
+        """INSERT INTO ledger_events
+              (user_id, canonical_uid, parent_canonical_uid,
+               source_type, source_calendar_id, source_event_id,
+               recurrence_instance_original_start, status, is_recurring,
+               version, created_at, updated_at)
+           VALUES (?, ?, ?, 'client', ?, ?, '2026-02-09T09:00:00Z',
+                   'active', 0, 1,
+                   '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')""",
+        (user.user_id, inst_canonical, parent_canonical, ccid,
+         f"{base}_20260209T090000Z"),
+    )
+    inst_id = int(cur.lastrowid)
+    await db.commit()
+
+    new_id = f"{base}_R20260216T090000Z"
+    await _try_rekey_R_parent(
+        db,
+        user_id=user.user_id,
+        source_type="client",
+        source_calendar_id=ccid,
+        new_event_id=new_id,
+        canonical_for=lambda eid: canonical_uid_client(ccid, eid),
+    )
+
+    inst = await (await db.execute(
+        "SELECT parent_canonical_uid FROM ledger_events WHERE id = ?",
+        (inst_id,),
+    )).fetchone()
+    assert inst["parent_canonical_uid"] == canonical_uid_client(ccid, new_id)
+    await s.close()
+
+
 async def test_rekey_R_parent_no_match_returns_none():
     """No existing series at the base id → no re-key, returns None."""
     s = Scenario()
