@@ -500,13 +500,14 @@ async def _restore_full_db(backup_zip: zipfile.ZipFile) -> None:
     """
     from app.database import replace_database_file
 
+    dest_db_path = get_settings().database_path
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         tmp_path = tmp.name
     try:
         with backup_zip.open("database.db") as src:
             with open(tmp_path, "wb") as dst:
                 dst.write(src.read())
-        await replace_database_file(tmp_path)
+        await replace_database_file(tmp_path, dest_db_path)
     finally:
         os.unlink(tmp_path)
 

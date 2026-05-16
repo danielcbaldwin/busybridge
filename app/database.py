@@ -265,8 +265,9 @@ async def close_database() -> None:
             logger.info("Database connection closed")
 
 
-async def replace_database_file(source_db_path: str) -> None:
-    """Swap the live database file for the contents of ``source_db_path``.
+async def replace_database_file(source_db_path: str, dest_db_path: str) -> None:
+    """Swap the database file at ``dest_db_path`` for the contents of
+    ``source_db_path``.
 
     The shared connection is closed first and reopens lazily on the
     new file via :func:`get_database`.  The close + file swap happen
@@ -278,22 +279,30 @@ async def replace_database_file(source_db_path: str) -> None:
     in-flight query is racing the swap.  Stale ``-wal`` / ``-shm``
     sidecars from the old database are removed so SQLite cannot apply
     a mismatched write-ahead log to the new file.
+
+    ``dest_db_path`` must be a real filesystem path — an in-memory
+    (``:memory:``) database has no file to replace.
     """
     import os
     import shutil
+
+    if not dest_db_path or dest_db_path == ":memory:":
+        raise RuntimeError(
+            "replace_database_file needs a file-backed database; "
+            f"got {dest_db_path!r}"
+        )
 
     global _db_connection
     async with _db_lock:
         if _db_connection is not None:
             await _db_connection.close()
             _db_connection = None
-        dst = get_settings().database_path
         for suffix in ("-wal", "-shm"):
             try:
-                os.remove(dst + suffix)
+                os.remove(dest_db_path + suffix)
             except FileNotFoundError:
                 pass
-        shutil.copyfile(source_db_path, dst)
+        shutil.copyfile(source_db_path, dest_db_path)
         logger.info("Database file replaced from %s", source_db_path)
 
 
