@@ -36,6 +36,7 @@ import aiosqlite
 from icalendar import Calendar as ICalCalendar
 
 from app.ledger.identity import (
+    canonical_uid_for_instance,
     canonical_uid_webcal_stable,
     canonical_uid_webcal_unstable,
 )
@@ -149,6 +150,10 @@ async def ingest_webcal_subscription(
     else:
         poll_interval = 3600
     stale_cutoff = (now - timedelta(seconds=2 * poll_interval)).isoformat()
+    # Instance rows (RECURRENCE-ID overrides) are excluded: they
+    # follow their parent series, and an override dropped from the
+    # feed should revert to the series default, not be cancelled
+    # (which would punch a hole in the recurring busy block).
     rows = await (await db.execute(
         """SELECT id, canonical_uid FROM ledger_events
             WHERE user_id = ?
@@ -156,6 +161,7 @@ async def ingest_webcal_subscription(
               AND source_calendar_id = ?
               AND status = 'active'
               AND user_intentionally_deleted = 0
+              AND parent_canonical_uid IS NULL
               AND (last_seen_at IS NULL OR last_seen_at < ?)""",
         (user_id, subscription_id, stale_cutoff),
     )).fetchall()
@@ -196,13 +202,15 @@ def _vevent_to_dict(comp) -> dict:
     dtend = comp.get("DTEND")
     start_at, end_at, is_all_day = _normalize_times(dtstart, dtend)
 
-    rrule = comp.get("RRULE")
-    recurrence_rule = None
-    if rrule is not None:
-        if hasattr(rrule, "to_ical"):
-            recurrence_rule = ["RRULE:" + rrule.to_ical().decode("ascii")]
-        else:
-            recurrence_rule = ["RRULE:" + str(rrule)]
+    # RRULE + EXDATE + RDATE all belong in the `recurrence` array
+    # Google materialises instances from.  Dropping EXDATE would
+    # leave a ghost busy block on every excluded occurrence.
+    recurrence_rule = _extract_recurrence(comp)
+
+    # A VEVENT carrying RECURRENCE-ID is a single-occurrence override
+    # of the series with the same UID — a modified or cancelled
+    # instance, not a standalone event.
+    recurrence_id = _format_recurrence_id(comp.get("RECURRENCE-ID"))
 
     transparency = (str(comp.get("TRANSP", "OPAQUE")) or "OPAQUE").upper()
     show_as = "free" if transparency == "TRANSPARENT" else "busy"
@@ -220,8 +228,44 @@ def _vevent_to_dict(comp) -> dict:
             json.dumps(recurrence_rule) if recurrence_rule else None
         ),
         "is_recurring": recurrence_rule is not None,
+        "recurrence_id": recurrence_id,
         "status": status,
     }
+
+
+def _extract_recurrence(comp) -> Optional[list[str]]:
+    """Collect RRULE / EXDATE / RDATE lines for the Google
+    ``recurrence`` array.  Each property may appear more than once
+    (common for EXDATE)."""
+    lines: list[str] = []
+    for key in ("RRULE", "EXDATE", "RDATE"):
+        val = comp.get(key)
+        if val is None:
+            continue
+        items = val if isinstance(val, list) else [val]
+        for item in items:
+            if hasattr(item, "to_ical"):
+                try:
+                    lines.append(f"{key}:" + item.to_ical().decode("ascii"))
+                except Exception:
+                    lines.append(f"{key}:" + str(item))
+            else:
+                lines.append(f"{key}:" + str(item))
+    return lines or None
+
+
+def _format_recurrence_id(rid) -> Optional[str]:
+    """Normalise a RECURRENCE-ID property to the same string shape
+    used for ``recurrence_instance_original_start``."""
+    if rid is None:
+        return None
+    dt = getattr(rid, "dt", None)
+    if dt is None:
+        return None
+    if isinstance(dt, datetime):
+        d = dt.astimezone(UTC) if dt.tzinfo else dt.replace(tzinfo=UTC)
+        return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.isoformat()  # date-only → YYYY-MM-DD
 
 
 def _first_str(comp, key: str) -> Optional[str]:
@@ -287,6 +331,20 @@ async def _ingest_ics_event(
         # Without a UID we cannot dedupe reliably across polls.
         # Fall back to the unstable hash regardless.
         unstable = True
+
+    # A RECURRENCE-ID override of a stable-UID series is a modified
+    # or cancelled single occurrence — route it to its own instance
+    # ledger row so it does not collide with the parent series
+    # (which carries the same UID).
+    if event.get("recurrence_id") and not unstable and uid is not None:
+        return await _ingest_ics_instance(
+            db,
+            user_id=user_id,
+            subscription_id=subscription_id,
+            event=event,
+            parent_uid=uid,
+            now=now,
+        )
 
     if unstable:
         canonical = canonical_uid_webcal_unstable(
@@ -373,6 +431,118 @@ async def _ingest_ics_event(
         ),
     )
     return "updated", int(existing["id"]), canonical
+
+
+async def _ingest_ics_instance(
+    db: aiosqlite.Connection,
+    *,
+    user_id: int,
+    subscription_id: int,
+    event: dict,
+    parent_uid: str,
+    now: datetime,
+) -> tuple[str, Optional[int], str]:
+    """Upsert a modified or cancelled RECURRENCE-ID override as an
+    instance ledger row (``parent_canonical_uid`` set), mirroring how
+    client/main recurring instances are handled.  The planner drives
+    it ABSENT when cancelled; the diff derives the per-instance
+    Google ID from the parent series' projection."""
+    parent_canonical = canonical_uid_webcal_stable(subscription_id, parent_uid)
+    original_start = event["recurrence_id"]
+    instance_canonical = canonical_uid_for_instance(
+        parent_canonical, original_start,
+    )
+    when = now.isoformat()
+    existing = await (await db.execute(
+        """SELECT * FROM ledger_events
+            WHERE user_id = ? AND canonical_uid = ?""",
+        (user_id, instance_canonical),
+    )).fetchone()
+
+    # Cancelled override — sticky cancelled instance row.
+    if event["status"] == "CANCELLED":
+        if existing is not None and existing["status"] == "cancelled":
+            return "skipped", int(existing["id"]), instance_canonical
+        if existing is None:
+            cursor = await db.execute(
+                """INSERT INTO ledger_events
+                      (user_id, canonical_uid, parent_canonical_uid,
+                       source_type, source_calendar_id, source_event_id,
+                       recurrence_instance_original_start,
+                       status, version, is_recurring,
+                       created_at, updated_at, last_seen_at, cancelled_at)
+                   VALUES (?, ?, ?, 'webcal', ?, ?, ?,
+                           'cancelled', 1, 0, ?, ?, ?, ?)""",
+                (
+                    user_id, instance_canonical, parent_canonical,
+                    subscription_id, parent_uid, original_start,
+                    when, when, when, when,
+                ),
+            )
+            return "cancelled", int(cursor.lastrowid), instance_canonical
+        await db.execute(
+            """UPDATE ledger_events
+                  SET status = 'cancelled', version = version + 1,
+                      cancelled_at = ?, updated_at = ?, last_seen_at = ?
+                WHERE id = ?""",
+            (when, when, when, int(existing["id"])),
+        )
+        return "cancelled", int(existing["id"]), instance_canonical
+
+    # Modified (active) override — a single-occurrence content change.
+    fields = _ics_to_ledger_fields(event)
+    if existing is None:
+        cursor = await db.execute(
+            """INSERT INTO ledger_events
+                  (user_id, canonical_uid, parent_canonical_uid,
+                   source_type, source_calendar_id, source_event_id,
+                   recurrence_instance_original_start,
+                   summary, description, location,
+                   start_at, end_at, is_all_day, show_as,
+                   recurrence_rule_json, is_recurring,
+                   status, version,
+                   created_at, updated_at, last_seen_at)
+               VALUES (?, ?, ?, 'webcal', ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       'active', 1, ?, ?, ?)""",
+            (
+                user_id, instance_canonical, parent_canonical,
+                subscription_id, parent_uid, original_start,
+                fields["summary"], fields["description"], fields["location"],
+                fields["start_at"], fields["end_at"], fields["is_all_day"],
+                fields["show_as"], fields["recurrence_rule_json"],
+                fields["is_recurring"],
+                when, when, when,
+            ),
+        )
+        return "created", int(cursor.lastrowid), instance_canonical
+
+    new_hash = _content_hash(fields)
+    old_hash = _ics_content_hash_from_row(existing)
+    if new_hash == old_hash:
+        await db.execute(
+            "UPDATE ledger_events SET last_seen_at = ? WHERE id = ?",
+            (when, int(existing["id"])),
+        )
+        return "skipped", int(existing["id"]), instance_canonical
+    await db.execute(
+        """UPDATE ledger_events
+              SET summary = ?, description = ?, location = ?,
+                  start_at = ?, end_at = ?, is_all_day = ?,
+                  show_as = ?, recurrence_rule_json = ?, is_recurring = ?,
+                  status = 'active',
+                  version = version + 1,
+                  updated_at = ?, last_seen_at = ?
+            WHERE id = ?""",
+        (
+            fields["summary"], fields["description"], fields["location"],
+            fields["start_at"], fields["end_at"], fields["is_all_day"],
+            fields["show_as"], fields["recurrence_rule_json"],
+            fields["is_recurring"],
+            when, when, int(existing["id"]),
+        ),
+    )
+    return "updated", int(existing["id"]), instance_canonical
 
 
 def _ics_to_ledger_fields(event: dict) -> dict:
