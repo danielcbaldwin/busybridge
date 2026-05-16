@@ -289,15 +289,27 @@ async def _upsert_projection(
         # Bump desired_ledger_version regardless of whether the hash
         # changed; that way the diff step can see "ledger has moved
         # past what's applied" and re-evaluate.
+        #
+        # A genuine desired change (hash differs) also un-sticks a
+        # poison-pilled projection: the failed payload is now moot, so
+        # clear permanently_failed and let the diff retry.  Without
+        # this a permanently-failed projection is excluded from the
+        # diff forever, even after the user edits the event.
+        hash_changed = existing["desired_payload_hash"] != desired_hash
         await db.execute(
             """UPDATE ledger_projections
                   SET desired_state = ?,
                       desired_payload_hash = ?,
                       desired_ledger_version = ?,
+                      permanently_failed = CASE WHEN ? THEN 0
+                                                ELSE permanently_failed END,
+                      last_error = CASE WHEN ? THEN NULL
+                                        ELSE last_error END,
                       updated_at = ?
                 WHERE id = ?""",
             (
                 desired_state, desired_hash, int(ledger_row["version"]),
+                hash_changed, hash_changed,
                 when, int(existing["id"]),
             ),
         )
@@ -326,6 +338,7 @@ async def _mark_implicit_absent(
                   SET desired_state = ?,
                       desired_payload_hash = 'absent',
                       desired_ledger_version = ?,
+                      permanently_failed = 0,
                       updated_at = ?
                 WHERE id = ?""",
             (ABSENT, ledger_version, when, int(row["id"])),

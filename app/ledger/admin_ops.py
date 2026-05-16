@@ -236,6 +236,62 @@ async def resume_sync(
 
 
 # ---------------------------------------------------------------------------
+# Poison-pill recovery
+# ---------------------------------------------------------------------------
+async def retry_permanent_failures(
+    db: aiosqlite.Connection,
+    *,
+    user_id: int,
+    projection_id: Optional[int] = None,
+) -> int:
+    """Clear the poison-pill flag on permanently-failed projections so
+    the diff step re-enqueues them.
+
+    A poison-pilled projection is excluded from the diff
+    (``permanently_failed = 1``); clearing the flag is the only way
+    back in.  ``applied_*`` still diverges from ``desired_*`` (the
+    failed op never advanced it), so the next diff pass enqueues a
+    fresh op with ``attempts = 0``.  Without an explicit
+    ``projection_id`` every permanently-failed projection for the user
+    is retried.  Returns the number of projections un-stuck.
+    """
+    when = datetime.now(UTC).isoformat()
+    params: list = [user_id]
+    clause = ""
+    if projection_id is not None:
+        clause = " AND p.id = ?"
+        params.append(projection_id)
+    rows = await (await db.execute(
+        f"""SELECT p.id, p.ledger_event_id
+              FROM ledger_projections p
+              JOIN ledger_events e ON e.id = p.ledger_event_id
+             WHERE e.user_id = ?
+               AND p.permanently_failed = 1{clause}""",
+        params,
+    )).fetchall()
+    if not rows:
+        return 0
+    proj_ids = [int(r["id"]) for r in rows]
+    placeholders = ",".join("?" for _ in proj_ids)
+    await db.execute(
+        f"""UPDATE ledger_projections
+               SET permanently_failed = 0,
+                   attempts = 0,
+                   next_attempt_at = NULL,
+                   last_error = NULL,
+                   updated_at = ?
+             WHERE id IN ({placeholders})""",
+        [when, *proj_ids],
+    )
+    await _append_affected(
+        db, user_id=user_id,
+        ledger_ids=[int(r["ledger_event_id"]) for r in rows],
+    )
+    await db.commit()
+    return len(proj_ids)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 async def _append_affected(

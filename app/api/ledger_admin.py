@@ -177,6 +177,23 @@ async def full_resync(
     return {"status": "sync_tokens_cleared"}
 
 
+@router.post("/users/{user_id}/retry-failed")
+async def retry_failed(
+    user_id: int,
+    projection_id: Optional[int] = None,
+    _: User = Depends(require_admin),
+) -> dict:
+    """Clear the poison-pill flag on a permanently-failed projection
+    (or, with no ``projection_id``, all of them for the user) so the
+    next reconcile retries the write.  Pair with ``sync-now`` or
+    ``reconcile-now`` to drain immediately."""
+    db = await get_database()
+    n = await admin_ops.retry_permanent_failures(
+        db, user_id=user_id, projection_id=projection_id,
+    )
+    return {"status": "retry_scheduled", "projections_unstuck": n}
+
+
 @router.post("/users/{user_id}/disconnect-calendar/{client_calendar_id}")
 async def disconnect_calendar(
     user_id: int,
