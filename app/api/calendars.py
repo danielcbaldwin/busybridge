@@ -66,6 +66,7 @@ async def list_client_calendars(user: User = Depends(get_current_user)):
            JOIN oauth_tokens ot ON cc.oauth_token_id = ot.id
            LEFT JOIN calendar_sync_state css ON cc.id = css.client_calendar_id
            WHERE cc.user_id = ? AND cc.is_active = TRUE
+             AND cc.calendar_type = 'client'
            ORDER BY cc.created_at DESC""",
         (user.id,)
     )
@@ -76,11 +77,16 @@ async def list_client_calendars(user: User = Depends(get_current_user)):
     for row in rows:
         last_sync = row["last_incremental_sync"] or row["last_full_sync"]
 
+        # consecutive_failures is NULL when the LEFT JOIN finds no
+        # calendar_sync_state row yet (calendar never synced) — coerce
+        # before comparing or the endpoint 500s.
+        failures = row["consecutive_failures"] or 0
+
         # Determine sync status
         status = "ok"
-        if row["consecutive_failures"] >= 5:
+        if failures >= 5:
             status = "error"
-        elif row["consecutive_failures"] >= 1:
+        elif failures >= 1:
             status = "warning"
         elif not last_sync:
             status = "pending"

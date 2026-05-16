@@ -17,6 +17,12 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Hard cap on a fetched ICS body.  A feed is plain text; anything past
+# this is almost certainly hostile (or broken) and reading it whole
+# into memory would be a DoS.  Enforced by streaming, so an oversized
+# body is abandoned mid-download rather than buffered.
+_MAX_ICS_BYTES = 10 * 1024 * 1024  # 10 MiB
+
 # Explicit blocklist for defence-in-depth (covers cloud metadata,
 # RFC 1918, carrier-grade NAT, benchmarking, documentation, and
 # broadcast ranges that some older Python ipaddress builds may
@@ -104,11 +110,25 @@ async def fetch_ics_feed(
     if etag:
         headers["If-None-Match"] = etag
     async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-        response = await client.get(url, headers=headers)
-    final_url = str(response.url)
-    if final_url != url:
-        validate_url_for_ssrf(final_url)
-    if response.status_code == 304:
-        return None, None
-    response.raise_for_status()
-    return response.text, response.headers.get("ETag")
+        async with client.stream("GET", url, headers=headers) as response:
+            # Re-validate the post-redirect host on every fetch (not
+            # only when a redirect occurred): it re-checks the
+            # resolved address, narrowing — though not fully closing —
+            # the DNS-rebinding window between validation and connect.
+            validate_url_for_ssrf(str(response.url))
+            if response.status_code == 304:
+                return None, None
+            response.raise_for_status()
+            # Stream with a running byte cap so an oversized (or
+            # endless) body is abandoned instead of buffered whole.
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > _MAX_ICS_BYTES:
+                    raise ValueError(
+                        f"ICS feed exceeds the {_MAX_ICS_BYTES}-byte limit"
+                    )
+                chunks.append(chunk)
+            etag_out = response.headers.get("ETag")
+    return b"".join(chunks).decode("utf-8", "replace"), etag_out

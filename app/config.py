@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 60
     webhook_rate_limit_per_minute: int = 30
     auth_rate_limit_per_minute: int = 10
+    # Whether to trust X-Real-IP / X-Forwarded-For for the client IP.
+    # Only enable when the app sits behind a reverse proxy that
+    # overwrites these headers; otherwise a client can spoof them to
+    # dodge per-IP rate limits.  Off by default (safe for a direct
+    # deployment).
+    trust_proxy_headers: bool = False
 
     # Sync settings
     sync_interval_minutes: int = 5

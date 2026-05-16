@@ -120,6 +120,27 @@ async def connect_personal_calendars(
             ),
         )
 
+    # Build a Google client once to verify each calendar is reachable
+    # with this token — mirrors the client-calendar connect flow, so an
+    # inaccessible or bogus calendar id is rejected rather than stored.
+    try:
+        from googleapiclient.discovery import build
+        from google.oauth2.credentials import Credentials
+
+        access_token = await get_valid_access_token(
+            user.id, token["google_account_email"],
+        )
+        service = build(
+            "calendar", "v3",
+            credentials=Credentials(token=access_token),
+        )
+    except Exception as e:
+        logger.error(f"Failed to build Google client for personal connect: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot access the personal account",
+        )
+
     results = []
     for cal_info in request.calendars:
         calendar_id = cal_info.get("calendar_id")
@@ -135,6 +156,17 @@ async def connect_personal_calendars(
             (user.id, calendar_id)
         )
         if await cursor.fetchone():
+            continue
+
+        # Verify the calendar is reachable with this token before
+        # storing it — an unreachable id would just fail every sync.
+        try:
+            service.calendars().get(calendarId=calendar_id).execute()
+        except Exception as e:
+            logger.warning(
+                "skipping inaccessible personal calendar %s: %s",
+                calendar_id, e,
+            )
             continue
 
         # Create the personal calendar connection (no color needed)

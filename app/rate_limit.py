@@ -8,23 +8,27 @@ from app.config import get_settings
 
 
 def _get_real_ip(request: Request) -> str:
-    """Extract real client IP behind a reverse proxy, falling back to direct IP.
+    """Extract the client IP used to key rate limits.
 
-    Prefers X-Real-IP (nginx overwrites this to $remote_addr, so it can't
-    be spoofed through the proxy).  Falls back to the rightmost
-    X-Forwarded-For entry (the one the proxy appended), then to the
-    direct connection IP.
+    Proxy headers (``X-Real-IP`` / ``X-Forwarded-For``) are trusted
+    ONLY when ``settings.trust_proxy_headers`` is set — i.e. the
+    operator has confirmed a reverse proxy that overwrites them sits
+    in front.  On a direct deployment any client can send those
+    headers, so trusting them unconditionally would let an attacker
+    mint a fresh rate-limit bucket per forged IP.  Without that
+    setting we always key on the real connection IP.
     """
-    # X-Real-IP: set by nginx to the connecting client's IP, not appendable
-    real_ip = request.headers.get("X-Real-IP")
-    if real_ip:
-        return real_ip.strip()
-
-    # X-Forwarded-For: client, proxy1, proxy2 — rightmost entry is the one
-    # our trusted proxy appended (leftmost entries can be spoofed by the client)
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[-1].strip()
+    if get_settings().trust_proxy_headers:
+        # X-Real-IP: a trusted proxy overwrites this with the
+        # connecting client's IP (not appendable by the client).
+        real_ip = request.headers.get("X-Real-IP")
+        if real_ip:
+            return real_ip.strip()
+        # X-Forwarded-For: client, proxy1, proxy2 — the rightmost
+        # entry is the one the trusted proxy appended.
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            return forwarded.split(",")[-1].strip()
 
     return get_remote_address(request)
 

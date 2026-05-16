@@ -464,6 +464,23 @@ def test_e2e_main_calendar_cannot_be_connected_as_a_client(
     assert "main calendar" in r.json()["detail"].lower()
 
 
+def test_e2e_client_calendar_list_handles_unsynced_calendars(
+    authed_client, seeded_app,
+):
+    """GET /api/client-calendars must not 500 when a calendar has no
+    calendar_sync_state row yet — consecutive_failures is NULL then,
+    and the status comparison used to crash on it."""
+    r = authed_client.get("/api/client-calendars")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # Both seeded client calendars come back; none have synced, so
+    # their status is computed from a NULL failure count.
+    assert len(body) == 2
+    assert {c["google_calendar_id"] for c in body} == {
+        "client_a@cal.test", "client_b@cal.test",
+    }
+
+
 def test_e2e_sync_progress_uses_a_known_status(authed_client, seeded_app):
     """The dashboard progress widget only understands settling /
     syncing / complete / error / idle.  The endpoint used to return

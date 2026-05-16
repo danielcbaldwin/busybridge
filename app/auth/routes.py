@@ -3,7 +3,7 @@
 import logging
 import secrets
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
@@ -389,9 +389,12 @@ async def connect_client_callback(
             expires_in=tokens.get("expires_in")
         )
 
-        # Redirect to calendar selection
+        # Redirect to calendar selection.  The email is URL-encoded:
+        # a raw '+', '&' or space in the address would otherwise break
+        # the query string or inject extra parameters.
+        query = urlencode({"token_id": token_id, "email": client_email})
         return RedirectResponse(
-            url=f"/app/calendars/select?token_id={token_id}&email={client_email}",
+            url=f"/app/calendars/select?{query}",
             status_code=status.HTTP_302_FOUND
         )
 

@@ -466,7 +466,15 @@ async def _do_delete(
     *,
     now: datetime,
 ) -> None:
-    """Idempotent delete: 404/410 are treated as success."""
+    """Idempotent delete: 404/410 are treated as success.
+
+    The delete is intentionally *unconditional* — no ``If-Match``.
+    The planner has decided this projection's desired state is
+    ``absent``; the event must go regardless of whatever revision
+    currently sits on Google.  Sending the stored ETag would only
+    invite a 412 ping-pong (event changed since we last saw it) for
+    no benefit, since the outcome we want is "gone" either way.
+    """
     proj = await _get_projection(db, op["projection_id"])
     if not proj["google_event_id"]:
         # Never created — nothing to delete.  Mark projection
