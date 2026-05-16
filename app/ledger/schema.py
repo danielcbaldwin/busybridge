@@ -236,7 +236,7 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
             "ALTER TABLE affected_ledger_events "
             "RENAME TO affected_ledger_events_old"
         )
-        await db.executescript(
+        await db.execute(
             """
             CREATE TABLE affected_ledger_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -244,9 +244,7 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
                 ledger_event_id INTEGER NOT NULL
                     REFERENCES ledger_events(id) ON DELETE CASCADE,
                 enqueued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_affected_user
-                ON affected_ledger_events(user_id);
+            )
             """
         )
         await db.execute(
@@ -255,5 +253,14 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
                SELECT user_id, ledger_event_id, enqueued_at
                  FROM affected_ledger_events_old"""
         )
+        # DROP last: the RENAME carried idx_affected_user onto the
+        # _old table, so creating the index before the drop would
+        # collide on the name (CREATE INDEX IF NOT EXISTS no-ops) and
+        # the drop would then take the only copy.  Drop first, then
+        # create the index fresh on the new table.
         await db.execute("DROP TABLE affected_ledger_events_old")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_affected_user "
+            "ON affected_ledger_events(user_id)"
+        )
         await db.commit()

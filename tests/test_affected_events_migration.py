@@ -68,5 +68,15 @@ async def test_queued_rows_survive_the_affected_table_rebuild():
             "WHERE name = 'affected_ledger_events_old'"
         )).fetchone()
         assert leftover is None
+
+        # The idx_affected_user index lives on the NEW table — the
+        # rename carried it onto the _old table, so it must be
+        # re-created after the drop or the migrated table has none.
+        idx = await (await db.execute(
+            """SELECT tbl_name FROM sqlite_master
+                WHERE type = 'index' AND name = 'idx_affected_user'"""
+        )).fetchone()
+        assert idx is not None, "idx_affected_user was lost in the migration"
+        assert idx["tbl_name"] == "affected_ledger_events"
     finally:
         await db.close()
