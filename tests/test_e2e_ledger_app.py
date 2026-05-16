@@ -389,3 +389,52 @@ def test_e2e_permanent_failures_surfaced_via_admin_endpoint(
     assert r.status_code == 200
     failures = r.json()
     assert any("poison-pill" in (f.get("last_error") or "") for f in failures)
+
+
+def test_e2e_activity_endpoint_returns_a_json_array(authed_client, seeded_app):
+    """The dashboard feed iterates the response directly, so
+    /api/sync/activity must return a JSON array — it previously
+    returned a {"recent_outbox": [...]} object and the feed silently
+    never rendered."""
+    fake = seeded_app["fake"]
+    user_id = seeded_app["user_id"]
+
+    fake.insert_event("client_a@cal.test", {
+        "summary": "Feed item",
+        "start": {"dateTime": "2026-03-05T09:00:00Z", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-03-05T09:30:00Z", "timeZone": "UTC"},
+    })
+    authed_client.post(f"/api/admin/ledger/users/{user_id}/reconcile-now")
+
+    r = authed_client.get("/api/sync/activity")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert isinstance(body, list), "activity feed must be a JSON array"
+    assert body, "expected outbox activity after a reconcile"
+    for item in body:
+        # Exactly the keys the dashboard feed reads off each item.
+        assert set(item) >= {"time", "level", "action", "calendar", "detail"}
+        assert item["level"] in ("info", "warning", "error")
+
+
+def test_e2e_sync_progress_uses_a_known_status(authed_client, seeded_app):
+    """The dashboard progress widget only understands settling /
+    syncing / complete / error / idle.  The endpoint used to return
+    'running', which the widget dropped — leaving the bar stuck on
+    'Starting...' forever."""
+    fake = seeded_app["fake"]
+    user_id = seeded_app["user_id"]
+    client_a_id = seeded_app["client_a_id"]
+
+    fake.insert_event("client_a@cal.test", {
+        "summary": "Progress probe",
+        "start": {"dateTime": "2026-03-06T09:00:00Z", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-03-06T09:30:00Z", "timeZone": "UTC"},
+    })
+    authed_client.post(f"/api/admin/ledger/users/{user_id}/reconcile-now")
+
+    r = authed_client.get(f"/api/client-calendars/{client_a_id}/sync-progress")
+    assert r.status_code == 200, r.text
+    status_value = r.json()["status"]
+    assert status_value in ("settling", "syncing", "complete", "error", "idle")
+    assert status_value != "running", "frontend cannot render the 'running' status"

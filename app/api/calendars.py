@@ -298,19 +298,81 @@ async def get_calendar_sync_progress(
             detail="Calendar not found"
         )
 
-    # Surface the outbox queue depth for this calendar's projections
-    # as "progress".  Empty queue = idle = done.
-    row = await (await db.execute(
-        """SELECT COUNT(*) AS pending FROM outbox_operations o
-             JOIN ledger_projections p ON p.id = o.projection_id
-            WHERE o.user_id = ? AND o.status IN ('pending', 'in_flight')
-              AND (p.target_calendar_id = ? OR p.target_kind = 'main')""",
-        (user.id, calendar_id),
+    # Translate ledger/outbox state into the status vocabulary the
+    # dashboard's progress widget understands: settling → syncing →
+    # complete (or error).  The widget never handled the old
+    # idle/running shape, so the bar sat on "Starting..." forever.
+    from datetime import datetime, timedelta, timezone
+    from app.ledger.triggers import MANUAL_SETTLING_DELAY
+
+    now = datetime.now(timezone.utc)
+    recent_cutoff = (now - timedelta(minutes=2)).isoformat()
+
+    async def _count(extra_sql: str, params: tuple) -> int:
+        row = await (await db.execute(
+            f"""SELECT COUNT(*) AS n FROM outbox_operations o
+                  JOIN ledger_projections p ON p.id = o.projection_id
+                 WHERE o.user_id = ?
+                   AND (p.target_calendar_id = ? OR p.target_kind = 'main')
+                   {extra_sql}""",
+            (user.id, calendar_id, *params),
+        )).fetchone()
+        return int(row["n"] or 0)
+
+    failed = await _count(
+        "AND o.status = 'permanent_failure' AND o.completed_at >= ?",
+        (recent_cutoff,),
+    )
+    if failed:
+        return {
+            "status": "error",
+            "message": f"{failed} change(s) could not be applied",
+        }
+
+    req = await (await db.execute(
+        """SELECT scheduled_for, enqueued_at, in_flight, last_run_at
+             FROM reconcile_requests WHERE user_id = ?""",
+        (user.id,),
     )).fetchone()
-    pending = int(row["pending"] or 0)
-    if pending == 0:
-        return {"status": "idle"}
-    return {"status": "running", "pending": pending}
+    in_flight = bool(req and req["in_flight"])
+    # The reconcile for the current request has run once its claim
+    # timestamp catches up to when the request was enqueued.
+    reconcile_ran = bool(
+        req and req["last_run_at"] and req["enqueued_at"]
+        and req["last_run_at"] >= req["enqueued_at"]
+    )
+
+    # Settling window: a manual sync waits for Google's eventual
+    # consistency before the reconcile fires.
+    if req and req["scheduled_for"] and not in_flight and not reconcile_ran:
+        try:
+            sched = datetime.fromisoformat(req["scheduled_for"])
+            if sched.tzinfo is None:
+                sched = sched.replace(tzinfo=timezone.utc)
+        except ValueError:
+            sched = None
+        if sched is not None and sched > now:
+            total = max(1, int(MANUAL_SETTLING_DELAY.total_seconds()))
+            remaining = min(total, max(1, round((sched - now).total_seconds())))
+            return {"status": "settling", "total": total, "remaining": remaining}
+
+    pending = await _count("AND o.status IN ('pending', 'in_flight')", ())
+    if pending or in_flight:
+        return {
+            "status": "syncing",
+            "step": (
+                f"Applying {pending} change(s)…" if pending
+                else "Checking calendars…"
+            ),
+        }
+    if req and not reconcile_ran:
+        # Settling done, but the drain tick has not fired yet.
+        return {"status": "syncing", "step": "Waiting to sync…"}
+
+    done = await _count(
+        "AND o.status = 'done' AND o.completed_at >= ?", (recent_cutoff,),
+    )
+    return {"status": "complete", "events_processed": done}
 
 
 @router.post("/{calendar_id}/resync")

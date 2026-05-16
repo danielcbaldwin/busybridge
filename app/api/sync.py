@@ -293,18 +293,45 @@ async def get_cleanup_progress(user: User = Depends(get_current_user)):
 
 @router.get("/activity")
 async def get_activity(user: User = Depends(get_current_user)):
-    """Recent activity for the live feed: outbox completions + sync log."""
+    """Recent activity for the dashboard's live feed.
+
+    Returns a JSON *array* — the feed iterates the response directly
+    and reads ``time`` / ``level`` / ``action`` / ``calendar`` /
+    ``detail`` off each item.  It previously returned a
+    ``{"recent_outbox": [...]}`` object, so the feed's ``.slice`` threw
+    and the panel silently never rendered."""
     db = await get_database()
     rows = await (await db.execute(
-        """SELECT operation, status, completed_at, target_google_calendar_id
+        """SELECT operation, status, completed_at, next_attempt_at,
+                  created_at, last_error, target_google_calendar_id
              FROM outbox_operations
             WHERE user_id = ?
             ORDER BY id DESC LIMIT 20""",
         (user.id,),
     )).fetchall()
-    return {
-        "recent_outbox": [dict(r) for r in rows],
-    }
+    items = []
+    for r in rows:
+        st = r["status"]
+        if st == "permanent_failure":
+            level, action = "error", "sync_failed"
+            detail = (r["last_error"] or f"{r['operation']} failed")[:200]
+        elif st == "done":
+            level, action = "info", "sync_complete"
+            detail = f"{r['operation']} applied"
+        elif st == "superseded":
+            level, action = "warning", "superseded"
+            detail = f"{r['operation']} superseded by a newer change"
+        else:  # pending / in_flight
+            level, action = "warning", "sync_pending"
+            detail = f"{r['operation']} {st}"
+        items.append({
+            "time": r["completed_at"] or r["next_attempt_at"] or r["created_at"],
+            "level": level,
+            "action": action,
+            "calendar": r["target_google_calendar_id"],
+            "detail": detail,
+        })
+    return items
 
 
 @router.get("/integrity")
