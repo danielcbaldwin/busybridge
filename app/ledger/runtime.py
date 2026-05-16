@@ -37,13 +37,12 @@ from typing import Any, Awaitable, Callable, Optional
 
 import aiosqlite
 
-from app.auth.google import get_valid_access_token
+from app.auth.google import build_user_credentials
 from app.database import get_database
 from app.ledger.google_router import GoogleRouter
 from app.ledger.reconciler import reconcile_user
 from app.ledger.real_google_client import RealGoogleClient
 from app.ledger.triggers import claim_due_request, release_request
-from google.oauth2.credentials import Credentials
 
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
@@ -58,9 +57,13 @@ WebcalFetcher = Callable[[str, Optional[str]], Awaitable[dict]]
 
 async def _default_google_client_factory(user_id: int, email: str):
     """Production factory: build a RealGoogleClient from the
-    OAuth token store."""
-    access_token = await get_valid_access_token(user_id, email)
-    return RealGoogleClient(Credentials(token=access_token))
+    OAuth token store.
+
+    The credentials are refresh-capable (refresh token + client
+    config), so a long reconcile pass survives an access-token expiry
+    rather than 401-ing on every op after the hour mark."""
+    credentials = await build_user_credentials(user_id, email)
+    return RealGoogleClient(credentials)
 
 
 _google_client_factory: GoogleClientFactory = _default_google_client_factory

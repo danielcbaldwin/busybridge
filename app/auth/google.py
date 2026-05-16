@@ -1,7 +1,7 @@
 """Google OAuth helpers."""
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlencode
 
@@ -261,6 +261,54 @@ async def get_valid_access_token(user_id: int, email: str) -> str:
                         raise
 
     return access_token
+
+
+async def build_user_credentials(user_id: int, email: str) -> Credentials:
+    """Build a *refresh-capable* Credentials for a user's account.
+
+    :func:`get_valid_access_token` refreshes proactively (inside the
+    5-minute pre-expiry window) and persists, but a single reconcile +
+    outbox-drain pass can outlive even a freshly minted access token
+    (~1h).  A ``Credentials(token=...)`` with nothing else cannot
+    refresh itself, so googleapiclient would simply 401 mid-pass.
+
+    Handing googleapiclient a Credentials that also carries the
+    refresh token, token URI, and OAuth client config lets it
+    transparently re-mint the access token when it expires, so a long
+    pass survives a token expiry instead of failing every remaining
+    op.  (That in-memory refresh is not persisted; the next pass
+    re-mints via ``get_valid_access_token`` as usual.)
+    """
+    access_token = await get_valid_access_token(user_id, email)
+    token_data = await get_oauth_token(user_id, email)
+    if not token_data:
+        raise ValueError(f"No token found for user {user_id}, email {email}")
+    refresh_token = decrypt_value(token_data["refresh_token_encrypted"])
+    client_id, client_secret = await get_oauth_credentials()
+
+    credentials = Credentials(
+        token=access_token,
+        refresh_token=refresh_token,
+        token_uri=GOOGLE_TOKEN_URL,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=HOME_SCOPES,
+    )
+    # google-auth compares expiry against a naive UTC now(); the token
+    # store writes a naive-UTC isoformat, so parsing yields the right
+    # shape.  A tz-aware value (older rows / future changes) is folded
+    # back to naive UTC so the comparison cannot raise.
+    raw_expiry = token_data.get("token_expiry")
+    if raw_expiry:
+        try:
+            expiry = datetime.fromisoformat(raw_expiry)
+        except ValueError:
+            expiry = None
+        if expiry is not None:
+            if expiry.tzinfo is not None:
+                expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
+            credentials.expiry = expiry
+    return credentials
 
 
 def get_calendar_service(credentials: Credentials):
