@@ -214,6 +214,39 @@ async def _reconcile_user_once(
     )
 
 
+async def _alert_if_token_revoked(
+    user_id: int, email: str, exc: Exception,
+) -> bool:
+    """When a Google client could not be built because the account's
+    refresh token is revoked (``invalid_grant``), queue a
+    ``token_revoked`` alert so the user knows to re-authenticate.
+
+    Without this a revoked token is silently swallowed — the calendar
+    is skipped every pass forever and the user is never told why their
+    calendar stopped syncing.  Returns True when the failure was a
+    revocation (as opposed to a transient build error); alerting is
+    best-effort and never propagates an exception into the reconcile.
+    """
+    if "invalid_grant" not in str(exc).lower():
+        return False
+    try:
+        from app.alerts.email import queue_alert
+        await queue_alert(
+            alert_type="token_revoked",
+            user_id=user_id,
+            details=(
+                f"The Google authorization for {email} has been revoked. "
+                f"Calendar sync for that account is paused until the user "
+                f"re-authenticates it."
+            ),
+        )
+    except Exception as e:  # alerting must never break reconcile
+        logger.warning(
+            "could not queue token_revoked alert for user %s: %s", user_id, e,
+        )
+    return True
+
+
 async def build_user_google_access(
     db: aiosqlite.Connection, user_id: int,
 ) -> Optional[dict]:
@@ -246,6 +279,7 @@ async def build_user_google_access(
             "Cannot build Google client for user %s home account: %s",
             user_id, e,
         )
+        await _alert_if_token_revoked(user_id, main_email, e)
         return None
 
     # Every client/personal calendar joined to the account that owns it.
@@ -274,6 +308,7 @@ async def build_user_google_access(
                     "Cannot build Google client for user %s account %s: %s",
                     user_id, email, e,
                 )
+                await _alert_if_token_revoked(user_id, email, e)
                 clients_by_email[email] = None
         client = clients_by_email[email]
         if client is None:
