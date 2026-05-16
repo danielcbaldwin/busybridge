@@ -27,6 +27,7 @@ decide.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import Optional
@@ -57,14 +58,43 @@ class GoogleApiError(Exception):
         )
 
 
+def _extract_google_reason(e: HttpError) -> str:
+    """Pull Google's structured error reason code out of the JSON
+    error body — ``error.errors[].reason`` (classic) or
+    ``error.status`` (newer).  Empty string if unavailable.
+
+    This is what distinguishes a quota / rate-limit 403
+    (``rateLimitExceeded``) from a genuine permission 403."""
+    try:
+        content = e.content
+        if isinstance(content, (bytes, bytearray)):
+            content = content.decode("utf-8", "replace")
+        body = json.loads(content)
+        err = body.get("error", {})
+        for item in err.get("errors") or []:
+            reason = item.get("reason")
+            if reason:
+                return str(reason)
+        return str(err.get("status") or "")
+    except Exception:
+        return ""
+
+
 def _wrap(e: HttpError) -> GoogleApiError:
-    """Convert a googleapiclient HttpError into our error type."""
+    """Convert a googleapiclient HttpError into our error type.
+
+    Google's structured reason code (e.g. ``rateLimitExceeded``) is
+    appended to the message so the outbox's failure classifier can
+    tell a rate-limit 403 from a genuine permission 403."""
     status_code = e.resp.status
     reason = e.resp.reason or ""
     try:
         message = e._get_reason() or str(e)
     except Exception:  # pragma: no cover
         message = str(e)
+    detail = _extract_google_reason(e)
+    if detail and detail.lower() not in message.lower():
+        message = f"{message} [{detail}]"
     return GoogleApiError(int(status_code), reason, message)
 
 

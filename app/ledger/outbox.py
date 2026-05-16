@@ -62,6 +62,29 @@ OP_PATCH = "patch"
 POISON_PILL_THRESHOLD = 5
 PERMANENT_FAILURE_STATUSES = frozenset({400, 401, 403, 404})
 
+# Google encodes quota / rate-limit errors as one of these reason
+# codes — carried in an HTTP 403 (classic) or 429 response.  They
+# are always transient and must never be poison-pilled.
+_RATE_LIMIT_TOKENS = (
+    "ratelimitexceeded",
+    "userratelimitexceeded",
+    "quotaexceeded",
+    "dailylimitexceeded",
+)
+
+
+def _is_rate_limited(error: Exception) -> bool:
+    """True for a Google quota / rate-limit response.  Status alone
+    is not enough: real Google returns 403 with a structured reason
+    for quota as often as 429.  ``RealGoogleClient`` surfaces the
+    reason code in the error message; the fake uses 429."""
+    if getattr(error, "status", None) == 429:
+        return True
+    haystack = (
+        str(error) + " " + str(getattr(error, "reason", "") or "")
+    ).lower()
+    return any(tok in haystack for tok in _RATE_LIMIT_TOKENS)
+
 # Backoff schedule (seconds): roughly the curve used today in
 # app/sync/google_calendar.py.  Capped at 60s.
 _BACKOFF_SECONDS = (1, 2, 4, 8, 16, 32, 60)
@@ -642,6 +665,14 @@ async def _classify_and_retry(
     """Decide whether to retry, give up, or supersede an op."""
     status = getattr(error, "status", None)
     msg = str(error)
+    if _is_rate_limited(error):
+        # Quota / rate-limit responses are ALWAYS transient.  Google
+        # Calendar returns these as HTTP 403 (with a structured
+        # reason) at least as often as 429, so they must be caught
+        # BEFORE the 403-is-permanent rule below — otherwise a quota
+        # blip poison-pills a real event.
+        await _mark_retry(db, op, error=msg, http_status=status, now=now)
+        return "retried"
     if status in PERMANENT_FAILURE_STATUSES:
         if int(op["attempts"]) >= POISON_PILL_THRESHOLD:
             await _mark_permanent_failure(
