@@ -185,6 +185,26 @@ async def _ingest_one(
             source_calendar_id=personal_calendar_id,
         )
 
+    # Rescheduled-parent ``_R`` quirk: re-key the existing series
+    # ledger row to the new event id so its projections (and the
+    # busy blocks they drive) are reused rather than orphaned.  The
+    # normal upsert below then applies the new content to it.
+    if (
+        status != "cancelled"
+        and "_R" in event_id
+        and event.get("recurrence")
+    ):
+        await _try_rekey_R_parent(
+            db,
+            user_id=user_id,
+            source_type="personal",
+            source_calendar_id=personal_calendar_id,
+            new_event_id=event_id,
+            canonical_for=lambda eid: canonical_uid_personal(
+                personal_calendar_id, eid,
+            ),
+        )
+
     canonical = canonical_uid_personal(personal_calendar_id, event_id)
     existing = await (await db.execute(
         """SELECT * FROM ledger_events

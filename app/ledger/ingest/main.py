@@ -38,6 +38,7 @@ from app.ledger.ingest.client import (
     _ingest_instance,
     _is_recurring_parent,
     _record_affected,
+    _try_rekey_R_parent,
     scan_full_sync_recurring_cancellations,
 )
 
@@ -218,6 +219,24 @@ async def _ingest_one_main_event(
             parent_canonical=parent_canonical,
             source_type="main_native",
             source_calendar_id=None,
+        )
+
+    # Rescheduled-parent ``_R`` quirk for a native main series:
+    # re-key the existing series ledger row so its projections are
+    # reused rather than orphaned.  The normal upsert below applies
+    # the new content to it.
+    if (
+        status != "cancelled"
+        and "_R" in event_id
+        and event.get("recurrence")
+    ):
+        await _try_rekey_R_parent(
+            db,
+            user_id=user_id,
+            source_type="main_native",
+            source_calendar_id=None,
+            new_event_id=event_id,
+            canonical_for=lambda eid: canonical_uid_main_native(user_id, eid),
         )
 
     # A native main event we haven't seen before, or seen previously.

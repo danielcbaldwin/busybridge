@@ -274,8 +274,12 @@ async def _ingest_one_event(
         rekeyed = await _try_rekey_R_parent(
             db,
             user_id=user_id,
-            client_calendar_id=client_calendar_id,
+            source_type="client",
+            source_calendar_id=client_calendar_id,
             new_event_id=event_id,
+            canonical_for=lambda eid: canonical_uid_client(
+                client_calendar_id, eid,
+            ),
         )
         if rekeyed is not None:
             await _apply_event_to_ledger(
@@ -611,24 +615,29 @@ async def _try_rekey_R_parent(
     db: aiosqlite.Connection,
     *,
     user_id: int,
-    client_calendar_id: int,
+    source_type: str,
+    source_calendar_id: Optional[int],
     new_event_id: str,
+    canonical_for: Callable[[str], str],
 ) -> Optional[int]:
     """Look up an existing ledger row under the base ID (everything
     before ``_R``) and re-key it to ``new_event_id``.  Returns the
     ledger event id if a re-key happened, else None.
 
-    Mirrors ``app/sync/rules.py:82-118``: searches for both the
-    bare base and any prior ``_R<ts>`` variant.
+    Source-neutral: ``source_type`` / ``source_calendar_id`` scope
+    the search, and ``canonical_for`` maps a source event id to its
+    canonical_uid (``canonical_uid_client`` / ``_personal`` /
+    ``_main_native``).  Searches for both the bare base and any
+    prior ``_R<ts>`` variant.
     """
     base = new_event_id.split("_R")[0]
-    bare_uid = canonical_uid_client(client_calendar_id, base)
+    bare_uid = canonical_for(base)
     rows = await (await db.execute(
         """SELECT id, canonical_uid, source_event_id
              FROM ledger_events
             WHERE user_id = ?
-              AND source_type = 'client'
-              AND source_calendar_id = ?
+              AND source_type = ?
+              AND COALESCE(source_calendar_id, -1) = COALESCE(?, -1)
               AND status = 'active'
               AND user_intentionally_deleted = 0
               AND (canonical_uid = ?
@@ -637,14 +646,14 @@ async def _try_rekey_R_parent(
             ORDER BY updated_at DESC
             LIMIT 1""",
         (
-            user_id, client_calendar_id,
+            user_id, source_type, source_calendar_id,
             bare_uid, base, f"{base}_R%",
         ),
     )).fetchall()
     if not rows:
         return None
     target = rows[0]
-    new_canonical = canonical_uid_client(client_calendar_id, new_event_id)
+    new_canonical = canonical_for(new_event_id)
     when = datetime.now(UTC).isoformat()
     await db.execute(
         """UPDATE ledger_events
