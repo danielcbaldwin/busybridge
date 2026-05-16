@@ -42,7 +42,11 @@ from app.database import get_database
 from app.ledger.google_router import GoogleRouter
 from app.ledger.reconciler import reconcile_user
 from app.ledger.real_google_client import RealGoogleClient
-from app.ledger.triggers import claim_due_request, release_request
+from app.ledger.triggers import (
+    claim_due_request,
+    reclaim_stale_requests,
+    release_request,
+)
 
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
@@ -362,6 +366,9 @@ async def drain_all_due_users(*, now: Optional[datetime] = None) -> dict:
     """
     now = now or datetime.now(UTC)
     db = await get_database()
+    # Free any claim a crashed process abandoned; otherwise its row
+    # stays in_flight=1 and is never SELECTed below again.
+    await reclaim_stale_requests(db, now=now)
     rows = await (await db.execute(
         """SELECT user_id FROM reconcile_requests
             WHERE in_flight = 0

@@ -27,6 +27,11 @@ UTC = timezone.utc
 WEBHOOK_DEBOUNCE = timedelta(seconds=5)
 MANUAL_SETTLING_DELAY = timedelta(seconds=25)
 
+# An in-flight reconcile claim older than this was almost certainly
+# abandoned by a crashed process: a single reconcile pass (ingest +
+# plan + diff + bounded outbox drain) never runs this long.
+STALE_CLAIM_TIMEOUT = timedelta(minutes=15)
+
 
 # ---------------------------------------------------------------------------
 # Enqueue
@@ -109,8 +114,20 @@ async def claim_due_request(
             WHERE user_id = ?""",
         (user_id,),
     )).fetchone()
-    if row is None or row["in_flight"]:
+    if row is None:
         return None
+    if row["in_flight"]:
+        # A claim in-flight far longer than any reconcile pass could
+        # run was almost certainly abandoned by a crashed process.
+        # Reclaim it rather than freezing this user out of every
+        # future pass — otherwise in_flight=1 is a permanent lockout.
+        if not _claim_is_stale(row["last_run_at"], now):
+            return None
+        logger.warning(
+            "reclaiming stale in-flight reconcile request for user %s "
+            "(claimed at %s)",
+            user_id, row["last_run_at"],
+        )
     sched = row["scheduled_for"]
     if sched:
         try:
@@ -141,6 +158,50 @@ async def release_request(
         (user_id,),
     )
     await db.commit()
+
+
+def _claim_is_stale(last_run_at: Optional[str], now: datetime) -> bool:
+    """True when an in-flight claim is older than STALE_CLAIM_TIMEOUT
+    (or its timestamp is missing / unparseable — also treated as
+    abandoned)."""
+    if not last_run_at:
+        return True
+    try:
+        claimed = datetime.fromisoformat(last_run_at)
+    except ValueError:
+        return True
+    if claimed.tzinfo is None:
+        claimed = claimed.replace(tzinfo=UTC)
+    return now - claimed > STALE_CLAIM_TIMEOUT
+
+
+async def reclaim_stale_requests(
+    db: aiosqlite.Connection, *, now: Optional[datetime] = None,
+) -> int:
+    """Reset in-flight reconcile requests abandoned by a crashed
+    process so the drain loop can pick them up again.
+
+    ``claim_due_request`` sets ``in_flight = 1``; a clean run clears it
+    via ``release_request``.  A process that dies mid-reconcile leaves
+    the row stuck — and ``drain_all_due_users`` only ever SELECTs
+    ``in_flight = 0`` rows, so that user would never reconcile again.
+    This sweeper clears any claim older than ``STALE_CLAIM_TIMEOUT``.
+    Returns the number of rows reclaimed.
+    """
+    now = now or datetime.now(UTC)
+    cutoff = (now - STALE_CLAIM_TIMEOUT).isoformat()
+    cursor = await db.execute(
+        """UPDATE reconcile_requests
+              SET in_flight = 0
+            WHERE in_flight = 1
+              AND (last_run_at IS NULL OR last_run_at < ?)""",
+        (cutoff,),
+    )
+    await db.commit()
+    n = cursor.rowcount or 0
+    if n:
+        logger.warning("reclaimed %s stale reconcile request(s)", n)
+    return n
 
 
 # ---------------------------------------------------------------------------
