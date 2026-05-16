@@ -70,6 +70,11 @@ async def test_build_user_credentials_is_refresh_capable(
     assert creds.expiry is not None
     assert creds.expiry.tzinfo is None
 
+    # scopes is intentionally NOT pinned: the builder serves home,
+    # client, and personal accounts, which hold different scope sets,
+    # and a refresh does not need the list.
+    assert not creds.scopes
+
     # A bare-token Credentials (the old behaviour) carries none of the
     # above — it simply cannot refresh.
     from google.oauth2.credentials import Credentials

@@ -121,6 +121,22 @@ async def connect_client_calendar(
             detail="Token not found"
         )
 
+    # The main calendar must not also be connected as a client
+    # calendar.  Routing is keyed on google_calendar_id, so an overlap
+    # would send main-calendar API calls through the client account's
+    # token (or vice versa).
+    main_row = await (await db.execute(
+        "SELECT main_calendar_id FROM users WHERE id = ?", (user.id,),
+    )).fetchone()
+    if main_row and main_row["main_calendar_id"] == request.calendar_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "This calendar is your main calendar and cannot also be "
+                "connected as a client calendar."
+            ),
+        )
+
     # Verify calendar exists and is accessible
     try:
         from googleapiclient.discovery import build

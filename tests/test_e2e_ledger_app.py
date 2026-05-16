@@ -417,6 +417,53 @@ def test_e2e_activity_endpoint_returns_a_json_array(authed_client, seeded_app):
         assert item["level"] in ("info", "warning", "error")
 
 
+def test_e2e_main_calendar_cannot_be_set_to_a_connected_client(
+    authed_client, seeded_app,
+):
+    """Setting the main calendar to one already connected as a client
+    calendar must be rejected — routing is keyed on
+    google_calendar_id, so the overlap would misroute API calls."""
+    r = authed_client.put(
+        "/api/me/main-calendar",
+        json={"calendar_id": "client_a@cal.test"},
+    )
+    assert r.status_code == 400, r.text
+    assert "already connected" in r.json()["detail"].lower()
+
+
+def test_e2e_main_calendar_cannot_be_connected_as_a_client(
+    authed_client, seeded_app,
+):
+    """Connecting the user's own main calendar as a client calendar
+    must be rejected before any Google round-trip."""
+    import asyncio
+    from app.database import get_database
+
+    user_id = seeded_app["user_id"]
+
+    async def _add_client_token() -> int:
+        db = await get_database()
+        cur = await db.execute(
+            """INSERT INTO oauth_tokens
+                  (user_id, account_type, google_account_email,
+                   access_token_encrypted, refresh_token_encrypted)
+               VALUES (?, 'client', 'other@example.com', ?, ?)
+               RETURNING id""",
+            (user_id, b"d", b"d"),
+        )
+        tid = int((await cur.fetchone())["id"])
+        await db.commit()
+        return tid
+
+    token_id = asyncio.get_event_loop().run_until_complete(_add_client_token())
+    r = authed_client.post(
+        "/api/client-calendars",
+        json={"token_id": token_id, "calendar_id": "alice@example.com"},
+    )
+    assert r.status_code == 400, r.text
+    assert "main calendar" in r.json()["detail"].lower()
+
+
 def test_e2e_sync_progress_uses_a_known_status(authed_client, seeded_app):
     """The dashboard progress widget only understands settling /
     syncing / complete / error / idle.  The endpoint used to return

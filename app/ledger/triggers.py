@@ -106,6 +106,13 @@ async def claim_due_request(
     """Atomically grab the user's due reconcile request and mark
     it in-flight.  Returns the source list, or None if nothing is
     due yet.
+
+    The claim is a *conditional* UPDATE checked via ``rowcount`` — its
+    WHERE clause itself enforces "claimable" (not in-flight, or an
+    abandoned/stale claim).  Two drains racing for the same user —
+    in this process or, with SQLite serialising the write, another —
+    cannot therefore both win: the loser sees ``rowcount == 0``.  A
+    plain select-then-update would let both proceed.
     """
     now = now or datetime.now(UTC)
     row = await (await db.execute(
@@ -116,18 +123,8 @@ async def claim_due_request(
     )).fetchone()
     if row is None:
         return None
-    if row["in_flight"]:
-        # A claim in-flight far longer than any reconcile pass could
-        # run was almost certainly abandoned by a crashed process.
-        # Reclaim it rather than freezing this user out of every
-        # future pass — otherwise in_flight=1 is a permanent lockout.
-        if not _claim_is_stale(row["last_run_at"], now):
-            return None
-        logger.warning(
-            "reclaiming stale in-flight reconcile request for user %s "
-            "(claimed at %s)",
-            user_id, row["last_run_at"],
-        )
+    # Not yet due — a future scheduled_for is a hard pre-condition,
+    # independent of any race.
     sched = row["scheduled_for"]
     if sched:
         try:
@@ -138,14 +135,33 @@ async def claim_due_request(
             sched_dt = None
         if sched_dt is not None and sched_dt > now:
             return None
+
+    was_in_flight = bool(row["in_flight"])
     sources = json.loads(row["sources_json"] or "[]") if row["sources_json"] else []
-    await db.execute(
+    # Compare-and-claim: the row is claimable when it is not in-flight,
+    # or its in-flight claim is older than STALE_CLAIM_TIMEOUT (a
+    # crashed process never released it).
+    stale_cutoff = (now - STALE_CLAIM_TIMEOUT).isoformat()
+    cursor = await db.execute(
         """UPDATE reconcile_requests
               SET in_flight = 1, sources_json = NULL, last_run_at = ?
-            WHERE user_id = ?""",
-        (now.isoformat(), user_id),
+            WHERE user_id = ?
+              AND (in_flight = 0
+                   OR last_run_at IS NULL
+                   OR last_run_at < ?)""",
+        (now.isoformat(), user_id, stale_cutoff),
     )
     await db.commit()
+    if (cursor.rowcount or 0) == 0:
+        # Either an in-flight claim is still fresh, or another drain
+        # won the race.  Nothing claimed.
+        return None
+    if was_in_flight:
+        logger.warning(
+            "reclaimed stale in-flight reconcile request for user %s "
+            "(claimed at %s)",
+            user_id, row["last_run_at"],
+        )
     return {"sources": sources}
 
 
@@ -158,21 +174,6 @@ async def release_request(
         (user_id,),
     )
     await db.commit()
-
-
-def _claim_is_stale(last_run_at: Optional[str], now: datetime) -> bool:
-    """True when an in-flight claim is older than STALE_CLAIM_TIMEOUT
-    (or its timestamp is missing / unparseable — also treated as
-    abandoned)."""
-    if not last_run_at:
-        return True
-    try:
-        claimed = datetime.fromisoformat(last_run_at)
-    except ValueError:
-        return True
-    if claimed.tzinfo is None:
-        claimed = claimed.replace(tzinfo=UTC)
-    return now - claimed > STALE_CLAIM_TIMEOUT
 
 
 async def reclaim_stale_requests(

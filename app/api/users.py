@@ -95,6 +95,26 @@ async def set_main_calendar(
     """Set user's main calendar."""
     db = await get_database()
 
+    # The main calendar must not already be connected as a client or
+    # personal calendar.  Routing is keyed on google_calendar_id, so an
+    # overlap would route main-calendar API calls through the
+    # connected calendar's account.  Checked before the Google
+    # round-trip so an obvious local conflict fails fast.
+    conflict = await (await db.execute(
+        """SELECT calendar_type FROM client_calendars
+            WHERE user_id = ? AND google_calendar_id = ? AND is_active = TRUE""",
+        (user.id, request.calendar_id),
+    )).fetchone()
+    if conflict:
+        kind = conflict["calendar_type"] or "client"
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"This calendar is already connected as a {kind} calendar. "
+                f"Disconnect it before setting it as your main calendar."
+            ),
+        )
+
     # Verify the calendar exists and user has access
     try:
         from googleapiclient.discovery import build

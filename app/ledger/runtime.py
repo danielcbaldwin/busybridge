@@ -125,8 +125,16 @@ async def reconcile_user_by_id(
     on the lock rather than interleaving (which would mean two
     ingest/diff/drain passes racing over the same calendars).
 
-    The app is single-process (one event loop), so an in-process
-    :class:`asyncio.Lock` per user is complete enforcement.
+    Scope of the guarantee: the app is single-process (one event
+    loop), so this in-process :class:`asyncio.Lock` per user is
+    complete enforcement *for that model*.  It does NOT span
+    processes.  The two pieces of shared state a second process would
+    contend for — the reconcile request and the outbox queue — are
+    instead guarded by atomic compare-and-claim UPDATEs
+    (``triggers.claim_due_request``, ``outbox._claim_next``), which
+    SQLite serialises.  Running multiple workers would still want a
+    DB-level advisory lock around the *whole* reconcile pass; the
+    asyncio lock alone is not enough there.
     """
     async with _user_lock(user_id):
         return await _reconcile_user_once(

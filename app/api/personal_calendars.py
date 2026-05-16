@@ -102,6 +102,24 @@ async def connect_personal_calendars(
             detail="No calendars selected"
         )
 
+    # The main calendar must not also be connected as a personal
+    # calendar — routing is keyed on google_calendar_id, so an overlap
+    # would route main-calendar API calls through the wrong account.
+    main_row = await (await db.execute(
+        "SELECT main_calendar_id FROM users WHERE id = ?", (user.id,),
+    )).fetchone()
+    main_calendar_id = main_row["main_calendar_id"] if main_row else None
+    if main_calendar_id and any(
+        c.get("calendar_id") == main_calendar_id for c in request.calendars
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Your main calendar cannot also be connected as a "
+                "personal calendar."
+            ),
+        )
+
     results = []
     for cal_info in request.calendars:
         calendar_id = cal_info.get("calendar_id")

@@ -292,7 +292,11 @@ async def build_user_credentials(user_id: int, email: str) -> Credentials:
         token_uri=GOOGLE_TOKEN_URL,
         client_id=client_id,
         client_secret=client_secret,
-        scopes=HOME_SCOPES,
+        # scopes is deliberately omitted: this builder serves home,
+        # client, and personal accounts alike, which hold different
+        # scope sets.  A refresh does not need the scope list — Google
+        # reports the actual granted scopes back — and hard-coding
+        # HOME_SCOPES here would be misleading for the others.
     )
     # google-auth compares expiry against a naive UTC now(); the token
     # store writes a naive-UTC isoformat, so parsing yields the right

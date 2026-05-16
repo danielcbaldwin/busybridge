@@ -235,7 +235,14 @@ async def _claim_next(
     user_id: int,
     now: datetime,
 ) -> Optional[aiosqlite.Row]:
-    """Atomically pull the oldest due pending op and mark it in-flight."""
+    """Atomically pull the oldest due pending op and mark it in-flight.
+
+    The claim is a *conditional* UPDATE (``WHERE id = ? AND status =
+    'pending'``) checked via ``rowcount`` — not a select-then-update.
+    That makes it safe even if two drains race for the same op, in
+    this process or (with SQLite serialising the write) another: the
+    loser sees ``rowcount == 0`` and claims nothing.
+    """
     row = await (await db.execute(
         """SELECT * FROM outbox_operations
             WHERE user_id = ?
@@ -246,13 +253,16 @@ async def _claim_next(
     )).fetchone()
     if row is None:
         return None
-    await db.execute(
+    cursor = await db.execute(
         """UPDATE outbox_operations
               SET status = ?, started_at = ?, attempts = attempts + 1
-            WHERE id = ?""",
-        (STATUS_IN_FLIGHT, now.isoformat(), row["id"]),
+            WHERE id = ? AND status = ?""",
+        (STATUS_IN_FLIGHT, now.isoformat(), row["id"], STATUS_PENDING),
     )
     await db.commit()
+    if (cursor.rowcount or 0) == 0:
+        # Another claimant won the row between our SELECT and UPDATE.
+        return None
     return row
 
 

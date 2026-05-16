@@ -109,6 +109,31 @@ async def test_claim_due_request_takes_over_a_stale_claim():
     await s.close()
 
 
+async def test_two_claims_cannot_both_win_a_due_request():
+    """Compare-and-claim: a second claim of a request the first call
+    already grabbed returns None, even though it was never released —
+    the conditional UPDATE, not a select-then-update, is what makes
+    the claim safe under a race."""
+    s = Scenario()
+    s.given_calendar("main")
+    user = await s.given_user("alice", main="main")
+    db = await s.setup_db()
+    now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+
+    await _put_request(
+        db, user.user_id,
+        in_flight=False,
+        last_run_at=None,
+        scheduled_for=now - timedelta(minutes=1),
+    )
+
+    first = await claim_due_request(db, user_id=user.user_id, now=now)
+    second = await claim_due_request(db, user_id=user.user_id, now=now)
+    assert first is not None, "first claim should have won the request"
+    assert second is None, "a second claim double-won the same request"
+    await s.close()
+
+
 async def test_claim_due_request_respects_a_fresh_claim():
     s = Scenario()
     s.given_calendar("main")
