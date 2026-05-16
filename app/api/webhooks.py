@@ -95,7 +95,32 @@ async def receive_google_calendar_webhook(
                 (x_goog_channel_id,)
             )
             await db.commit()
-            # TODO: Trigger webhook re-registration for this calendar
+            # Re-register the user's webhook channels.  The renewal
+            # job only renews channels still in the table, so a
+            # channel deleted here would otherwise be left without a
+            # webhook until a full re-registration.  Run in the
+            # background so the webhook ack stays fast.
+            try:
+                from app.jobs.webhook_renewal import register_webhooks_for_user
+                from app.utils.tasks import create_background_task
+
+                async def _reregister(user_id: int) -> None:
+                    try:
+                        await register_webhooks_for_user(user_id)
+                    except Exception:
+                        logger.exception(
+                            "webhook re-registration failed for user %s",
+                            user_id,
+                        )
+
+                create_background_task(
+                    _reregister(channel["user_id"]),
+                    f"webhook_reregister_user_{channel['user_id']}",
+                )
+            except Exception as e:
+                logger.warning(
+                    "could not schedule webhook re-registration: %s", e,
+                )
             return {"status": "ok", "message": "Channel expired and removed"}
 
     # Enqueue a debounced reconcile request and schedule an

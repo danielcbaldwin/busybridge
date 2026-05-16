@@ -57,6 +57,32 @@ def test_setup_scheduler_registers_webhook_job_when_enabled(monkeypatch):
     scheduler.shutdown_scheduler()
 
 
+def test_setup_scheduler_registers_vacuum_job(monkeypatch):
+    """Scheduler setup should register the weekly database VACUUM
+    job so the DB reclaims space after retention deletes."""
+    import app.jobs.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "AsyncIOScheduler", _FakeScheduler)
+    monkeypatch.setattr(
+        scheduler,
+        "get_settings",
+        lambda: SimpleNamespace(
+            sync_interval_minutes=5,
+            enable_webhooks=True,
+            webhook_renewal_hours=6,
+            consistency_check_hours=1,
+            token_refresh_minutes=30,
+            alert_process_minutes=1,
+        ),
+    )
+
+    sched = scheduler.setup_scheduler()
+    assert "database_vacuum" in sched.jobs
+    assert "retention_cleanup" in sched.jobs
+
+    scheduler.shutdown_scheduler()
+
+
 def test_setup_scheduler_skips_webhook_job_when_disabled(monkeypatch):
     """Scheduler setup should skip webhook renewal when ENABLE_WEBHOOKS is false."""
     import app.jobs.scheduler as scheduler

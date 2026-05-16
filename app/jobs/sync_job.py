@@ -42,8 +42,58 @@ async def run_periodic_sync() -> None:
         await ledger_enqueue_periodic()
         await ledger_drain_due()
         await _check_circuit_breaker()
+        await _alert_failing_calendars()
     finally:
         await release_job_lock("periodic_sync")
+
+
+async def _alert_failing_calendars() -> None:
+    """Email an alert for any calendar stuck at 5+ consecutive sync
+    failures (REWRITE_PLAN.md §12).
+
+    Distinct from the circuit breaker, which fires only when EVERY
+    calendar is failing.  ``queue_alert`` dedups per alert-type per
+    user within an hour, so a persistently-failing calendar alerts
+    at most hourly.  Calendars are grouped per user into one alert.
+    """
+    db = await get_database()
+    rows = await (await db.execute(
+        """SELECT cc.user_id,
+                  cc.display_name,
+                  cc.google_calendar_id,
+                  css.consecutive_failures,
+                  css.last_error
+             FROM client_calendars cc
+             JOIN calendar_sync_state css
+               ON cc.id = css.client_calendar_id
+            WHERE cc.is_active = TRUE
+              AND COALESCE(css.consecutive_failures, 0) >= 5
+            ORDER BY cc.user_id""",
+    )).fetchall()
+    if not rows:
+        return
+
+    from app.alerts.email import queue_alert
+
+    by_user: dict[int, list] = {}
+    for row in rows:
+        by_user.setdefault(int(row["user_id"]), []).append(row)
+
+    for user_id, cals in by_user.items():
+        lines = [
+            f"- {c['display_name'] or c['google_calendar_id']}: "
+            f"{c['consecutive_failures']} consecutive failures "
+            f"(last error: {c['last_error'] or 'unknown'})"
+            for c in cals
+        ]
+        await queue_alert(
+            alert_type="calendar_sync_failing",
+            user_id=user_id,
+            details=(
+                "One or more calendars have failed to sync 5+ times "
+                "in a row:\n" + "\n".join(lines)
+            ),
+        )
 
 
 async def _check_circuit_breaker() -> None:

@@ -102,6 +102,17 @@ def setup_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
 
+    # Database VACUUM - weekly, Sunday 4:30 AM.  Reclaims space after
+    # retention deletes; VACUUM rewrites the whole file, so keep it
+    # infrequent and off the daily-cleanup hot path.
+    _scheduler.add_job(
+        "app.jobs.cleanup:vacuum_database",
+        trigger=CronTrigger(day_of_week="sun", hour=4, minute=30),
+        id="database_vacuum",
+        name="Database VACUUM",
+        replace_existing=True,
+    )
+
     # Backup - daily at 11 PM (uses system timezone, set via TZ env var)
     _scheduler.add_job(
         "app.jobs.backup_job:run_scheduled_backup",
