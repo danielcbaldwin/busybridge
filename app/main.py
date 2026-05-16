@@ -18,26 +18,47 @@ from slowapi.middleware import SlowAPIMiddleware
 from app.config import get_settings
 from app.database import close_database, get_database
 
-# Configure logging
+# Configure logging.  stdout always; a rotating file handler when
+# the log directory is writable.
 _log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-_log_handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
-
-_log_dir = get_settings().log_dir
-os.makedirs(_log_dir, exist_ok=True)
-_file_handler = logging.handlers.TimedRotatingFileHandler(
-    os.path.join(_log_dir, "busybridge.log"),
-    when="midnight",
-    backupCount=14,
-)
-_file_handler.setFormatter(logging.Formatter(_log_format))
-_log_handlers.append(_file_handler)
 
 logging.basicConfig(
     level=logging.INFO,
     format=_log_format,
-    handlers=_log_handlers,
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+
+
+def _install_file_logging(log_dir: str) -> bool:
+    """Best-effort rotating file logging.
+
+    Production mounts ``/data`` as a writable volume, but dev / CI /
+    sandbox environments often do not — and this runs at import
+    time, so a failure here would make the whole app un-importable.
+    On an unwritable directory it logs a warning and returns
+    ``False``; stdout logging still applies.
+    """
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        handler = logging.handlers.TimedRotatingFileHandler(
+            os.path.join(log_dir, "busybridge.log"),
+            when="midnight",
+            backupCount=14,
+        )
+        handler.setFormatter(logging.Formatter(_log_format))
+        logging.getLogger().addHandler(handler)
+        return True
+    except OSError as e:
+        logger.warning(
+            "file logging disabled (%s not writable: %s); "
+            "logging to stdout only",
+            log_dir, e,
+        )
+        return False
+
+
+_install_file_logging(get_settings().log_dir)
 
 
 # Rate limiter (shared instance lives in app.rate_limit to avoid circular imports)
