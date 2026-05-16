@@ -25,6 +25,7 @@ from app.auth.session import (
     create_or_update_user,
     create_session_token,
     get_current_user,
+    session_cookie_secure,
     update_user_last_login,
     User,
 )
@@ -267,7 +268,7 @@ async def oauth_callback(
             key=SESSION_COOKIE_NAME,
             value=session_token,
             httponly=True,
-            secure=True,
+            secure=session_cookie_secure(),
             samesite="lax",
             max_age=60 * 60 * 24 * 7  # 7 days
         )

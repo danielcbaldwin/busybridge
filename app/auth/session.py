@@ -17,6 +17,20 @@ ALGORITHM = "HS256"
 SESSION_COOKIE_NAME = "session"
 
 
+def session_cookie_secure() -> bool:
+    """Whether the session cookie should carry the ``Secure`` flag.
+
+    Hard-coding ``Secure=True`` silently breaks login on the plain-HTTP
+    deployments a self-hosted tool legitimately runs — a LAN box, a
+    localhost trial, or a setup behind a TLS-terminating proxy that is
+    itself reached over HTTP.  The browser simply never returns the
+    cookie, so the user can never stay logged in.  Derive the flag from
+    the configured public URL instead: HTTPS deployments get ``Secure``
+    cookies, HTTP ones do not.
+    """
+    return get_settings().public_url.lower().startswith("https://")
+
+
 class SessionData(BaseModel):
     """Session data stored in JWT."""
     user_id: int
