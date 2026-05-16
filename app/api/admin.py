@@ -786,19 +786,26 @@ async def factory_reset(
 
 @router.get("/export")
 async def export_database(admin: User = Depends(require_admin)):
-    """Download database backup."""
-    settings = get_settings()
+    """Download a consistent backup of the database.
 
-    if not os.path.exists(settings.database_path):
+    Goes through the backup pipeline's sqlite3-backup ZIP rather than
+    serving the raw DB file: the database runs in WAL mode, so a raw
+    file copy can omit changes still sitting in an uncheckpointed
+    write-ahead log.
+    """
+    from app.sync.backup import _backup_filepath, create_backup
+
+    meta = await create_backup()
+    zip_path = _backup_filepath(meta["backup_id"])
+    if not os.path.exists(zip_path):
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Database file not found"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Backup could not be created",
         )
-
     return FileResponse(
-        path=settings.database_path,
-        filename=f"calendar-sync-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db",
-        media_type="application/octet-stream",
+        path=zip_path,
+        filename=f"{meta['backup_id']}.zip",
+        media_type="application/zip",
     )
 
 

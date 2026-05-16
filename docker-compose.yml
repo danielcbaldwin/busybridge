@@ -13,7 +13,11 @@ services:
     environment:
       - DATABASE_PATH=/data/calendar-sync.db
       - ENCRYPTION_KEY_FILE=/secrets/encryption.key
-      - PUBLIC_URL=https://${FQDN:-localhost:3000}
+      # Externally-reachable base URL.  Default matches the published
+      # host port (8033) over plain HTTP for a local run; set PUBLIC_URL
+      # to your real https:// origin in production — the session
+      # cookie's Secure flag is derived from this scheme.
+      - PUBLIC_URL=${PUBLIC_URL:-http://localhost:8033}
       - LOG_LEVEL=info
       - TZ=America/New_York
       # TEST_MODE quick switch:

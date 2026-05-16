@@ -45,7 +45,7 @@
                         </span>
                         {% else %}
                         <button type="button"
-                                onclick="connectCalendar({{ token_id }}, '{{ cal['id'] }}', '{{ cal.get('summary', cal['id']) | e }}')"
+                                onclick="connectCalendar({{ token_id }}, {{ cal['id'] | tojson }}, {{ cal.get('summary', cal['id']) | tojson }})"
                                 class="flex-shrink-0 inline-flex items-center px-3 sm:px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700">
                             Connect
                         </button>

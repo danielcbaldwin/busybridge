@@ -23,6 +23,7 @@ import io
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import tempfile
 import zipfile
@@ -212,7 +213,12 @@ async def create_backup(user_ids: Optional[list[int]] = None) -> dict:
     settings = get_settings()
     now = datetime.now()  # respects TZ env var
     backup_type = _classify_backup(now)
-    backup_id = f"backup-{now.strftime('%Y%m%d-%H%M%S')}-{backup_type}"
+    # A random suffix keeps two backups started in the same second
+    # from colliding on the same id (and overwriting each other's ZIP).
+    backup_id = (
+        f"backup-{now.strftime('%Y%m%d-%H%M%S')}-{backup_type}"
+        f"-{secrets.token_hex(3)}"
+    )
     zip_path = _backup_filepath(backup_id)
 
     db = await get_database()
