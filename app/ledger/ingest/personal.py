@@ -72,7 +72,11 @@ async def ingest_personal_calendar(
         try:
             page = google.list_events(
                 google_calendar_id,
-                sync_token=sync_token if page_token is None else None,
+                # Google's sync guide: every page of an incremental
+                # sync carries the SAME syncToken (plus pageToken for
+                # pages 2+).  Dropping it on later pages can break a
+                # sync that spans >250 changes.
+                sync_token=sync_token,
                 page_token=page_token,
                 show_deleted=True,
                 max_results=250,

@@ -152,6 +152,20 @@ CREATE TABLE IF NOT EXISTS reconcile_requests (
 );
 
 
+-- Ledger events awaiting a replan.  One row per (user, event): the
+-- ingest layer and admin ops INSERT OR IGNORE here, so concurrent
+-- writers cannot lose each other's ids (the old sources_json JSON
+-- blob did a racy read-merge-write).  The reconciler deletes a row
+-- only AFTER that event's planning succeeds, so a crash mid-plan
+-- re-plans next pass instead of stranding the work.
+CREATE TABLE IF NOT EXISTS affected_ledger_events (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    ledger_event_id INTEGER NOT NULL REFERENCES ledger_events(id) ON DELETE CASCADE,
+    enqueued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, ledger_event_id)
+);
+
+
 -- Orphan guard (REWRITE_PLAN.md §18).  Hard-deleting a ledger_event
 -- whose projection is still 'present' on Google cascades the
 -- projection away without deleting the Google event, leaving an

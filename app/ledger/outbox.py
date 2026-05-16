@@ -451,6 +451,30 @@ async def _do_update(
             )
             await _request_projection_replan(db, op["projection_id"])
             return "superseded"
+        if getattr(e, "status", None) in (404, 410):
+            # The event we meant to update is gone — a user deleted
+            # our managed copy.  Reset the projection so the next diff
+            # re-CREATEs it, rather than poison-pilling the update
+            # (404 is otherwise a permanent-failure status).
+            await db.execute(
+                """UPDATE ledger_projections
+                      SET current_state = 'absent',
+                          google_event_id = NULL,
+                          google_etag = NULL,
+                          applied_ledger_version = NULL,
+                          applied_payload_hash = NULL
+                    WHERE id = ?""",
+                (int(proj["id"]),),
+            )
+            await db.commit()
+            await _mark_superseded(
+                db, op,
+                error="target_event_gone",
+                http_status=int(getattr(e, "status", 404)),
+                now=now,
+            )
+            await _request_projection_replan(db, op["projection_id"])
+            return "superseded"
         raise
     await _record_success(
         db, op,

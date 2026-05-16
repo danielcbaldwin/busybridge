@@ -70,7 +70,11 @@ async def ingest_client_calendar(
         try:
             page = google.list_events(
                 google_calendar_id,
-                sync_token=sync_token if page_token is None else None,
+                # Google's sync guide: every page of an incremental
+                # sync carries the SAME syncToken (plus pageToken for
+                # pages 2+).  Dropping it on later pages can break a
+                # sync that spans >250 changes.
+                sync_token=sync_token,
                 page_token=page_token,
                 show_deleted=True,
                 max_results=250,
@@ -359,10 +363,23 @@ async def _maybe_revert_client_drift(
     ``events.update`` is not rejected by ``If-Match``
     (REWRITE_PLAN.md §9; uniform with the main-copy revert).
 
-    A user-deleted busy block (status=cancelled) is left alone here —
-    re-creation on demand is out of this path's scope.
+    A user-deleted busy block (status=cancelled) resets the projection
+    so the diff re-CREATEs it: a missing busy block is a real
+    correctness failure for a calendar-as-truth system, and leaving
+    the projection 'present' would make the next source change emit an
+    ``events.update`` that 404s and poison-pills.
     """
     if event.get("status") == "cancelled":
+        await db.execute(
+            """UPDATE ledger_projections
+                  SET current_state = 'absent',
+                      google_event_id = NULL,
+                      google_etag = NULL,
+                      applied_ledger_version = NULL,
+                      applied_payload_hash = NULL
+                WHERE id = ?""",
+            (int(proj_match["id"]),),
+        )
         return
     ev_etag = event.get("etag")
     stored = proj_match["google_etag"]
@@ -854,26 +871,15 @@ async def _get_or_create_sync_state(
 async def _record_affected(
     db: aiosqlite.Connection, *, user_id: int, ledger_ids: list[int],
 ) -> None:
-    """Append affected ledger_event ids to the user's reconcile_request."""
-    when = datetime.now(UTC).isoformat()
-    existing = await (await db.execute(
-        "SELECT sources_json FROM reconcile_requests WHERE user_id = ?",
-        (user_id,),
-    )).fetchone()
-    if existing is None:
-        sources = list(set(ledger_ids))
-        await db.execute(
-            """INSERT INTO reconcile_requests
-                  (user_id, sources_json, enqueued_at, scheduled_for)
-               VALUES (?, ?, ?, ?)""",
-            (user_id, json.dumps(sources), when, when),
-        )
+    """Mark affected ledger events for replan.
+
+    Ingest already runs inside a reconcile pass that will plan these
+    events in its own step 3, so this only records them — it does not
+    schedule a further reconcile.
+    """
+    if not ledger_ids:
         return
-    prior = json.loads(existing["sources_json"] or "[]")
-    merged = list({*prior, *ledger_ids})
-    await db.execute(
-        """UPDATE reconcile_requests
-              SET sources_json = ?, enqueued_at = ?
-            WHERE user_id = ?""",
-        (json.dumps(merged), when, user_id),
+    from app.ledger.triggers import record_affected_events
+    await record_affected_events(
+        db, user_id=user_id, ledger_event_ids=ledger_ids,
     )

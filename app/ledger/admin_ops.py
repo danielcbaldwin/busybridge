@@ -323,27 +323,16 @@ async def retry_permanent_failures(
 async def _append_affected(
     db: aiosqlite.Connection, *, user_id: int, ledger_ids: list[int],
 ) -> None:
-    import json
+    """Mark affected ledger events for replan AND schedule a reconcile.
+
+    Admin ops run outside any reconcile pass, so — unlike ingest's
+    ``_record_affected`` — this also upserts a ``reconcile_requests``
+    row so the drain loop actually picks the user up.
+    """
     if not ledger_ids:
         return
-    when = datetime.now(UTC).isoformat()
-    existing = await (await db.execute(
-        "SELECT sources_json FROM reconcile_requests WHERE user_id = ?",
-        (user_id,),
-    )).fetchone()
-    if existing is None:
-        await db.execute(
-            """INSERT INTO reconcile_requests
-                  (user_id, sources_json, enqueued_at, scheduled_for)
-               VALUES (?, ?, ?, ?)""",
-            (user_id, json.dumps(list(set(ledger_ids))), when, when),
-        )
-        return
-    prior = json.loads(existing["sources_json"] or "[]")
-    merged = list({*prior, *ledger_ids})
-    await db.execute(
-        """UPDATE reconcile_requests
-              SET sources_json = ?, enqueued_at = ?
-            WHERE user_id = ?""",
-        (json.dumps(merged), when, user_id),
+    from app.ledger.triggers import enqueue_periodic, record_affected_events
+    await record_affected_events(
+        db, user_id=user_id, ledger_event_ids=ledger_ids,
     )
+    await enqueue_periodic(db, user_id=user_id)

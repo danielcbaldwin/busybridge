@@ -95,6 +95,32 @@ async def enqueue_manual(
 
 
 # ---------------------------------------------------------------------------
+# Affected-event recording
+# ---------------------------------------------------------------------------
+async def record_affected_events(
+    db: aiosqlite.Connection,
+    *,
+    user_id: int,
+    ledger_event_ids: Iterable[int],
+) -> None:
+    """Mark ledger events as needing a replan.
+
+    Each id is an independent ``INSERT OR IGNORE`` into
+    ``affected_ledger_events`` — there is no read-merge-write, so two
+    concurrent callers cannot clobber each other's ids (the failure
+    mode of the old ``reconcile_requests.sources_json`` JSON blob).
+    The reconciler reads these rows, plans each event, and deletes the
+    row only once planning has succeeded.
+    """
+    for lid in {int(x) for x in ledger_event_ids}:
+        await db.execute(
+            """INSERT OR IGNORE INTO affected_ledger_events
+                  (user_id, ledger_event_id) VALUES (?, ?)""",
+            (user_id, lid),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Claim
 # ---------------------------------------------------------------------------
 async def claim_due_request(

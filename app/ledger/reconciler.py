@@ -257,12 +257,17 @@ async def reconcile_user(
             logger.warning("discovery scan failed user_id=%s: %s", user_id, e)
             out["ingest_errors"]["discovery"] = str(e)
 
-    # 3. Plan affected ledger rows.  We pull the affected list out
-    #    of reconcile_requests and clear it inside this run.
-    affected = await _consume_affected_ledger_ids(db, user_id=user_id)
+    # 3. Plan affected ledger rows.  The affected ids are READ first
+    #    and only cleared AFTER planning succeeds — a crash mid-plan
+    #    re-plans next pass instead of stranding the work.
+    affected = await _read_affected_ledger_ids(db, user_id=user_id)
     for ledger_id in affected:
         await plan_for_ledger_event(db, ledger_event_id=ledger_id)
         out["planned"] += 1
+    if affected:
+        await _clear_affected_ledger_ids(
+            db, user_id=user_id, ledger_event_ids=affected,
+        )
 
     # 4. Diff + drain + replan loop.  An etag-mismatch on update
     #    marks an op superseded and clears the projection's
@@ -331,27 +336,34 @@ async def _bump_failure(
     await db.commit()
 
 
-async def _consume_affected_ledger_ids(
+async def _read_affected_ledger_ids(
     db: aiosqlite.Connection, *, user_id: int,
 ) -> list[int]:
-    """Pull and clear the affected list for one user."""
-    row = await (await db.execute(
-        "SELECT sources_json FROM reconcile_requests WHERE user_id = ?",
+    """The ledger events awaiting a replan for one user.
+
+    Read-only: the rows are deleted by :func:`_clear_affected_ledger_ids`
+    only AFTER planning succeeds, so a crash mid-plan re-plans next
+    pass rather than stranding the work.
+    """
+    rows = await (await db.execute(
+        "SELECT ledger_event_id FROM affected_ledger_events WHERE user_id = ?",
         (user_id,),
-    )).fetchone()
-    if row is None or not row["sources_json"]:
-        return []
-    ids = json.loads(row["sources_json"])
-    when = datetime.now(UTC).isoformat()
-    await db.execute(
-        """UPDATE reconcile_requests
-              SET sources_json = NULL,
-                  in_flight = 0,
-                  last_run_at = ?
-            WHERE user_id = ?""",
-        (when, user_id),
-    )
+    )).fetchall()
+    return [int(r["ledger_event_id"]) for r in rows]
+
+
+async def _clear_affected_ledger_ids(
+    db: aiosqlite.Connection, *, user_id: int, ledger_event_ids: list[int],
+) -> None:
+    """Delete affected-event rows once their planning has succeeded.
+
+    Only the ids actually planned are cleared — any added concurrently
+    during the pass survive for the next reconcile.
+    """
+    for lid in ledger_event_ids:
+        await db.execute(
+            """DELETE FROM affected_ledger_events
+                WHERE user_id = ? AND ledger_event_id = ?""",
+            (user_id, int(lid)),
+        )
     await db.commit()
-    # The list might contain non-int legacy junk if ingest evolves;
-    # belt-and-braces filter.
-    return [int(i) for i in ids if isinstance(i, int) or str(i).isdigit()]

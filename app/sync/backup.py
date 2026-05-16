@@ -772,7 +772,20 @@ async def restore_from_backup(
             metadata = json.load(f)
 
     backup_user_ids: list[int] = metadata.get("user_ids_snapshotted", [])
-    target_user_ids: list[int] = user_ids if user_ids else backup_user_ids
+    if user_ids:
+        # A scoped restore must name only users actually present in
+        # this backup.  _restore_single_user deletes the live rows
+        # before loading the backup rows, so a typo'd / stale id would
+        # otherwise wipe that live user with nothing to restore.
+        unknown = sorted(set(user_ids) - set(backup_user_ids))
+        if unknown:
+            raise ValueError(
+                f"users {unknown} are not in backup {backup_id} "
+                f"(snapshotted: {sorted(backup_user_ids)})"
+            )
+        target_user_ids: list[int] = list(user_ids)
+    else:
+        target_user_ids = list(backup_user_ids)
 
     summary: dict = {
         "backup_id": backup_id,
