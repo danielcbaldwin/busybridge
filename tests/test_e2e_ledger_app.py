@@ -464,6 +464,72 @@ def test_e2e_main_calendar_cannot_be_connected_as_a_client(
     assert "main calendar" in r.json()["detail"].lower()
 
 
+def test_e2e_delete_user_drains_google_events(authed_client, seeded_app):
+    """Deleting a user must remove BusyBridge-managed events from
+    Google before wiping the ledger — otherwise the managed copies
+    are orphaned with no record left to track them."""
+    import asyncio
+
+    from app.database import get_database
+
+    fake = seeded_app["fake"]
+    fake.add_calendar("u2_main@cal.test", "U2 Main")
+    fake.add_calendar("u2_client@cal.test", "U2 Client")
+
+    async def _make_user2() -> int:
+        db = await get_database()
+        u = await (await db.execute(
+            """INSERT INTO users
+                  (email, google_user_id, display_name, main_calendar_id,
+                   is_admin)
+               VALUES ('u2@example.com', 'g-u2', 'U2',
+                       'u2_main@cal.test', 0)
+               RETURNING id""",
+        )).fetchone()
+        uid = int(u["id"])
+        tok = await (await db.execute(
+            """INSERT INTO oauth_tokens
+                  (user_id, account_type, google_account_email,
+                   access_token_encrypted, refresh_token_encrypted)
+               VALUES (?, 'home', 'u2@example.com', ?, ?)
+               RETURNING id""",
+            (uid, b"d", b"d"),
+        )).fetchone()
+        await db.execute(
+            """INSERT INTO client_calendars
+                  (user_id, oauth_token_id, google_calendar_id,
+                   display_name, calendar_type, is_active)
+               VALUES (?, ?, 'u2_client@cal.test', 'U2 Client',
+                       'client', 1)""",
+            (uid, int(tok["id"])),
+        )
+        await db.commit()
+        return uid
+
+    user2_id = asyncio.get_event_loop().run_until_complete(_make_user2())
+
+    fake.insert_event("u2_client@cal.test", {
+        "summary": "U2 event",
+        "start": {"dateTime": "2026-04-01T09:00:00Z", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-04-01T09:30:00Z", "timeZone": "UTC"},
+    })
+    authed_client.post(f"/api/admin/ledger/users/{user2_id}/reconcile-now")
+    main_before = [
+        e for e in fake.list_events("u2_main@cal.test")["items"]
+        if e.get("summary") == "U2 event"
+    ]
+    assert len(main_before) == 1, "setup: main copy should exist pre-delete"
+
+    r = authed_client.delete(f"/api/admin/users/{user2_id}")
+    assert r.status_code == 200, r.text
+
+    main_after = [
+        e for e in fake.list_events("u2_main@cal.test")["items"]
+        if e.get("summary") == "U2 event"
+    ]
+    assert main_after == [], "managed event orphaned after user deletion"
+
+
 def test_e2e_client_calendar_list_handles_unsynced_calendars(
     authed_client, seeded_app,
 ):

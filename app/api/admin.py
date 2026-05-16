@@ -390,6 +390,22 @@ async def delete_user(
         except Exception as e:
             logger.warning(f"Error cleaning up calendar {cal['id']}: {e}")
 
+    # Drain the staged Google deletes BEFORE wiping the ledger.
+    # disconnect_calendar only sets projections to absent; the diff +
+    # outbox drain that actually removes the events from Google runs
+    # inside a reconcile pass.  Without this, DELETE FROM users
+    # cascades the ledger/outbox away and the BusyBridge-managed
+    # events are orphaned on Google with nothing left to track them.
+    # Best-effort: a revoked token must not block the user deletion.
+    try:
+        from app.ledger.runtime import reconcile_user_by_id
+        await reconcile_user_by_id(user_id)
+    except Exception as e:
+        logger.warning(
+            "could not drain Google deletes before deleting user %s: %s",
+            user_id, e,
+        )
+
     # Delete user (cascades to related records)
     await db.execute("DELETE FROM users WHERE id = ?", (user_id,))
     await db.commit()
