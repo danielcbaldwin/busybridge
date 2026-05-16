@@ -24,6 +24,7 @@ import base64
 import hashlib
 import re
 import struct
+from datetime import datetime, timezone
 from typing import Optional
 
 # Stamp that marks a deterministic Google ID as ours.  Three
@@ -145,16 +146,27 @@ def derive_instance_google_event_id(
         # Defensive: ensure 8 digits.
         stamp = stamp[:8]
         return f"{parent_google_event_id}_{stamp}"
-    # Normalise the timed form to UTC and strip punctuation.
+    # Timed form: Google's instance ID stamp is always UTC.  The
+    # source ``originalStartTime`` may carry any offset
+    # (e.g. ``2024-03-10T14:30:00-05:00``), so parse it and convert
+    # to UTC rather than stripping punctuation off whatever string
+    # we were handed — a naive strip mangles a non-UTC offset into
+    # an invalid id.
     s = original_start_at
-    if s.endswith("Z"):
-        s = s[:-1]
-    # Strip fractional seconds if present.
-    if "." in s:
-        s = s.split(".", 1)[0]
-    # s is now YYYY-MM-DDTHH:MM:SS (assume already UTC).
-    stamp = s.replace("-", "").replace(":", "") + "Z"
-    return f"{parent_google_event_id}_{stamp}"
+    iso = (s[:-1] + "+00:00") if s.endswith("Z") else s
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        # Unexpected format — best-effort strip, assume UTC.
+        bare = s[:-1] if s.endswith("Z") else s
+        if "." in bare:
+            bare = bare.split(".", 1)[0]
+        stamp = bare.replace("-", "").replace(":", "") + "Z"
+        return f"{parent_google_event_id}_{stamp}"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    return f"{parent_google_event_id}_{dt.strftime('%Y%m%dT%H%M%SZ')}"
 
 
 def is_managed_google_event_id(event_id: Optional[str]) -> bool:
