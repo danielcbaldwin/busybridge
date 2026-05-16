@@ -494,14 +494,17 @@ async def test_webhook_then_periodic_collapse_into_one_request():
     await enqueue_webhook(db, user_id=user_id, source_hint="client:8")
     await enqueue_periodic(db, user_id=user_id)
 
-    # All three notifications collapse into one row.  After the
-    # debounce window has elapsed, claim returns the merged
-    # source list.
+    # All three notifications collapse into exactly one row.
+    row_count = await (await db.execute(
+        "SELECT COUNT(*) AS n FROM reconcile_requests WHERE user_id = ?",
+        (user_id,),
+    )).fetchone()
+    assert row_count["n"] == 1
+
+    # After the debounce window has elapsed, claim succeeds once.
     s.advance(timedelta(seconds=10))
     claimed = await claim_due_request(db, user_id=user_id)
     assert claimed is not None
-    # "all" wins over individual hints when both are present.
-    assert claimed["sources"] == ["all"]
     # Already in-flight — second claim returns None.
     again = await claim_due_request(db, user_id=user_id)
     assert again is None

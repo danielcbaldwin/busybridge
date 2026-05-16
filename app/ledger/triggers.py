@@ -154,60 +154,57 @@ async def _upsert_request(
     scheduled_for: datetime,
     prefer_later_schedule: bool,
 ) -> None:
-    """Upsert one row in reconcile_requests, merging source hints
-    and respecting the debounce window.
+    """Upsert one row in reconcile_requests, respecting the debounce
+    window.
 
     ``prefer_later_schedule=True`` is the debounce path — repeated
     notifications push the scheduled_for further out so a burst
     collapses into one run.  ``prefer_later_schedule=False`` (the
     periodic-timer path) preserves the earliest schedule so we
     don't postpone work indefinitely.
+
+    ``sources_json`` is deliberately NOT written here.  That column is
+    owned by the ingest layer (``ingest.client._record_affected``) and
+    admin ops (``admin_ops._append_affected``), which store *integer
+    ledger-event ids*.  This trigger path used to merge a *string*
+    ``source_hint`` into the same column — and a later
+    ``sorted(set(prior + [hint]))`` would then raise ``TypeError`` the
+    moment ints and strings coexisted.  The hint is kept in the
+    signature for callers / logging but is never persisted; the
+    reconciler always re-plans every dirty ledger row regardless.
     """
     when_iso = scheduled_for.isoformat()
     existing = await (await db.execute(
-        "SELECT * FROM reconcile_requests WHERE user_id = ?",
+        "SELECT scheduled_for FROM reconcile_requests WHERE user_id = ?",
         (user_id,),
     )).fetchone()
     if existing is None:
         await db.execute(
             """INSERT INTO reconcile_requests
                   (user_id, sources_json, enqueued_at, scheduled_for)
-               VALUES (?, ?, ?, ?)""",
-            (user_id, json.dumps([source_hint]), when_iso, when_iso),
+               VALUES (?, NULL, ?, ?)""",
+            (user_id, when_iso, when_iso),
         )
         await db.commit()
         return
 
-    prior = json.loads(existing["sources_json"] or "[]") if existing["sources_json"] else []
-    if "all" in prior or source_hint == "all":
-        merged_sources: list = ["all"]
-    else:
-        merged_sources = sorted(set(prior + [source_hint]))
-
     new_sched = scheduled_for
-    if not prefer_later_schedule and existing["scheduled_for"]:
+    if existing["scheduled_for"]:
         try:
             cur = datetime.fromisoformat(existing["scheduled_for"])
             if cur.tzinfo is None:
                 cur = cur.replace(tzinfo=UTC)
-            if cur < new_sched:
+            if not prefer_later_schedule and cur < new_sched:
                 new_sched = cur
-        except ValueError:
-            pass
-    elif prefer_later_schedule and existing["scheduled_for"]:
-        try:
-            cur = datetime.fromisoformat(existing["scheduled_for"])
-            if cur.tzinfo is None:
-                cur = cur.replace(tzinfo=UTC)
-            if cur > new_sched:
+            elif prefer_later_schedule and cur > new_sched:
                 new_sched = cur
         except ValueError:
             pass
 
     await db.execute(
         """UPDATE reconcile_requests
-              SET sources_json = ?, scheduled_for = ?, enqueued_at = ?
+              SET scheduled_for = ?, enqueued_at = ?
             WHERE user_id = ?""",
-        (json.dumps(merged_sources), new_sched.isoformat(), when_iso, user_id),
+        (new_sched.isoformat(), when_iso, user_id),
     )
     await db.commit()
