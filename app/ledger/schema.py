@@ -225,14 +225,17 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
     # affected_ledger_events was first shipped with a
     # (user_id, ledger_event_id) primary key, which made a re-enqueue
     # of the same event an INSERT-OR-IGNORE no-op — a lost update.
-    # Rebuild it with the append-only autoincrement-id shape.  The
-    # table holds only transient replan-queue state, so dropping it
-    # costs at most a re-derive on the next ingest.
+    # Rebuild it with the append-only autoincrement-id shape, COPYING
+    # any rows already queued: a row here is an event that ingest has
+    # not yet planned, and dropping it would strand that change.
     cols = await (await db.execute(
         "PRAGMA table_info(affected_ledger_events)"
     )).fetchall()
     if cols and not any(c[1] == "id" for c in cols):
-        await db.execute("DROP TABLE affected_ledger_events")
+        await db.execute(
+            "ALTER TABLE affected_ledger_events "
+            "RENAME TO affected_ledger_events_old"
+        )
         await db.executescript(
             """
             CREATE TABLE affected_ledger_events (
@@ -246,4 +249,11 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
                 ON affected_ledger_events(user_id);
             """
         )
+        await db.execute(
+            """INSERT INTO affected_ledger_events
+                  (user_id, ledger_event_id, enqueued_at)
+               SELECT user_id, ledger_event_id, enqueued_at
+                 FROM affected_ledger_events_old"""
+        )
+        await db.execute("DROP TABLE affected_ledger_events_old")
         await db.commit()

@@ -146,3 +146,73 @@ async def test_create_recreates_past_a_cancelled_tombstone():
     live = fake.get_event("main@cal", gen1_id)
     assert live["status"] == "confirmed"
     await s.close()
+
+
+async def test_create_recreates_when_409_id_then_get_404s():
+    """A 409 whose id then GET-404s (a reserved tombstone Google will
+    not surface) must also be treated as a burned id — bump the
+    generation, do not poison-pill."""
+    from tests.fakes.google_calendar import GoogleApiError
+
+    s = Scenario()
+    s.given_calendar("main")
+    user = await s.given_user("alice", main="main")
+    db = await s.setup_db()
+
+    ev = await (await db.execute(
+        """INSERT INTO ledger_events
+              (user_id, canonical_uid, source_type, status, version,
+               summary, created_at, updated_at)
+           VALUES (?, 'client:1:y', 'client', 'active', 1,
+                   'Busy', '2026-01-01', '2026-01-01') RETURNING id""",
+        (user.user_id,),
+    )).fetchone()
+    proj = await (await db.execute(
+        """INSERT INTO ledger_projections
+              (ledger_event_id, target_kind, desired_state,
+               desired_payload_hash, desired_ledger_version, current_state)
+           VALUES (?, 'main', 'present_full', 'h', 1, 'absent')
+           RETURNING id""",
+        (int(ev["id"]),),
+    )).fetchone()
+    pid = int(proj["id"])
+    gen0_id = derive_google_event_id(pid, 0)
+    gen1_id = derive_google_event_id(pid, 1)
+
+    class _BurnedIdClient:
+        """insert 409s on the gen-0 id; GET 404s it (reserved
+        tombstone); the gen-1 id inserts cleanly."""
+
+        def insert_event(self, cal_id, body):
+            if body["id"] == gen0_id:
+                raise GoogleApiError(409, "Conflict", "id reserved")
+            return {"id": body["id"], "etag": "e1"}
+
+        def get_event(self, cal_id, event_id):
+            raise GoogleApiError(404, "Not Found", "gone")
+
+    await db.execute(
+        """INSERT INTO outbox_operations
+              (user_id, projection_id, operation, idempotency_key,
+               ledger_version_at_enqueue, desired_payload_hash,
+               target_google_calendar_id, payload_json, status, attempts)
+           VALUES (?, ?, 'create', 'k1', 1, 'h', 'main@cal',
+                   '{"summary": "Busy"}', 'pending', 0)""",
+        (user.user_id, pid),
+    )
+    await db.commit()
+
+    counters = await drain_user(
+        db, _BurnedIdClient(), user_id=user.user_id, now=datetime.now(UTC),
+    )
+    assert counters["succeeded"] == 1, counters
+
+    row = await (await db.execute(
+        """SELECT current_state, google_event_id, google_id_generation
+             FROM ledger_projections WHERE id = ?""",
+        (pid,),
+    )).fetchone()
+    assert row["google_id_generation"] == 1
+    assert row["google_event_id"] == gen1_id
+    assert row["current_state"] == "present"
+    await s.close()

@@ -388,11 +388,23 @@ async def _do_create(
         except Exception as e:
             if getattr(e, "status", None) != 409:
                 raise
-            # The ID is already on Google.  Three cases:
-            existing = await google.get_event(cal_id, google_id)
-            if existing.get("status") == "cancelled":
-                # Cancelled tombstone — this id is burned.  Move to a
-                # fresh deterministic id and retry.
+            # The ID is already on Google.  Fetch it to tell the cases
+            # apart — but the GET itself may 404/410 if the id is a
+            # burned/reserved tombstone Google will not surface.
+            burned = False
+            try:
+                existing = await google.get_event(cal_id, google_id)
+            except Exception as ge:
+                if getattr(ge, "status", None) not in (404, 410):
+                    raise
+                # insert said the id is taken, yet GET says it is gone
+                # — a reserved tombstone.  Treat exactly like a
+                # cancelled one: burn this generation.
+                existing = {}
+                burned = True
+            if burned or existing.get("status") == "cancelled":
+                # The id is burned (cancelled tombstone, or reserved).
+                # Move to a fresh deterministic id and retry.
                 generation += 1
                 await db.execute(
                     """UPDATE ledger_projections
