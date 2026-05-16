@@ -3,19 +3,23 @@
 Retention policy (unchanged at the API contract level):
 
 * Single-occurrence ledger events past ``event_retention_days``
-  since their end time → deleted.
+  since their end time → CANCELLED if still active (so the outbox
+  drains their Google copies), then hard-deleted once every
+  projection has drained.
 * Cancelled (soft-deleted) recurring series past
-  ``recurring_soft_delete_days`` since cancellation → deleted.
+  ``recurring_soft_delete_days`` since cancellation → hard-deleted
+  once every projection has drained.
 * Old ``sync_log`` rows past ``audit_log_retention_days`` → deleted.
 * Disconnected client_calendars past
   ``disconnected_calendar_retention_days`` → deleted.
 * Settled outbox rows (``done`` / ``superseded``) older than 7 days
   are pruned so the table doesn't grow without bound.
 
-The legacy busy_blocks/event_mappings tables are no longer
-written to under the ledger architecture; if they exist (from a
-pre-cutover deployment) we also prune them here so the DB stays
-clean during the parallel-run period.
+A ledger_event is never hard-deleted while a projection of it is
+still ``present`` on Google — that would orphan the Google copy
+(REWRITE_PLAN.md §18, enforced by a DB trigger).  Expired active
+events are cancelled and re-planned here; the next reconcile drains
+the deletes, and a subsequent retention pass removes the row.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ async def run_retention_cleanup() -> dict:
     now = datetime.utcnow()
 
     summary = {
+        "expired_events_cancelled": 0,
         "expired_ledger_events": 0,
         "deleted_recurring_series": 0,
         "old_sync_logs": 0,
@@ -48,22 +53,57 @@ async def run_retention_cleanup() -> dict:
         "old_busy_blocks": 0,
     }
 
-    # 1. Single (non-recurring) ledger events past retention.
+    # 1. Single (non-recurring) events past retention.
+    #
+    #    Active expired events are CANCELLED and re-planned — the
+    #    planner drives every projection to 'absent' and the next
+    #    reconcile's diff drains the Google deletes.  Only rows whose
+    #    projections have all drained ('present' nowhere) are then
+    #    hard-deleted: deleting a row with a live projection would
+    #    orphan its Google copy (REWRITE_PLAN.md §18).
+    from app.ledger.planner import plan_for_ledger_event
+
+    nowiso = now.isoformat()
     event_cutoff = (
         now - timedelta(days=settings.event_retention_days)
     ).isoformat()
+
+    cancelled_rows = await (await db.execute(
+        """UPDATE ledger_events
+              SET status = 'cancelled',
+                  cancelled_at = COALESCE(cancelled_at, ?),
+                  version = version + 1,
+                  updated_at = ?
+            WHERE is_recurring = 0
+              AND status = 'active'
+              AND end_at IS NOT NULL
+              AND end_at < ?
+            RETURNING id""",
+        (nowiso, nowiso, event_cutoff),
+    )).fetchall()
+    summary["expired_events_cancelled"] = len(cancelled_rows)
+    # Re-plan each freshly-cancelled row so its projections flip to
+    # 'absent' and become diverged; the next reconcile drains them.
+    for row in cancelled_rows:
+        await plan_for_ledger_event(db, ledger_event_id=int(row["id"]))
+
     cursor = await db.execute(
         """DELETE FROM ledger_events
             WHERE is_recurring = 0
+              AND status = 'cancelled'
               AND end_at IS NOT NULL
               AND end_at < ?
-              AND status IN ('cancelled', 'active')
+              AND NOT EXISTS (
+                  SELECT 1 FROM ledger_projections p
+                   WHERE p.ledger_event_id = ledger_events.id
+                     AND p.current_state = 'present')
             RETURNING id""",
         (event_cutoff,),
     )
     summary["expired_ledger_events"] = len(await cursor.fetchall())
 
-    # 2. Cancelled recurring series past retention.
+    # 2. Cancelled recurring series past retention — only once every
+    #    projection has drained (no Google copy left to orphan).
     recurring_cutoff = (
         now - timedelta(days=settings.recurring_soft_delete_days)
     ).isoformat()
@@ -73,6 +113,10 @@ async def run_retention_cleanup() -> dict:
               AND status = 'cancelled'
               AND cancelled_at IS NOT NULL
               AND cancelled_at < ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM ledger_projections p
+                   WHERE p.ledger_event_id = ledger_events.id
+                     AND p.current_state = 'present')
             RETURNING id""",
         (recurring_cutoff,),
     )

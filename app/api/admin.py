@@ -311,7 +311,19 @@ async def force_user_reauth(
            )""",
         (user_id,)
     )
-    # Ledger projections + outbox cascade through user_id on ledger_events.
+    # Delete the ledger projections (and, by cascade, the outbox)
+    # explicitly BEFORE the ledger rows: the orphan-guard trigger on
+    # ledger_events refuses a delete while a projection is still
+    # 'present'.  This is a deliberate full sync-state wipe — the
+    # user re-onboards from scratch — so removing the projections
+    # first is the intended path here.
+    await db.execute(
+        """DELETE FROM ledger_projections
+           WHERE ledger_event_id IN (
+               SELECT id FROM ledger_events WHERE user_id = ?
+           )""",
+        (user_id,),
+    )
     await db.execute(
         """DELETE FROM ledger_events WHERE user_id = ?""", (user_id,),
     )

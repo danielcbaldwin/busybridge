@@ -166,3 +166,126 @@ async def test_disconnected_calendars_age_out(test_db):
     ids = {r["google_calendar_id"] for r in rows}
     assert "old@cal" not in ids
     assert "recent@cal" in ids
+
+
+# ---------------------------------------------------------------------------
+# Orphan-safe retention (REWRITE_PLAN.md §18)
+# ---------------------------------------------------------------------------
+async def test_active_expired_event_with_live_projection_is_cancelled_not_deleted(
+    test_db,
+):
+    """An expired event whose busy block is still live on Google must
+    NOT be hard-deleted — that would orphan the Google copy.  It is
+    cancelled and re-planned; the next reconcile drains the delete."""
+    db = await get_database()
+    user_id = await _seed_user(db, "reta@example.com")
+    long_ago = (datetime.utcnow() - timedelta(days=60)).isoformat()
+
+    ev = await (await db.execute(
+        """INSERT INTO ledger_events
+              (user_id, canonical_uid, source_type, is_recurring,
+               start_at, end_at, status, version, created_at, updated_at)
+           VALUES (?, ?, 'main_native', 0, ?, ?, 'active', 1, ?, ?)
+           RETURNING id""",
+        (user_id, "main_native:1:livepast", long_ago, long_ago,
+         long_ago, long_ago),
+    )).fetchone()
+    ev_id = int(ev["id"])
+    await db.execute(
+        """INSERT INTO ledger_projections
+              (ledger_event_id, target_kind, target_calendar_id,
+               desired_state, desired_payload_hash, desired_ledger_version,
+               current_state, google_event_id, applied_ledger_version,
+               applied_payload_hash)
+           VALUES (?, 'main', NULL, 'present_full', 'h', 1,
+                   'present', 'bbliveevt00001', 1, 'h')""",
+        (ev_id,),
+    )
+    await db.commit()
+
+    summary = await run_retention_cleanup()
+
+    row = await (await db.execute(
+        "SELECT status FROM ledger_events WHERE id = ?", (ev_id,),
+    )).fetchone()
+    assert row is not None, "event was hard-deleted despite a live projection"
+    assert row["status"] == "cancelled"
+    assert summary["expired_events_cancelled"] >= 1
+    # Re-planned: the projection now wants the Google copy gone.
+    proj = await (await db.execute(
+        "SELECT desired_state FROM ledger_projections WHERE ledger_event_id = ?",
+        (ev_id,),
+    )).fetchone()
+    assert proj["desired_state"] == "absent"
+
+
+async def test_drained_cancelled_event_is_hard_deleted(test_db):
+    """Once every projection has drained ('present' nowhere) the
+    cancelled row is safe to hard-delete."""
+    db = await get_database()
+    user_id = await _seed_user(db, "retb@example.com")
+    long_ago = (datetime.utcnow() - timedelta(days=60)).isoformat()
+
+    ev = await (await db.execute(
+        """INSERT INTO ledger_events
+              (user_id, canonical_uid, source_type, is_recurring,
+               start_at, end_at, status, version, created_at, updated_at)
+           VALUES (?, ?, 'main_native', 0, ?, ?, 'cancelled', 2, ?, ?)
+           RETURNING id""",
+        (user_id, "main_native:1:drained", long_ago, long_ago,
+         long_ago, long_ago),
+    )).fetchone()
+    ev_id = int(ev["id"])
+    await db.execute(
+        """INSERT INTO ledger_projections
+              (ledger_event_id, target_kind, target_calendar_id,
+               desired_state, desired_payload_hash, desired_ledger_version,
+               current_state, applied_ledger_version)
+           VALUES (?, 'main', NULL, 'absent', 'absent', 2, 'absent', 2)""",
+        (ev_id,),
+    )
+    await db.commit()
+
+    summary = await run_retention_cleanup()
+
+    row = await (await db.execute(
+        "SELECT id FROM ledger_events WHERE id = ?", (ev_id,),
+    )).fetchone()
+    assert row is None, "fully-drained cancelled event should be hard-deleted"
+    assert summary["expired_ledger_events"] >= 1
+
+
+async def test_orphan_guard_trigger_blocks_deleting_a_live_ledger_event(test_db):
+    """The DB trigger refuses a direct delete of a ledger_event whose
+    projection is still 'present' on Google."""
+    db = await get_database()
+    user_id = await _seed_user(db, "retc@example.com")
+
+    ev = await (await db.execute(
+        """INSERT INTO ledger_events
+              (user_id, canonical_uid, source_type, status, version,
+               created_at, updated_at)
+           VALUES (?, 'main_native:1:guard', 'main_native', 'active', 1,
+                   '2026-01-01', '2026-01-01')
+           RETURNING id""",
+        (user_id,),
+    )).fetchone()
+    ev_id = int(ev["id"])
+    await db.execute(
+        """INSERT INTO ledger_projections
+              (ledger_event_id, target_kind, desired_state,
+               desired_payload_hash, desired_ledger_version, current_state)
+           VALUES (?, 'main', 'present_full', 'h', 1, 'present')""",
+        (ev_id,),
+    )
+    await db.commit()
+
+    with pytest.raises(Exception) as exc:
+        await db.execute("DELETE FROM ledger_events WHERE id = ?", (ev_id,))
+    assert "refusing to delete" in str(exc.value)
+
+    # The row survives the blocked delete.
+    row = await (await db.execute(
+        "SELECT id FROM ledger_events WHERE id = ?", (ev_id,),
+    )).fetchone()
+    assert row is not None

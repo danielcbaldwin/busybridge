@@ -144,6 +144,29 @@ CREATE TABLE IF NOT EXISTS reconcile_requests (
     in_flight BOOLEAN DEFAULT FALSE,
     last_run_at TIMESTAMP
 );
+
+
+-- Orphan guard (REWRITE_PLAN.md §18).  Hard-deleting a ledger_event
+-- whose projection is still 'present' on Google cascades the
+-- projection away without deleting the Google event, leaving an
+-- orphan.  The correct path is status='cancelled' — the planner
+-- drives every projection to 'absent' and the outbox deletes the
+-- Google copies; only then may the row be hard-deleted.  This
+-- trigger makes the unsafe delete structurally impossible.
+--
+-- It does NOT fire for FK-cascade deletes (recursive_triggers is
+-- off by default), so DELETE FROM users still cleanly removes an
+-- entire account.
+CREATE TRIGGER IF NOT EXISTS trg_ledger_events_block_orphaning_delete
+BEFORE DELETE ON ledger_events
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM ledger_projections
+     WHERE ledger_event_id = OLD.id AND current_state = 'present'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'refusing to delete a ledger_event with a live projection: set status=cancelled and let the outbox drain the deletes first');
+END;
 """
 
 
