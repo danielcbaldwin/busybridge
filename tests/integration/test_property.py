@@ -31,6 +31,7 @@ from app.ledger.identity import (
     derive_google_event_id,
     is_managed_google_event_id,
 )
+from app.ledger.ingest.client import _extract_event_fields
 from app.ledger.payload import (
     PRESENT_BUSY,
     PRESENT_FULL,
@@ -219,6 +220,32 @@ def test_busy_block_hash_excludes_user_can_edit(row):
 
 
 @given(row=_ledger_row())
+@settings(suppress_health_check=[HealthCheck.function_scoped_fixture], max_examples=60)
+def test_present_full_payload_round_trips_through_ingest(row):
+    """Render a client event as a full-detail main copy, then
+    re-extract it the way main-ingest would: the user-visible
+    fields must survive the round trip unchanged (REWRITE_PLAN.md
+    §14 Layer 2 — render → ingest → same ledger row)."""
+    # user_can_edit=True so no 🔒 prefix is added to the summary.
+    row = dict(row, user_can_edit=True)
+    body = render_payload(
+        desired_state=PRESENT_FULL,
+        ledger_row=row,
+        projection_id=1,
+        ledger_version=1,
+        target_kind="main",
+    )
+    fields = _extract_event_fields(body, user_email="user@example.com")
+
+    assert fields["start_at"] == row["start_at"]
+    assert fields["end_at"] == row["end_at"]
+    assert fields["is_all_day"] == row["is_all_day"]
+    assert fields["show_as"] == row["show_as"]
+    # An empty summary renders as the "(no title)" placeholder.
+    assert fields["summary"] == (row["summary"] or "(no title)")
+
+
+@given(row=_ledger_row())
 @settings(suppress_health_check=[HealthCheck.function_scoped_fixture], max_examples=50)
 def test_personal_busy_hides_summary(row):
     """Personal busy blocks must never leak the source summary —
@@ -289,3 +316,60 @@ def test_fake_replay_produces_same_final_state(ops):
         for e in b.list_events("primary")["items"]
     )
     assert a_events == b_events
+
+
+# ---------------------------------------------------------------------------
+# Recurrence expansion — RRULE COUNT + per-instance cancellation
+# ---------------------------------------------------------------------------
+@given(count=st.integers(min_value=1, max_value=14))
+@settings(suppress_health_check=[HealthCheck.function_scoped_fixture], max_examples=20)
+def test_rrule_count_expands_to_exactly_n_instances(count):
+    """A weekly series with ``COUNT=n`` expands to exactly ``n``
+    confirmed instances (REWRITE_PLAN.md §14 — the expanded
+    instance set matches the expected count)."""
+    from tests.fakes.google_calendar import FakeGoogleCalendar
+
+    g = FakeGoogleCalendar()
+    g.add_calendar("primary")
+    ev = g.insert_event("primary", {
+        "summary": "Series",
+        "start": {"dateTime": "2026-01-05T09:00:00Z", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-01-05T09:30:00Z", "timeZone": "UTC"},
+        "recurrence": [f"RRULE:FREQ=WEEKLY;COUNT={count}"],
+    })
+    insts = g.list_instances("primary", ev["id"], show_deleted=True)
+    confirmed = [i for i in insts["items"] if i.get("status") != "cancelled"]
+    assert len(confirmed) == count
+
+
+@given(
+    count=st.integers(min_value=3, max_value=12),
+    cancel_index=st.integers(min_value=0, max_value=11),
+)
+@settings(suppress_health_check=[HealthCheck.function_scoped_fixture], max_examples=20)
+def test_cancelling_one_instance_reduces_confirmed_count_by_one(
+    count, cancel_index,
+):
+    """Cancelling a single occurrence of an ``n``-instance series
+    leaves ``n-1`` confirmed instances and exactly one cancelled —
+    the modified-instance accounting the ledger relies on."""
+    from tests.fakes.google_calendar import FakeGoogleCalendar
+
+    cancel_index %= count
+    g = FakeGoogleCalendar()
+    g.add_calendar("primary")
+    ev = g.insert_event("primary", {
+        "summary": "Series",
+        "start": {"dateTime": "2026-01-05T09:00:00Z", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-01-05T09:30:00Z", "timeZone": "UTC"},
+        "recurrence": [f"RRULE:FREQ=WEEKLY;COUNT={count}"],
+    })
+    instances = g.list_instances("primary", ev["id"])["items"]
+    assert len(instances) == count
+    g.delete_event("primary", instances[cancel_index]["id"])
+
+    after = g.list_instances("primary", ev["id"], show_deleted=True)["items"]
+    confirmed = [i for i in after if i.get("status") != "cancelled"]
+    cancelled = [i for i in after if i.get("status") == "cancelled"]
+    assert len(confirmed) == count - 1
+    assert len(cancelled) == 1

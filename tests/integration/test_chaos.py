@@ -259,3 +259,89 @@ async def test_recurring_cancellation_survives_repeated_token_expiry():
     ]
     assert len(cancelled) >= 1
     await s.close()
+
+
+# ---------------------------------------------------------------------------
+# Periodic timer firing around a webhook sync
+# ---------------------------------------------------------------------------
+async def test_periodic_timer_and_webhook_interleave_without_loss_or_dup():
+    """A webhook and the periodic timer both fire for the same user.
+    They must coalesce into one reconcile request, and a periodic
+    enqueue arriving while a reconcile is 'in flight' must not be
+    lost — the next reconcile still picks the change up."""
+    from app.ledger.triggers import enqueue_periodic, enqueue_webhook
+
+    s = await _user_with_clients()
+    s.given_event("client_a", summary="First", start="2026-05-01T09:00:00Z")
+    db = await s.setup_db()
+    uid = s.user("alice").user_id
+
+    # Webhook fires; the periodic timer fires before the reconcile
+    # runs — both collapse into a single reconcile_requests row.
+    await enqueue_webhook(db, user_id=uid, source_hint="client:1")
+    await enqueue_periodic(db, user_id=uid)
+    n = (await (await db.execute(
+        "SELECT COUNT(*) AS n FROM reconcile_requests WHERE user_id = ?",
+        (uid,),
+    )).fetchone())["n"]
+    assert n == 1, "webhook + periodic did not coalesce into one request"
+
+    await s.run_reconciler("alice")
+    assert len(s.find_events("main", summary="First")) == 1
+
+    # A new change lands; the periodic timer fires while a reconcile
+    # is marked in-flight.  The enqueue must survive.
+    s.given_event("client_a", summary="Second", start="2026-05-02T09:00:00Z")
+    await db.execute(
+        "UPDATE reconcile_requests SET in_flight = 1 WHERE user_id = ?",
+        (uid,),
+    )
+    await db.commit()
+    await enqueue_periodic(db, user_id=uid)
+    await db.execute(
+        "UPDATE reconcile_requests SET in_flight = 0 WHERE user_id = ?",
+        (uid,),
+    )
+    await db.commit()
+
+    await s.run_reconciler("alice")
+    assert len(s.find_events("main", summary="Second")) == 1
+    # The first event is still there exactly once — no duplication.
+    assert len(s.find_events("main", summary="First")) == 1
+    assert s.google.event_count(s.cal("main"), include_cancelled=False) == 2
+    await s.close()
+
+
+# ---------------------------------------------------------------------------
+# Two users with overlapping operations
+# ---------------------------------------------------------------------------
+async def test_two_users_overlapping_operations_stay_isolated():
+    """Two users reconcile in an interleaved order.  The per-user
+    reconciler must keep them fully isolated: one user's events
+    never appear on the other's calendars."""
+    s = Scenario()
+    for nick in ("main_a", "client_a1", "main_b", "client_b1"):
+        s.given_calendar(nick)
+    await s.given_user("alice", main="main_a", clients=["client_a1"])
+    await s.given_user("bob", main="main_b", clients=["client_b1"])
+
+    s.given_event("client_a1", summary="Alice mtg", start="2026-06-01T09:00:00Z")
+    s.given_event("client_b1", summary="Bob mtg", start="2026-06-01T10:00:00Z")
+
+    # Interleave the two users' reconciles.
+    await s.run_reconciler("alice")
+    await s.run_reconciler("bob")
+    s.given_event("client_a1", summary="Alice 2", start="2026-06-02T09:00:00Z")
+    s.given_event("client_b1", summary="Bob 2", start="2026-06-02T10:00:00Z")
+    await s.run_reconciler("bob")
+    await s.run_reconciler("alice")
+
+    # Each user's full copies land only on their own main calendar.
+    assert len(s.find_events("main_a", summary="Alice mtg")) == 1
+    assert len(s.find_events("main_a", summary="Alice 2")) == 1
+    assert s.find_events("main_a", summary_contains="Bob") == []
+
+    assert len(s.find_events("main_b", summary="Bob mtg")) == 1
+    assert len(s.find_events("main_b", summary="Bob 2")) == 1
+    assert s.find_events("main_b", summary_contains="Alice") == []
+    await s.close()
