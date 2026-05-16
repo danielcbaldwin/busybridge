@@ -91,7 +91,11 @@ async def cleanup_one_calendar(
 
     # 2. Target-side: any projection that targets this client must
     #    go absent regardless of source — busy blocks from other
-    #    calendars also need to vanish.
+    #    calendars also need to vanish.  The divergence the diff acts
+    #    on is the payload-hash change (-> 'absent'); desired_ledger_version
+    #    stays pinned to the event's real version rather than a
+    #    fabricated version+1, which the next planner pass would
+    #    overwrite with the real value anyway.
     await db.execute(
         """UPDATE ledger_projections
               SET desired_state = 'absent',
@@ -99,7 +103,7 @@ async def cleanup_one_calendar(
                   desired_ledger_version = (
                       SELECT version FROM ledger_events
                        WHERE id = ledger_projections.ledger_event_id
-                  ) + 1,
+                  ),
                   updated_at = ?
             WHERE target_kind = 'client'
               AND target_calendar_id = ?
@@ -142,6 +146,9 @@ async def cleanup_and_pause(
     contain none of our writes.
     """
     when = datetime.now(UTC).isoformat()
+    # The diff acts on the payload-hash change to 'absent';
+    # desired_ledger_version stays at the event's real version
+    # instead of a fabricated version+1.
     await db.execute(
         """UPDATE ledger_projections
               SET desired_state = 'absent',
@@ -149,7 +156,7 @@ async def cleanup_and_pause(
                   desired_ledger_version = (
                       SELECT version FROM ledger_events
                        WHERE id = ledger_projections.ledger_event_id
-                  ) + 1,
+                  ),
                   updated_at = ?
             WHERE ledger_event_id IN (
                 SELECT id FROM ledger_events WHERE user_id = ?
