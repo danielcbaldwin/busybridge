@@ -261,18 +261,19 @@ async def verify_against_google(
     model matches reality.
     """
     from app.ledger.verify import verify_user
-    from app.ledger.runtime import _google_client_factory, _resolve_home_email
+    from app.ledger.runtime import build_user_google_access
 
     db = await get_database()
     main_google_id, client_map = await _user_calendar_bindings(db, user_id)
     if main_google_id is None:
         return {"status": "skipped", "reason": "user has no main calendar"}
-    email = await _resolve_home_email(db, user_id)
-    if not email:
+    # The router sends each client/personal calendar's GETs to the
+    # account that can actually read it — the home token cannot.
+    access = await build_user_google_access(db, user_id)
+    if access is None:
         return {"status": "skipped", "reason": "no home OAuth token"}
-    google = await _google_client_factory(user_id, email)
     result = await verify_user(
-        db, google,
+        db, access["router"],
         user_id=user_id,
         main_google_calendar_id=main_google_id,
         google_calendar_id_for=client_map,

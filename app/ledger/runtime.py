@@ -38,6 +38,7 @@ import aiosqlite
 
 from app.auth.google import get_valid_access_token
 from app.database import get_database
+from app.ledger.google_router import GoogleRouter
 from app.ledger.reconciler import reconcile_user
 from app.ledger.real_google_client import RealGoogleClient
 from app.ledger.triggers import claim_due_request, release_request
@@ -130,48 +131,14 @@ async def reconcile_user_by_id(
         # User hasn't finished OOBE; skip.
         return {"skipped": "no_main_calendar"}
 
-    # Get an OAuth token for the user's home account → main calendar.
-    main_email = await _resolve_home_email(db, user_id)
-    if not main_email:
+    # Resolve every calendar + the account (OAuth token) that can
+    # reach it, and build a router that sends each calendar's API
+    # calls to the right account.
+    access = await build_user_google_access(db, user_id)
+    if access is None:
         return {"skipped": "no_home_oauth_token"}
-    try:
-        main_client = await _google_client_factory(user_id, main_email)
-    except Exception as e:
-        logger.warning(
-            "Cannot build Google client for user %s: %s", user_id, e,
-        )
-        return {"skipped": "google_client_unavailable", "error": str(e)}
 
-    # Active client calendars.
-    client_rows = await (await db.execute(
-        """SELECT id, google_calendar_id, oauth_token_id, calendar_type
-             FROM client_calendars
-            WHERE user_id = ? AND is_active = 1""",
-        (user_id,),
-    )).fetchall()
-    active_clients: list[dict] = []
-    active_personals: list[dict] = []
-    for row in client_rows:
-        entry = {"id": int(row["id"]), "google_calendar_id": row["google_calendar_id"]}
-        if (row["calendar_type"] or "client") == "personal":
-            active_personals.append(entry)
-        else:
-            active_clients.append(entry)
-
-    # All known calendars (active + disconnected) for the diff/outbox
-    # to be able to issue deletes against disconnected calendars.
-    all_known_rows = await (await db.execute(
-        """SELECT id, google_calendar_id
-             FROM client_calendars
-            WHERE user_id = ?""",
-        (user_id,),
-    )).fetchall()
-    all_known = [
-        {"id": int(r["id"]), "google_calendar_id": r["google_calendar_id"]}
-        for r in all_known_rows
-    ]
-
-    # Webcal subscriptions.
+    # Webcal subscriptions (HTTP, not account-routed).
     webcal_rows = await (await db.execute(
         """SELECT id, url FROM webcal_subscriptions
             WHERE user_id = ? AND is_active = 1""",
@@ -182,19 +149,123 @@ async def reconcile_user_by_id(
     ]
 
     return await reconcile_user(
-        db, main_client,
+        db, access["router"],
         user_id=user_id,
-        user_email=main_email,
+        user_email=access["main_email"],
         main_google_calendar_id=user["main_calendar_id"],
-        client_calendars=active_clients,
-        all_known_client_calendars=all_known,
-        personal_calendars=active_personals,
+        client_calendars=access["client_calendars"],
+        all_known_client_calendars=access["all_known"],
+        personal_calendars=access["personal_calendars"],
         webcal_subscriptions=webcal_subs,
         webcal_fetch=_resolve_webcal_fetcher() if webcal_subs else None,
         include_main=include_main,
         drain=drain,
         run_discovery=run_discovery,
     )
+
+
+async def build_user_google_access(
+    db: aiosqlite.Connection, user_id: int,
+) -> Optional[dict]:
+    """Resolve a user's calendars and the account that reaches each.
+
+    A BusyBridge user has several Google accounts — a home account
+    (main calendar) and one OAuth token per connected client /
+    personal calendar (``client_calendars.oauth_token_id``).  Each
+    calendar is only reachable with ITS account's token; the home
+    token 403s against another account's calendar.
+
+    Returns ``None`` when the user has no usable home OAuth token.
+    Otherwise a dict with:
+
+    * ``main_email`` — the home account's email.
+    * ``router`` — a :class:`GoogleRouter` that dispatches each
+      calendar to the right account's client.
+    * ``client_calendars`` / ``personal_calendars`` — the *active,
+      reachable* calendars to ingest.
+    * ``all_known`` — every client_calendars row (active +
+      disconnected) for the diff/outbox calendar-id mapping.
+    """
+    main_email = await _resolve_home_email(db, user_id)
+    if not main_email:
+        return None
+    try:
+        home_client = await _google_client_factory(user_id, main_email)
+    except Exception as e:
+        logger.warning(
+            "Cannot build Google client for user %s home account: %s",
+            user_id, e,
+        )
+        return None
+
+    # Every client/personal calendar joined to the account that owns it.
+    cal_rows = await (await db.execute(
+        """SELECT cc.id, cc.google_calendar_id, cc.calendar_type,
+                  cc.is_active, ot.google_account_email
+             FROM client_calendars cc
+             JOIN oauth_tokens ot ON ot.id = cc.oauth_token_id
+            WHERE cc.user_id = ?""",
+        (user_id,),
+    )).fetchall()
+
+    # Build one client per distinct account; route each calendar to it.
+    clients_by_email: dict[str, Any] = {main_email: home_client}
+    by_calendar: dict[str, Any] = {}
+    unreachable: set[str] = set()
+    for row in cal_rows:
+        email = row["google_account_email"]
+        if email not in clients_by_email:
+            try:
+                clients_by_email[email] = await _google_client_factory(
+                    user_id, email,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Cannot build Google client for user %s account %s: %s",
+                    user_id, email, e,
+                )
+                clients_by_email[email] = None
+        client = clients_by_email[email]
+        if client is None:
+            unreachable.add(row["google_calendar_id"])
+        else:
+            by_calendar[row["google_calendar_id"]] = client
+
+    router = GoogleRouter(default=home_client, by_calendar=by_calendar)
+
+    # Ingest only active calendars whose account is reachable.
+    active_clients: list[dict] = []
+    active_personals: list[dict] = []
+    for row in cal_rows:
+        if not row["is_active"]:
+            continue
+        if row["google_calendar_id"] in unreachable:
+            logger.warning(
+                "skipping calendar %s for user %s: its account's OAuth "
+                "token is unavailable",
+                row["google_calendar_id"], user_id,
+            )
+            continue
+        entry = {
+            "id": int(row["id"]),
+            "google_calendar_id": row["google_calendar_id"],
+        }
+        if (row["calendar_type"] or "client") == "personal":
+            active_personals.append(entry)
+        else:
+            active_clients.append(entry)
+
+    all_known = [
+        {"id": int(r["id"]), "google_calendar_id": r["google_calendar_id"]}
+        for r in cal_rows
+    ]
+    return {
+        "main_email": main_email,
+        "router": router,
+        "client_calendars": active_clients,
+        "personal_calendars": active_personals,
+        "all_known": all_known,
+    }
 
 
 async def drain_all_due_users(*, now: Optional[datetime] = None) -> dict:
