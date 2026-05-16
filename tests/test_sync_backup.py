@@ -86,121 +86,6 @@ class TestClassifyBackup:
 
 
 # ---------------------------------------------------------------------------
-# _events_differ
-# ---------------------------------------------------------------------------
-
-
-class TestEventsDiffer:
-    def test_identical_events_not_different(self):
-        from app.sync.backup import _events_differ
-
-        e = {"summary": "Meeting", "start": {"dateTime": "2024-01-01T10:00:00Z"}, "end": {"dateTime": "2024-01-01T11:00:00Z"}, "status": "confirmed"}
-        assert _events_differ(e, e) is False
-
-    def test_summary_change_detected(self):
-        from app.sync.backup import _events_differ
-
-        a = {"summary": "Old Title"}
-        b = {"summary": "New Title"}
-        assert _events_differ(a, b) is True
-
-    def test_start_change_detected(self):
-        from app.sync.backup import _events_differ
-
-        a = {"start": {"dateTime": "2024-01-01T10:00:00Z"}}
-        b = {"start": {"dateTime": "2024-01-01T11:00:00Z"}}
-        assert _events_differ(a, b) is True
-
-    def test_status_change_detected(self):
-        from app.sync.backup import _events_differ
-
-        a = {"status": "confirmed"}
-        b = {"status": "cancelled"}
-        assert _events_differ(a, b) is True
-
-    def test_missing_field_vs_present_detected(self):
-        from app.sync.backup import _events_differ
-
-        a = {"colorId": "1"}
-        b = {}
-        assert _events_differ(a, b) is True
-
-    def test_irrelevant_field_ignored(self):
-        from app.sync.backup import _events_differ
-
-        # 'attendees' is not in the compared field set
-        a = {"summary": "Meeting", "attendees": [{"email": "a@b.com"}]}
-        b = {"summary": "Meeting", "attendees": []}
-        assert _events_differ(a, b) is False
-
-
-# ---------------------------------------------------------------------------
-# _diff_events
-# ---------------------------------------------------------------------------
-
-
-class TestDiffEvents:
-    def test_create_when_event_only_in_backup(self):
-        from app.sync.backup import _diff_events
-
-        backup = [{"id": "evt1", "summary": "New"}]
-        current = []
-        diff = _diff_events(backup, current)
-        assert len(diff["create"]) == 1
-        assert diff["create"][0]["id"] == "evt1"
-        assert diff["delete"] == []
-        assert diff["update"] == []
-
-    def test_delete_when_event_only_in_current(self):
-        from app.sync.backup import _diff_events
-
-        backup = []
-        current = [{"id": "evt2", "summary": "Gone"}]
-        diff = _diff_events(backup, current)
-        assert diff["create"] == []
-        assert len(diff["delete"]) == 1
-        assert diff["delete"][0]["id"] == "evt2"
-
-    def test_update_when_event_changed(self):
-        from app.sync.backup import _diff_events
-
-        backup = [{"id": "evt3", "summary": "Updated Title"}]
-        current = [{"id": "evt3", "summary": "Old Title"}]
-        diff = _diff_events(backup, current)
-        assert diff["create"] == []
-        assert diff["delete"] == []
-        assert len(diff["update"]) == 1
-        assert diff["update"][0]["summary"] == "Updated Title"
-
-    def test_no_diff_when_identical(self):
-        from app.sync.backup import _diff_events
-
-        event = {"id": "evt4", "summary": "Same"}
-        diff = _diff_events([event], [event])
-        assert diff["create"] == []
-        assert diff["delete"] == []
-        assert diff["update"] == []
-
-    def test_mixed_operations(self):
-        from app.sync.backup import _diff_events
-
-        backup = [
-            {"id": "keep", "summary": "Keep"},
-            {"id": "create_me", "summary": "Create"},
-            {"id": "update_me", "summary": "New Summary"},
-        ]
-        current = [
-            {"id": "keep", "summary": "Keep"},
-            {"id": "delete_me", "summary": "Delete"},
-            {"id": "update_me", "summary": "Old Summary"},
-        ]
-        diff = _diff_events(backup, current)
-        assert [e["id"] for e in diff["create"]] == ["create_me"]
-        assert [e["id"] for e in diff["delete"]] == ["delete_me"]
-        assert [e["id"] for e in diff["update"]] == ["update_me"]
-
-
-# ---------------------------------------------------------------------------
 # _event_snapshot_fields
 # ---------------------------------------------------------------------------
 
@@ -578,34 +463,141 @@ class TestRestoreFromBackupDryRun:
 
         user_id = await _insert_user("dry-user@example.com", "dry-google")
 
-        backup_snap = {
-            "main_calendar_events": [{"id": "new-evt", "summary": "New Event"}],
-            "client_calendars": [],
-        }
         metadata = {
             "backup_id": "backup-20240101-120000-daily",
             "backup_type": "daily",
             "created_at": "2024-01-01T12:00:00",
             "user_ids_snapshotted": [user_id],
         }
-        zip_data = _make_backup_zip(metadata, snapshots={str(user_id): backup_snap})
+        zip_data = _make_backup_zip(metadata)
         bid = metadata["backup_id"]
         (tmp_path / f"{bid}.zip").write_bytes(zip_data)
 
-        # Mock the live event fetch to return an empty list (event will show as "create")
-        async def fake_fetch_current(*args, **kwargs):
-            return []
-
-        monkeypatch.setattr("app.sync.backup._fetch_current_busybridge_events", fake_fetch_current)
-
         result = await restore_from_backup(
             bid,
-            restore_db=False,
+            restore_db=True,
             restore_calendars=True,
             dry_run=True,
         )
 
         assert result["dry_run"] is True
+        # Dry run reports a per-user preview and touches nothing.
         assert isinstance(result["planned_actions"], list)
-        # DB should not be flagged as restored in dry_run mode
         assert result["db_restored"] is False
+        assert result["users_restored"] == [user_id]
+        assert result["events_created"] == 0
+
+
+# ---------------------------------------------------------------------------
+# restore_from_backup — ledger preservation (the core per-user restore fix)
+# ---------------------------------------------------------------------------
+
+
+class TestRestorePreservesLedger:
+    @pytest.mark.asyncio
+    async def test_per_user_restore_brings_back_the_ledger(
+        self, test_db, tmp_path, monkeypatch
+    ):
+        """A per-user restore must repopulate ledger_events,
+        ledger_projections and outbox_operations — they ARE the
+        post-rewrite source of truth.  Regression guard for the bug
+        where the per-user restore table-lists referenced the dropped
+        event_mappings/busy_blocks tables and omitted the ledger."""
+        import aiosqlite
+        from app.database import init_schema
+
+        monkeypatch.setenv("BACKUP_PATH", str(tmp_path))
+
+        # Build an on-disk backup DB carrying a full ledger for user 1.
+        # It also holds a second user so the restore takes the
+        # PER-USER path (a subset) rather than the whole-file swap.
+        backup_db = tmp_path / "backup_src.db"
+        bconn = await aiosqlite.connect(str(backup_db))
+        bconn.row_factory = aiosqlite.Row
+        await init_schema(bconn)
+        for uid, email in ((1, "restored@example.com"), (2, "other@example.com")):
+            await bconn.execute(
+                """INSERT INTO users
+                      (id, email, google_user_id, display_name, main_calendar_id)
+                   VALUES (?, ?, ?, ?, 'main-cal')""",
+                (uid, email, f"g-{uid}", email.split("@")[0]),
+            )
+        await bconn.execute(
+            """INSERT INTO ledger_events
+                  (id, user_id, canonical_uid, source_type, status, version,
+                   summary, created_at, updated_at)
+               VALUES (10, 1, 'client:1:evt-abc', 'client', 'active', 1,
+                       'Restored meeting', '2026-01-01T00:00:00Z',
+                       '2026-01-01T00:00:00Z')""",
+        )
+        await bconn.execute(
+            """INSERT INTO ledger_projections
+                  (id, ledger_event_id, target_kind, target_calendar_id,
+                   desired_state, desired_payload_hash, desired_ledger_version,
+                   current_state, google_event_id, applied_ledger_version,
+                   applied_payload_hash)
+               VALUES (20, 10, 'main', NULL, 'present_full', 'hash1', 1,
+                       'present', 'bb000abc', 1, 'hash1')""",
+        )
+        await bconn.execute(
+            """INSERT INTO outbox_operations
+                  (id, user_id, projection_id, operation, idempotency_key,
+                   ledger_version_at_enqueue, target_google_calendar_id, status)
+               VALUES (30, 1, 20, 'create', 'proj:20:v1:create', 1,
+                       'main-cal', 'done')""",
+        )
+        await bconn.execute("INSERT INTO reconcile_requests (user_id) VALUES (1)")
+        await bconn.commit()
+        await bconn.close()
+
+        metadata = {
+            "backup_id": "backup-20260101-000000-daily",
+            "backup_type": "daily",
+            "created_at": "2026-01-01T00:00:00",
+            "user_ids_snapshotted": [1, 2],
+        }
+        bid = metadata["backup_id"]
+        (tmp_path / f"{bid}.zip").write_bytes(
+            _make_backup_zip(metadata, db_bytes=backup_db.read_bytes())
+        )
+
+        # The live DB has none of user 1's ledger rows.
+        live = await get_database()
+        before = await (await live.execute(
+            "SELECT COUNT(*) AS n FROM ledger_events WHERE user_id = 1"
+        )).fetchone()
+        assert before["n"] == 0
+
+        from app.sync.backup import restore_from_backup
+        result = await restore_from_backup(
+            bid,
+            user_ids=[1],             # subset → exercises the per-user path
+            restore_db=True,
+            restore_calendars=False,  # skip the Google re-converge
+            dry_run=False,
+        )
+        assert result["db_restored"] is True
+
+        # The ledger for user 1 is back — events, projections, outbox.
+        ev = await (await live.execute(
+            "SELECT summary FROM ledger_events WHERE user_id = 1"
+        )).fetchall()
+        assert [r["summary"] for r in ev] == ["Restored meeting"]
+        proj = await (await live.execute(
+            "SELECT desired_state FROM ledger_projections WHERE ledger_event_id = 10"
+        )).fetchall()
+        assert [r["desired_state"] for r in proj] == ["present_full"]
+        ob = await (await live.execute(
+            "SELECT operation FROM outbox_operations WHERE user_id = 1"
+        )).fetchall()
+        assert [r["operation"] for r in ob] == ["create"]
+        rr = await (await live.execute(
+            "SELECT COUNT(*) AS n FROM reconcile_requests WHERE user_id = 1"
+        )).fetchone()
+        assert rr["n"] == 1
+
+        # User 2 was NOT restored — per-user scope respected.
+        u2 = await (await live.execute(
+            "SELECT COUNT(*) AS n FROM users WHERE id = 2"
+        )).fetchone()
+        assert u2["n"] == 0
