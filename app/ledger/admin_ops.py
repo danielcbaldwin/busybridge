@@ -46,10 +46,15 @@ async def recolor_client_calendar(
               AND status = 'active'""",
         (new_color_id, when, client_calendar_id),
     )
-    # Affected ledger rows: enqueue them for replan.
+    # Affected ledger rows: enqueue them for replan.  The source_type
+    # filter matches the UPDATE above — client/personal calendars and
+    # webcal subscriptions are numbered in separate tables, so without
+    # it a colliding webcal id would replan unrelated webcal rows.
     affected = await (await db.execute(
         """SELECT id, user_id FROM ledger_events
-            WHERE source_calendar_id = ? AND status = 'active'""",
+            WHERE source_type IN ('client', 'personal')
+              AND source_calendar_id = ?
+              AND status = 'active'""",
         (client_calendar_id,),
     )).fetchall()
     by_user: dict[int, list[int]] = {}
