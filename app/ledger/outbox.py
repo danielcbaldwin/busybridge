@@ -671,6 +671,15 @@ async def _record_origin_writeback_applied(
             when, when, int(op["projection_id"]),
         ),
     )
+    # The pending main-side change has now reached the source — clear
+    # the flag so a later reconcile does not re-patch.
+    await db.execute(
+        """UPDATE ledger_events
+              SET origin_writeback_pending = 0
+            WHERE id = (SELECT ledger_event_id FROM ledger_projections
+                         WHERE id = ?)""",
+        (int(op["projection_id"]),),
+    )
     await db.execute(
         """UPDATE outbox_operations
               SET status = ?, completed_at = ?, last_http_status = 200

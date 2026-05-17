@@ -432,6 +432,35 @@ def _resolve_original_start(time_dict: dict) -> str:
     return naive.replace(tzinfo=tz).astimezone(UTC).isoformat()
 
 
+def _instance_original_start(event: dict) -> tuple[str, bool]:
+    """Return ``(original_start, is_all_day)`` for a recurring instance.
+
+    Prefers ``originalStartTime`` (the un-modified occurrence slot);
+    falls back to the instance's own ``start`` when Google omitted it.
+    A timed value is normalized via :func:`_resolve_original_start` so
+    the same occurrence always yields the same string.
+    """
+    ost = event.get("originalStartTime", {}) or {}
+    if "dateTime" in ost:
+        return _resolve_original_start(ost), False
+    if "date" in ost:
+        return ost["date"], True
+    start = event.get("start") or {}
+    if "dateTime" in start:
+        return _resolve_original_start(start), False
+    if "date" in start:
+        return start["date"], True
+    return "", False
+
+
+#: Sentinel for ``_ingest_instance``'s ``source_event_id`` parameter:
+#: "store the event's own id".  A literal ``None`` is a distinct,
+#: meaningful value (the instance has no source event id yet — used
+#: by the main-side managed-instance edit path), so it cannot double
+#: as the default.
+_USE_EVENT_ID: Any = object()
+
+
 async def _ingest_instance(
     db: aiosqlite.Connection,
     *,
@@ -441,6 +470,8 @@ async def _ingest_instance(
     parent_canonical: str,
     source_type: str,
     source_calendar_id: Optional[int],
+    source_event_id: Any = _USE_EVENT_ID,
+    fields: Optional[dict] = None,
 ) -> tuple[str, Optional[int]]:
     """Upsert a modified or cancelled instance of a recurring series.
 
@@ -452,27 +483,23 @@ async def _ingest_instance(
     gets re-ingested via full sync (which omits cancelled
     exceptions — the documented "recurring-cancellation amnesia"
     bug).
+
+    ``source_event_id`` defaults to the event's own id.  The main-side
+    managed-instance edit path passes ``None``: a move made on one of
+    our managed copies has no source event id yet (the source's own
+    occurrence is still an un-exceptioned part of its series), and
+    storing the main-copy instance id there would mis-identify it.
+
+    ``fields`` overrides the extracted content fields.  The main-side
+    edit path passes a dict whose edit-rights / organizer / attendee
+    keys are taken from the SOURCE series rather than from the opaque
+    managed copy the user dragged.  Passing it (rather than patching
+    the row afterwards) keeps the content hash self-consistent so a
+    re-ingest of the same edit still no-ops.
     """
-    ost = event.get("originalStartTime", {}) or {}
-    if "dateTime" in ost:
-        original_start = _resolve_original_start(ost)
-        instance_is_all_day = False
-    elif "date" in ost:
-        original_start = ost["date"]
-        instance_is_all_day = True
-    else:
-        start = event.get("start") or {}
-        # No originalStartTime — fall back to the instance's own start:
-        # an all-day occurrence carries a date-only start.
-        if "dateTime" in start:
-            original_start = _resolve_original_start(start)
-            instance_is_all_day = False
-        elif "date" in start:
-            original_start = start["date"]
-            instance_is_all_day = True
-        else:
-            original_start = ""
-            instance_is_all_day = False
+    if source_event_id is _USE_EVENT_ID:
+        source_event_id = event.get("id")
+    original_start, instance_is_all_day = _instance_original_start(event)
 
     instance_canonical = canonical_uid_for_instance(
         parent_canonical, original_start,
@@ -506,7 +533,7 @@ async def _ingest_instance(
                            ?, ?, ?, ?)""",
                 (
                     user_id, instance_canonical, parent_canonical,
-                    source_type, source_calendar_id, event["id"],
+                    source_type, source_calendar_id, source_event_id,
                     original_start, instance_is_all_day,
                     when, when, when, when,
                 ),
@@ -524,7 +551,8 @@ async def _ingest_instance(
         return "cancelled", int(existing["id"])
 
     # Modified instance — single-instance override on the series.
-    fields = _extract_event_fields(event, user_email=user_email)
+    if fields is None:
+        fields = _extract_event_fields(event, user_email=user_email)
     if existing is None:
         cursor = await db.execute(
             """INSERT INTO ledger_events
@@ -553,7 +581,7 @@ async def _ingest_instance(
                        ?, ?, ?)""",
             (
                 user_id, instance_canonical, parent_canonical,
-                source_type, source_calendar_id, event["id"],
+                source_type, source_calendar_id, source_event_id,
                 original_start,
                 event.get("etag"), event.get("updated"),
                 fields["summary"], fields["description"], fields["location"],

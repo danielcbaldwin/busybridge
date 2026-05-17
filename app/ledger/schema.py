@@ -53,6 +53,12 @@ CREATE TABLE IF NOT EXISTS ledger_events (
     user_intentionally_deleted BOOLEAN DEFAULT FALSE,
     is_recurring BOOLEAN DEFAULT FALSE,
 
+    -- Set when a main-side edit produced a change the source event
+    -- has not yet received, so the origin-writeback patch must fire
+    -- even on the projection's first appearance (when applied_payload_hash
+    -- is still NULL).  Cleared by the outbox once the patch lands.
+    origin_writeback_pending BOOLEAN DEFAULT FALSE,
+
     version INTEGER NOT NULL DEFAULT 1,
 
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -221,6 +227,8 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
         "ADD COLUMN google_id_generation INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE ledger_events ADD COLUMN start_timezone TEXT",
         "ALTER TABLE ledger_events ADD COLUMN end_timezone TEXT",
+        "ALTER TABLE ledger_events "
+        "ADD COLUMN origin_writeback_pending BOOLEAN DEFAULT FALSE",
     ):
         try:
             await db.execute(stmt)

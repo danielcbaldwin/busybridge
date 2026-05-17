@@ -31,6 +31,7 @@ from app.ledger.async_google import as_async_google
 from app.ledger.google_client import GoogleClient
 from app.ledger.identity import (
     canonical_uid_main_native,
+    derive_instance_google_event_id,
     is_managed_google_event_id,
 )
 from app.ledger.payload import render_payload
@@ -39,6 +40,7 @@ from app.ledger.ingest.client import (
     _content_hash_from_row,
     _extract_event_fields,
     _ingest_instance,
+    _instance_original_start,
     _is_recurring_parent,
     _record_affected,
     _try_rekey_R_parent,
@@ -222,14 +224,21 @@ async def _ingest_one_main_event(
     # A recurring-event INSTANCE (carries recurringEventId).
     recurring_parent = event.get("recurringEventId")
     if recurring_parent and is_managed_google_event_id(recurring_parent):
-        # This is an instance — modified or cancelled — of one of OUR
-        # managed recurring copies (the parent id is a bb-derived id).
-        # It is NOT a native main event.  Falling through to the
-        # native upsert below would mint a phantom main_native ledger
-        # row for it and project DUPLICATE busy blocks onto every
-        # client calendar.  Per-instance edits of a managed copy are
-        # not propagated yet, so skip it rather than corrupt state.
-        return "our_writes_skipped", None
+        # An instance — modified or cancelled — of one of OUR managed
+        # recurring copies (the parent id is a bb-derived id).  It is
+        # NOT a native main event: falling through to the native
+        # upsert below would mint a phantom main_native ledger row and
+        # project DUPLICATE busy blocks onto every client calendar.
+        # A modified instance is the user moving/editing one
+        # occurrence on the main calendar — map it back to the SOURCE
+        # series and let the planner propagate it everywhere.
+        return await _ingest_managed_recurring_instance(
+            db,
+            user_id=user_id,
+            user_email=user_email,
+            event=event,
+            managed_parent_id=recurring_parent,
+        )
     if recurring_parent and not is_managed_google_event_id(recurring_parent):
         # Instance of a *native* main series — route to the shared
         # instance handler so a cancellation gets its own sticky
@@ -365,6 +374,105 @@ async def _ingest_one_main_event(
         ),
     )
     return "native_updated", int(existing["id"])
+
+
+async def _ingest_managed_recurring_instance(
+    db: aiosqlite.Connection,
+    *,
+    user_id: int,
+    user_email: str,
+    event: dict,
+    managed_parent_id: str,
+) -> tuple[str, Optional[int]]:
+    """Handle an instance of one of our managed recurring main copies.
+
+    The user moved or edited a single occurrence of a recurring event
+    we mirror onto the main calendar.  Map it back to the SOURCE
+    series' ledger row and upsert a canonical source-parented instance
+    row, so the existing planner / diff propagate the change to the
+    source occurrence and every peer copy (REWRITE_PLAN.md Option A).
+
+    Never mints a ``main_native`` row.  Cancelled instances are a
+    destructive operation handled separately; for now they are skipped.
+    """
+    status = event.get("status", "confirmed")
+    if status == "cancelled":
+        # Cancelling one occurrence of a managed copy is destructive
+        # (it must delete that occurrence on the real source calendar).
+        # Handled by the dedicated cancellation path; skip here.
+        return "our_writes_skipped", None
+
+    # Map the managed parent id back to the SOURCE series ledger row
+    # via its 'main' projection.  The bb-id the instance carries as
+    # recurringEventId is that projection's google_event_id.
+    parent = await (await db.execute(
+        """SELECT e.id AS ledger_event_id, e.canonical_uid,
+                  e.source_type, e.source_calendar_id, e.source_event_id,
+                  e.is_recurring, e.parent_canonical_uid,
+                  e.user_can_edit, e.organizer_email, e.attendees_json
+             FROM ledger_projections p
+             JOIN ledger_events e ON e.id = p.ledger_event_id
+            WHERE p.google_event_id = ?
+              AND p.target_kind = 'main'
+              AND e.user_id = ?
+            LIMIT 1""",
+        (managed_parent_id, user_id),
+    )).fetchone()
+    if parent is None:
+        # No projection maps this id — cannot map it back to a source,
+        # so there is nothing safe to do.  Skip (never mint a phantom).
+        return "our_writes_skipped", None
+    if not parent["is_recurring"] or parent["parent_canonical_uid"]:
+        # The mapped row is not a recurring series master — defensive.
+        return "our_writes_skipped", None
+
+    # The dragged copy is opaque about edit-rights: its rendered shape
+    # carries neither the real organizer nor guestsCanModify.  Take
+    # edit-rights / organizer / attendees from the SOURCE series; take
+    # the moved time and (for full copies) the detail from the event.
+    fields = _extract_event_fields(event, user_email=user_email)
+    fields["user_can_edit"] = bool(parent["user_can_edit"])
+    fields["organizer_email"] = parent["organizer_email"]
+    fields["attendees_json"] = parent["attendees_json"]
+
+    # The origin writeback patches the source occurrence by id.  No
+    # exception exists on the source yet, but Google addresses an
+    # instance as ``<series>_<stamp>`` whether or not one has been
+    # materialised — derive it from the source series id so the
+    # writeback has a target (and so a later source-side ingest of
+    # that same exception keys to the very same row).
+    source_event_id: Optional[str] = None
+    src_series_id = parent["source_event_id"]
+    if parent["source_type"] in ("client", "personal") and src_series_id:
+        original_start, instance_is_all_day = _instance_original_start(event)
+        source_event_id = derive_instance_google_event_id(
+            src_series_id, original_start, instance_is_all_day,
+        )
+
+    outcome, ledger_id = await _ingest_instance(
+        db,
+        user_id=user_id,
+        user_email=user_email,
+        event=event,
+        parent_canonical=parent["canonical_uid"],
+        source_type=parent["source_type"],
+        source_calendar_id=parent["source_calendar_id"],
+        source_event_id=source_event_id,
+        fields=fields,
+    )
+
+    # The change was made on main; the source event does not have it.
+    # Flag the row so the origin-writeback patch fires even though the
+    # instance's writeback projection is brand new (NULL applied hash).
+    # Only on a real create/update — a no-op re-ingest must not re-arm
+    # a writeback that already drained.
+    if ledger_id is not None and outcome in ("created", "updated"):
+        await db.execute(
+            "UPDATE ledger_events SET origin_writeback_pending = 1 "
+            "WHERE id = ?",
+            (ledger_id,),
+        )
+    return outcome, ledger_id
 
 
 async def _maybe_apply_main_edit_back(

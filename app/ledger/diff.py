@@ -97,6 +97,7 @@ async def diff_and_enqueue_for_user(
                               e.summary, e.description, e.location,
                               e.start_at, e.end_at,
                               e.start_timezone, e.end_timezone,
+                              e.origin_writeback_pending,
                               e.is_all_day, e.show_as,
                               e.color_id, e.user_can_edit, e.user_rsvp_status,
                               e.recurrence_rule_json, e.version AS ledger_version,
@@ -177,6 +178,7 @@ async def _diverged_projections(
                   e.summary, e.description, e.location,
                   e.start_at, e.end_at,
                   e.start_timezone, e.end_timezone,
+                  e.origin_writeback_pending,
                   e.is_all_day, e.show_as,
                   e.color_id, e.user_can_edit, e.user_rsvp_status,
                   e.recurrence_rule_json, e.version AS ledger_version,
@@ -259,7 +261,15 @@ def _decide(
         # projection was just planned from state ingested *from* the
         # source, so it already matches — snap a baseline, no patch.
         applied = proj["applied_payload_hash"]
-        if applied is None or applied == proj["desired_payload_hash"]:
+        if applied is not None and applied == proj["desired_payload_hash"]:
+            # Already written back — nothing to do.
+            return None, None, target_cal
+        if applied is None and not bool(proj["origin_writeback_pending"]):
+            # First sight with a NULL baseline normally means the
+            # projection was just planned from state ingested FROM the
+            # source, so the source already matches — snap a baseline,
+            # no patch.  origin_writeback_pending overrides this: a
+            # main-side edit produced a change the source has not seen.
             return None, None, target_cal
         return OP_PATCH, payload, target_cal
 
