@@ -382,9 +382,10 @@ async def health_check():
             raise RuntimeError("encryption manager not initialized")
         return {"status": "healthy", "database": "connected"}
     except Exception as e:
+        logger.warning("health check failed: %s", e)
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"status": "unhealthy", "error": str(e)},
+            content={"status": "unhealthy"},
         )
 
 

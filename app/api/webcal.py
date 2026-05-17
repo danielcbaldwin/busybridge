@@ -137,14 +137,16 @@ async def create_webcal_subscription(
             detail="URL must point to a public internet address",
         )
     except httpx.HTTPError as e:
+        logger.warning("webcal feed fetch failed for %s: %s", url, e)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to fetch URL: {e}",
+            detail="Could not fetch the feed from this URL.",
         )
     except Exception as e:
+        logger.warning("webcal feed parse failed for %s: %s", url, e)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid ICS feed: {e}",
+            detail="The URL did not return a valid ICS calendar feed.",
         )
 
     # Insert
