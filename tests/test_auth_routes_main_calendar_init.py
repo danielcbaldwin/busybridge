@@ -45,7 +45,7 @@ async def test_oauth_callback_initializes_main_calendar_when_missing(test_db, mo
         return None
 
     async def fake_create_or_update_user(**_kwargs):
-        return SimpleNamespace(id=22, email="init-main@example.com", is_admin=False, main_calendar_id=None)
+        return SimpleNamespace(id=22, email="init-main@example.com", is_admin=False, main_calendar_id=None, session_token_version=0)
 
     async def fake_store_oauth_tokens(**_kwargs):
         return 1
@@ -104,7 +104,7 @@ async def test_oauth_callback_main_calendar_init_failure_is_non_fatal(test_db, m
         return None
 
     async def fake_create_or_update_user(**_kwargs):
-        return SimpleNamespace(id=23, email="init-fail@example.com", is_admin=False, main_calendar_id=None)
+        return SimpleNamespace(id=23, email="init-fail@example.com", is_admin=False, main_calendar_id=None, session_token_version=0)
 
     async def fake_store_oauth_tokens(**_kwargs):
         return 1

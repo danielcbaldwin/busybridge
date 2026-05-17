@@ -255,7 +255,8 @@ async def oauth_callback(
         session_token = create_session_token(
             user_id=user.id,
             email=user.email,
-            is_admin=user.is_admin
+            is_admin=user.is_admin,
+            token_version=user.session_token_version,
         )
 
         # Set cookie and redirect (re-validate in case DB was tampered with)

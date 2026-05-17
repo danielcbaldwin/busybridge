@@ -341,6 +341,13 @@ async def force_user_reauth(
 
     # Delete all tokens for user.
     await db.execute("DELETE FROM oauth_tokens WHERE user_id = ?", (user_id,))
+    # Bump the session-token version so the user's existing app session
+    # cookies are invalidated too — not just their Google tokens.
+    await db.execute(
+        "UPDATE users SET session_token_version = session_token_version + 1 "
+        "WHERE id = ?",
+        (user_id,),
+    )
     await db.commit()
 
     # Log action

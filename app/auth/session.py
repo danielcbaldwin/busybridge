@@ -36,6 +36,10 @@ class SessionData(BaseModel):
     user_id: int
     email: str
     is_admin: bool = False
+    # Token-version stamp: compared against users.session_token_version
+    # so an admin can revoke a user's existing sessions.  Defaults to 0
+    # so tokens issued before this field existed still decode.
+    tv: int = 0
     exp: datetime
 
 
@@ -47,11 +51,14 @@ class User(BaseModel):
     display_name: Optional[str] = None
     main_calendar_id: Optional[str] = None
     is_admin: bool = False
+    session_token_version: int = 0
     created_at: Optional[datetime] = None
     last_login_at: Optional[datetime] = None
 
 
-def create_session_token(user_id: int, email: str, is_admin: bool = False) -> str:
+def create_session_token(
+    user_id: int, email: str, is_admin: bool = False, token_version: int = 0,
+) -> str:
     """Create a JWT session token."""
     settings = get_settings()
     secret = get_session_secret()
@@ -61,6 +68,7 @@ def create_session_token(user_id: int, email: str, is_admin: bool = False) -> st
         "user_id": user_id,
         "email": email,
         "is_admin": is_admin,
+        "tv": token_version,
         "exp": expire,
     }
 
@@ -94,6 +102,7 @@ async def get_user_by_id(user_id: int) -> Optional[User]:
             display_name=row["display_name"],
             main_calendar_id=row["main_calendar_id"],
             is_admin=bool(row["is_admin"]),
+            session_token_version=row["session_token_version"],
             created_at=row["created_at"],
             last_login_at=row["last_login_at"],
         )
@@ -111,6 +120,12 @@ async def get_current_user_optional(request: Request) -> Optional[User]:
         return None
 
     user = await get_user_by_id(session.user_id)
+    if user is None:
+        return None
+    # Reject a token whose version is behind the user's current one —
+    # an admin force-reauth bumps the version to revoke old sessions.
+    if session.tv != user.session_token_version:
+        return None
     return user
 
 

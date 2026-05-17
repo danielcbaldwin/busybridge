@@ -57,3 +57,34 @@ async def test_get_current_user_success_and_require_admin_success(test_db):
         is_admin=True,
     )
     assert await require_admin(admin_user) is admin_user
+
+
+@pytest.mark.asyncio
+async def test_bumping_token_version_revokes_an_old_session(test_db):
+    """A session token is rejected once the user's
+    session_token_version has moved past the token's stamp."""
+    from app.auth.session import get_current_user_optional
+
+    db = await get_database()
+    cursor = await db.execute(
+        """INSERT INTO users (email, google_user_id, display_name)
+           VALUES ('revoke@example.com', 'revoke-google', 'Revoke User')
+           RETURNING id"""
+    )
+    user_id = (await cursor.fetchone())["id"]
+    await db.commit()
+
+    # A token minted at the current version resolves fine.
+    token = create_session_token(
+        user_id=user_id, email="revoke@example.com", token_version=0,
+    )
+    assert (await get_current_user_optional(_request_with_cookie(token))) is not None
+
+    # An admin force-reauth bumps the version — the old token is dead.
+    await db.execute(
+        "UPDATE users SET session_token_version = session_token_version + 1 "
+        "WHERE id = ?",
+        (user_id,),
+    )
+    await db.commit()
+    assert (await get_current_user_optional(_request_with_cookie(token))) is None

@@ -139,7 +139,7 @@ async def test_oauth_callback_paths(test_db, monkeypatch):
         return None
 
     async def fake_create_or_update_user(**_kwargs):
-        return SimpleNamespace(id=7, email="person@inside.com", is_admin=False, main_calendar_id="main")
+        return SimpleNamespace(id=7, email="person@inside.com", is_admin=False, main_calendar_id="main", session_token_version=0)
 
     async def fake_store_tokens(**_kwargs):
         return 1
@@ -384,6 +384,7 @@ async def test_oauth_callback_preserves_existing_refresh_token_when_missing(test
             email="preserve@inside.com",
             is_admin=False,
             main_calendar_id="primary-31",
+            session_token_version=0,
         )
 
     async def fake_update_user_last_login(_user_id: int):
