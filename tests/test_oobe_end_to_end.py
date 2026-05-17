@@ -108,9 +108,11 @@ async def test_oobe_completes_from_empty_database(test_db, tmp_path, monkeypatch
     assert r6.headers["location"].startswith("/setup?step=7")
 
     # --- Post-conditions ---------------------------------------------
-    # Encryption key file written.
+    # Encryption key file written, owner-only (0600).
     assert key_path.exists()
     assert len(key_path.read_bytes()) == 32
+    import stat
+    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
 
     # OOBE data cleared.
     assert setup_module._oobe_data == {}

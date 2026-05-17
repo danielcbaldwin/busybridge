@@ -315,13 +315,24 @@ async def setup_step_6(request: Request):
         key = generate_encryption_key()
         _oobe_data["encryption_key"] = key
 
-    # Ensure directory exists
+    # Ensure the key directory exists, owner-only.
     key_dir = os.path.dirname(settings.encryption_key_file)
     if key_dir and not os.path.exists(key_dir):
-        os.makedirs(key_dir, exist_ok=True)
+        os.makedirs(key_dir, mode=0o700, exist_ok=True)
 
-    with open(settings.encryption_key_file, "wb") as f:
+    # Write the master key 0600 (owner read/write only).  This key
+    # protects every OAuth token and derives the session secret.
+    # os.open with the mode set avoids the brief world-readable window
+    # a plain open() would leave; the explicit chmod also tightens the
+    # file if it somehow already existed with looser permissions.
+    fd = os.open(
+        settings.encryption_key_file,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    with os.fdopen(fd, "wb") as f:
         f.write(key)
+    os.chmod(settings.encryption_key_file, 0o600)
 
     # Initialize encryption manager
     enc = init_encryption_manager(key)
