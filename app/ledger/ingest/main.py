@@ -219,13 +219,21 @@ async def _ingest_one_main_event(
                 return outcome, int(proj_match["ledger_event_id"])
         return "our_writes_skipped", None
 
-    # Recurring-event INSTANCE of a *native* main series — route to
-    # the shared instance handler so cancellations get their own
-    # sticky ledger row.  Instances whose parent is one of our own
-    # managed writes are left to the native path below (which
-    # safely skips an unknown cancelled event).
+    # A recurring-event INSTANCE (carries recurringEventId).
     recurring_parent = event.get("recurringEventId")
+    if recurring_parent and is_managed_google_event_id(recurring_parent):
+        # This is an instance — modified or cancelled — of one of OUR
+        # managed recurring copies (the parent id is a bb-derived id).
+        # It is NOT a native main event.  Falling through to the
+        # native upsert below would mint a phantom main_native ledger
+        # row for it and project DUPLICATE busy blocks onto every
+        # client calendar.  Per-instance edits of a managed copy are
+        # not propagated yet, so skip it rather than corrupt state.
+        return "our_writes_skipped", None
     if recurring_parent and not is_managed_google_event_id(recurring_parent):
+        # Instance of a *native* main series — route to the shared
+        # instance handler so a cancellation gets its own sticky
+        # ledger row.
         parent_canonical = canonical_uid_main_native(user_id, recurring_parent)
         return await _ingest_instance(
             db,
