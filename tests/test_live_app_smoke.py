@@ -119,6 +119,18 @@ def test_security_headers_and_vendored_assets(app_with_fake_google):
         assert rr.status_code == 200, path
 
 
+def test_cross_site_post_is_blocked(app_with_fake_google):
+    """A state-changing request carrying a foreign Origin header is
+    refused by the CSRF origin check before it reaches the route."""
+    client, user_id = app_with_fake_google
+    r = client.post(
+        f"/api/admin/ledger/users/{user_id}/reconcile-now",
+        headers={"Origin": "https://evil.example.com"},
+    )
+    assert r.status_code == 403
+    assert "Cross-site" in r.json()["detail"]
+
+
 def test_bb_fake_google_end_to_end(app_with_fake_google):
     """The exact flow we ran by hand: plant events, reconcile,
     verify state."""

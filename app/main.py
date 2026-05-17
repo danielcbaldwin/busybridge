@@ -6,6 +6,7 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -289,6 +290,40 @@ _CSP = (
     "form-action 'self'"
 )
 _HSTS_ENABLED = settings.public_url.lower().startswith("https://")
+
+
+# CSRF defence: reject cross-site state-changing requests by checking
+# the Origin / Referer header against this app's own origin.
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
+_APP_ORIGIN = (
+    lambda p: f"{p.scheme}://{p.netloc}"
+)(urlparse(settings.public_url))
+
+
+def _is_same_origin(header_value: str) -> bool:
+    p = urlparse(header_value)
+    return bool(p.netloc) and f"{p.scheme}://{p.netloc}" == _APP_ORIGIN
+
+
+@app.middleware("http")
+async def csrf_origin_check(request: Request, call_next):
+    """Reject cross-site state-changing requests.
+
+    Browsers send Origin (and Referer) on cross-origin POST/PUT/DELETE/
+    PATCH and page JavaScript cannot forge them.  A request whose
+    Origin/Referer is present and does NOT match this app's own origin
+    is a cross-site forgery and is refused.  Non-browser callers
+    (Google's webhook, monitoring) send neither header and are allowed
+    — the CSRF threat is browser-driven.
+    """
+    if request.method not in _SAFE_METHODS:
+        check = request.headers.get("origin") or request.headers.get("referer")
+        if check is not None and not _is_same_origin(check):
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": "Cross-site request blocked."},
+            )
+    return await call_next(request)
 
 
 @app.middleware("http")
