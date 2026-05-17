@@ -22,7 +22,6 @@ time — they never mutate Google state.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Optional
 
@@ -132,38 +131,6 @@ async def verify_user(
         "divergences": divergences,
         "consistent": not divergences,
     }
-
-
-async def preview_pending_outbox(
-    db: aiosqlite.Connection, *, user_id: int,
-) -> list[dict]:
-    """Return the pending outbox operations for a user as a
-    human-readable preview.  Run this after a dry-run reconcile to
-    see exactly what the system would write to Google."""
-    rows = await (await db.execute(
-        """SELECT o.id, o.operation, o.target_google_calendar_id,
-                  o.idempotency_key, o.payload_json, o.status,
-                  e.summary, e.canonical_uid, p.target_kind
-             FROM outbox_operations o
-             JOIN ledger_projections p ON p.id = o.projection_id
-             JOIN ledger_events e ON e.id = p.ledger_event_id
-            WHERE o.user_id = ? AND o.status = 'pending'
-            ORDER BY o.id""",
-        (user_id,),
-    )).fetchall()
-    out: list[dict] = []
-    for r in rows:
-        payload = json.loads(r["payload_json"]) if r["payload_json"] else None
-        out.append({
-            "outbox_id": int(r["id"]),
-            "operation": r["operation"],
-            "target_calendar": r["target_google_calendar_id"],
-            "target_kind": r["target_kind"],
-            "event_summary": r["summary"],
-            "canonical_uid": r["canonical_uid"],
-            "would_send_summary": (payload or {}).get("summary"),
-        })
-    return out
 
 
 def _resolve(

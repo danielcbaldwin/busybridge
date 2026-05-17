@@ -489,13 +489,24 @@ async def _restore_db_for_users(backup_zip: zipfile.ZipFile, user_ids: list[int]
                 dst.write(src.read())
 
         bk_conn = sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True)
-        live_db = await get_database()
-
-        for uid in user_ids:
-            await _restore_single_user(live_db, bk_conn, uid)
-
-        bk_conn.close()
-        await live_db.commit()
+        try:
+            live_db = await get_database()
+            # The app connection runs in autocommit mode (isolation_level
+            # =None), so without an explicit transaction every DELETE and
+            # INSERT in _restore_single_user commits on its own — a crash
+            # mid-restore would leave a user partially wiped.  BEGIN
+            # IMMEDIATE makes the whole scoped restore atomic: every user
+            # lands, or none of them do.
+            await live_db.execute("BEGIN IMMEDIATE")
+            try:
+                for uid in user_ids:
+                    await _restore_single_user(live_db, bk_conn, uid)
+            except Exception:
+                await live_db.rollback()
+                raise
+            await live_db.commit()
+        finally:
+            bk_conn.close()
     finally:
         os.unlink(tmp_path)
 

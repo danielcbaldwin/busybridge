@@ -53,19 +53,13 @@ async def test_oauth_callback_initializes_main_calendar_when_missing(test_db, mo
     async def fake_update_user_last_login(_user_id: int):
         return None
 
-    class FakeRealGoogleClient:
-        """Stand-in for RealGoogleClient; the OAuth callback calls
-        ``client.list_calendar_list()`` to find the primary calendar."""
-        def __init__(self, _credentials):
-            pass
-
-        def list_calendar_list(self):
-            return {
-                "items": [
-                    {"id": "primary-22", "primary": True},
-                    {"id": "other", "primary": False},
-                ]
-            }
+    async def fake_fetch_calendar_list(_user_id, _email):
+        """The OAuth callback lists calendars via fetch_calendar_list,
+        which returns the items list directly."""
+        return [
+            {"id": "primary-22", "primary": True},
+            {"id": "other", "primary": False},
+        ]
 
     monkeypatch.setattr("app.auth.routes.get_oauth_state", fake_get_oauth_state)
     monkeypatch.setattr("app.auth.routes.exchange_code_for_tokens", fake_exchange)
@@ -75,7 +69,7 @@ async def test_oauth_callback_initializes_main_calendar_when_missing(test_db, mo
     monkeypatch.setattr("app.auth.routes.store_oauth_tokens", fake_store_oauth_tokens)
     monkeypatch.setattr("app.auth.routes.update_user_last_login", fake_update_user_last_login)
     monkeypatch.setattr("app.auth.routes.create_session_token", lambda **_kwargs: "session-token")
-    monkeypatch.setattr("app.ledger.real_google_client.RealGoogleClient", FakeRealGoogleClient)
+    monkeypatch.setattr("app.auth.routes.fetch_calendar_list", fake_fetch_calendar_list)
 
     response = await oauth_callback(_request(), code="code", state="state")
     assert response.status_code == 302
@@ -118,9 +112,8 @@ async def test_oauth_callback_main_calendar_init_failure_is_non_fatal(test_db, m
     async def fake_update_user_last_login(_user_id: int):
         return None
 
-    class ExplodingRealGoogleClient:
-        def __init__(self, _credentials):
-            raise RuntimeError("calendar list failed")
+    async def exploding_fetch_calendar_list(_user_id, _email):
+        raise RuntimeError("calendar list failed")
 
     monkeypatch.setattr("app.auth.routes.get_oauth_state", fake_get_oauth_state)
     monkeypatch.setattr("app.auth.routes.exchange_code_for_tokens", fake_exchange)
@@ -130,7 +123,7 @@ async def test_oauth_callback_main_calendar_init_failure_is_non_fatal(test_db, m
     monkeypatch.setattr("app.auth.routes.store_oauth_tokens", fake_store_oauth_tokens)
     monkeypatch.setattr("app.auth.routes.update_user_last_login", fake_update_user_last_login)
     monkeypatch.setattr("app.auth.routes.create_session_token", lambda **_kwargs: "session-token")
-    monkeypatch.setattr("app.ledger.real_google_client.RealGoogleClient", ExplodingRealGoogleClient)
+    monkeypatch.setattr("app.auth.routes.fetch_calendar_list", exploding_fetch_calendar_list)
 
     response = await oauth_callback(_request(), code="code", state="state")
     assert response.status_code == 302

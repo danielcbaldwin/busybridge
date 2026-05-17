@@ -167,14 +167,15 @@ def _compute_desired_projections(
     if source == "client":
         peer = PRESENT_BUSY if show_as != "free" else ABSENT
         # The origin client calendar holds the event natively, so it
-        # gets no busy block.  But when the user is an attendee with
-        # an RSVP, the origin gets a "phantom" rsvp-only projection
-        # (REWRITE_PLAN.md §9): an RSVP the user sets on the main
-        # copy is written back to the source event.  Rendered as an
-        # events.patch — it never creates or deletes the source.
+        # gets no busy block.  It gets a "phantom" writeback
+        # projection (REWRITE_PLAN.md §9) whenever there is something
+        # to push back to the source: the user's RSVP, or — for an
+        # editable event — a time/detail edit made on the main copy.
+        # Rendered as an events.patch; it never creates or deletes
+        # the source event.
         origin = (
             PRESENT_FULL_RSVP_ONLY
-            if ledger["user_rsvp_status"]
+            if (ledger["user_rsvp_status"] or ledger["user_can_edit"])
             else ABSENT
         )
         return {
@@ -184,10 +185,19 @@ def _compute_desired_projections(
         }
 
     if source == "personal":
+        # Personal detail stays opaque on every copy.  The origin
+        # writeback projection carries only the user's RSVP and the
+        # canonical time back to the personal source event — never
+        # detail, and never a create/delete (it is an events.patch).
+        origin = (
+            PRESENT_FULL_RSVP_ONLY
+            if (ledger["user_rsvp_status"] or ledger["user_can_edit"])
+            else ABSENT
+        )
         return {
             "main": PRESENT_PERSONAL_BUSY,
             "peer_clients": PRESENT_PERSONAL_BUSY,
-            "origin_client": ABSENT,
+            "origin_client": origin,
         }
 
     if source == "webcal":
@@ -234,6 +244,14 @@ def _resolve_targets(
         else:
             state = peer_state
         out.append((TARGET_CLIENT, cal_id, state))
+
+    # A personal-sourced event also gets an origin writeback target,
+    # on the personal calendar itself.  Personal calendars are
+    # deliberately excluded from active_clients (they are never
+    # busy-block targets), so this target is appended explicitly.
+    # It is rendered as an events.patch and never creates/deletes.
+    if source_type == "personal" and origin_cal_id is not None:
+        out.append((TARGET_CLIENT, origin_cal_id, origin_state))
     return out
 
 

@@ -11,9 +11,10 @@ Same shape as the client ingest, with three differences:
    ``user_intentionally_deleted`` flag, so the planner suppresses
    re-creation on every target.
 
-Edit-back-propagation (RSVP from main → source, drag-on-main
-revert) is intentionally not in this first pass — those land
-once the basic main-ingest is exercised end-to-end.
+Edit-back-propagation (REWRITE_PLAN.md §9): a user edit to one of
+our managed copies on the main calendar is classified by
+:func:`_maybe_apply_main_edit_back` and either propagated to the
+source event or reverted as drift.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from app.ledger.identity import (
     canonical_uid_main_native,
     is_managed_google_event_id,
 )
+from app.ledger.payload import render_payload
 from app.ledger.ingest.client import (
     _content_hash,
     _content_hash_from_row,
@@ -357,16 +359,29 @@ async def _maybe_apply_main_edit_back(
     ledger_event_id: int,
     event: dict,
 ) -> Optional[str]:
-    """User edited our copy on main.  Decide what to do per
-    REWRITE_PLAN.md §9:
+    """The user edited our copy of an event on the main calendar.
+    Classify the edit and either propagate it to the source event or
+    revert it (REWRITE_PLAN.md §9).
 
-    * RSVP changed → ALWAYS propagate.  A user may set their own
-      response on any event, editable or not; the planner routes it
-      back to the origin client via the ``present_full_rsvp_only``
-      projection (the outbox writes it with an ``events.patch``).
-    * Time changed + editable → propagate the new time to the source.
-    * Time changed + non-editable → bump the version so the planner
-      re-renders the canonical time and the outbox reverts the drift.
+    Three edit categories, each routed per source type:
+
+    * RSVP — always propagated.  A user may set their own response
+      on any event, editable or not; the planner's origin writeback
+      projection writes it back to the source via an events.patch.
+    * Time (start/end) — propagated for an editable client- or
+      personal-sourced event; reverted otherwise (a webcal feed is
+      read-only; a locked event the user is not allowed to move).
+    * Detail (summary/description/location) — propagated for an
+      editable client-sourced event only.  A personal main copy is
+      an opaque "Busy (personal)" placeholder and a webcal copy is
+      read-only, so a detail edit there is reverted.
+
+    A propagated category is written into the ledger so the planner
+    re-renders it onto every copy and the origin writeback patch
+    carries it to the source.  An un-propagated (reverted) category
+    is left untouched in the ledger; the version bump alone makes the
+    planner re-render the canonical copy and the diff revert the
+    drift on the main calendar.
     """
     ledger = await (await db.execute(
         "SELECT * FROM ledger_events WHERE id = ?",
@@ -375,62 +390,92 @@ async def _maybe_apply_main_edit_back(
     if ledger is None:
         return None
 
+    # Compare the incoming event against the payload we last rendered
+    # for the main copy — NOT the raw ledger fields.  A personal copy
+    # is an opaque placeholder whose rendered summary ("Busy
+    # (personal)") never equals the ledger's real summary, so a
+    # ledger-field comparison would read every personal copy as
+    # permanently drifted.
+    main_proj = await (await db.execute(
+        """SELECT desired_state FROM ledger_projections
+            WHERE ledger_event_id = ?
+              AND target_kind = 'main'
+              AND target_calendar_id IS NULL""",
+        (ledger_event_id,),
+    )).fetchone()
+    canonical: dict = {}
+    if main_proj is not None:
+        rendered = render_payload(
+            desired_state=main_proj["desired_state"],
+            ledger_row={k: ledger[k] for k in ledger.keys()},
+            target_kind="main",
+        )
+        canonical = rendered or {}
+
     new_rsvp = _extract_self_rsvp(event, user_email)
     new_start, new_end, is_all_day = _extract_start_end(event)
 
+    source_type = ledger["source_type"]
     user_can_edit = bool(ledger["user_can_edit"])
-    rsvp_changed = (new_rsvp is not None and new_rsvp != ledger["user_rsvp_status"])
+
+    rsvp_changed = (
+        new_rsvp is not None and new_rsvp != ledger["user_rsvp_status"]
+    )
     time_changed = (
         new_start is not None
         and (new_start != ledger["start_at"] or new_end != ledger["end_at"])
     )
+    detail_changed = _detail_differs(event, canonical)
 
-    if not (rsvp_changed or time_changed):
+    if not (rsvp_changed or time_changed or detail_changed):
         return "our_writes_skipped"
 
+    # Which categories may be written back to this source type.
+    time_writeback = source_type in ("client", "personal")
+    detail_writeback = source_type == "client"
+
+    apply_rsvp = rsvp_changed
+    apply_time = time_changed and user_can_edit and time_writeback
+    apply_detail = detail_changed and user_can_edit and detail_writeback
+
     when = datetime.now(UTC).isoformat()
-    # A time edit only propagates to the source when the user is
-    # allowed to move the event; otherwise it is drift to revert.
-    apply_time = time_changed and user_can_edit
-
-    if rsvp_changed or apply_time:
-        # Forward-edit: update the ledger so the planner re-renders
-        # and the outbox pushes the change back.  RSVP routes to the
-        # origin client; an editable time edit routes to every copy.
-        # The version bump also reverts any *non-editable* time drift
-        # bundled into the same edit (the planner re-renders the
-        # canonical time, the diff sees the main copy diverged).
-        await db.execute(
-            """UPDATE ledger_events
-                  SET user_rsvp_status = COALESCE(?, user_rsvp_status),
-                      start_at = COALESCE(?, start_at),
-                      end_at = COALESCE(?, end_at),
-                      is_all_day = COALESCE(?, is_all_day),
-                      version = version + 1,
-                      updated_at = ?
-                WHERE id = ?""",
-            (
-                new_rsvp if rsvp_changed else None,
-                new_start if apply_time else None,
-                new_end if apply_time else None,
-                is_all_day if apply_time else None,
-                when, ledger_event_id,
-            ),
-        )
-        return "main_edit_propagated"
-
-    # Only a non-editable time drift remains: bump the version
-    # without changing canonical content.  The planner re-renders
-    # the desired payload and the diff issues an update that reverts
-    # the move on Google.
     await db.execute(
         """UPDATE ledger_events
-              SET version = version + 1,
+              SET user_rsvp_status = COALESCE(?, user_rsvp_status),
+                  start_at = COALESCE(?, start_at),
+                  end_at = COALESCE(?, end_at),
+                  is_all_day = COALESCE(?, is_all_day),
+                  summary = CASE WHEN ? THEN ? ELSE summary END,
+                  description = CASE WHEN ? THEN ? ELSE description END,
+                  location = CASE WHEN ? THEN ? ELSE location END,
+                  version = version + 1,
                   updated_at = ?
             WHERE id = ?""",
-        (when, ledger_event_id),
+        (
+            new_rsvp if apply_rsvp else None,
+            new_start if apply_time else None,
+            new_end if apply_time else None,
+            is_all_day if apply_time else None,
+            apply_detail, event.get("summary"),
+            apply_detail, event.get("description"),
+            apply_detail, event.get("location"),
+            when, ledger_event_id,
+        ),
     )
+    if apply_rsvp or apply_time or apply_detail:
+        return "main_edit_propagated"
     return "main_drift_reverted"
+
+
+def _detail_differs(event: dict, canonical: dict) -> bool:
+    """True when the incoming main-copy event's summary, description
+    or location differs from the payload last rendered for it.  An
+    absent field and an empty string are normalised to compare equal.
+    """
+    for key in ("summary", "description", "location"):
+        if (event.get(key) or "") != (canonical.get(key) or ""):
+            return True
+    return False
 
 
 def _extract_self_rsvp(event: dict, user_email: str) -> Optional[str]:

@@ -328,20 +328,21 @@ async def dry_run_preview(
     user_id: int,
     _: User = Depends(require_admin),
 ) -> dict:
-    """Run an ingest + plan + diff pass with the outbox left
-    UNDRAINED, then return the pending operations: the exact list
-    of writes the system *would* send to Google.
+    """Run an ingest + plan + diff pass and return the operations
+    the system *would* send to Google.
 
-    Pure read against Google (ingest only); nothing is written.
-    Use this during the Stage-4 staging window to see what the
-    new system intends to do before letting it loose.
+    Pure read against Google (ingest only); nothing is written to
+    Google.  The diff step always enqueues outbox rows, so the pass
+    runs with ``dry_run=True``: the rows it creates are captured as
+    the preview below and then deleted under the per-user reconcile
+    lock, so no later reconcile can drain them.  Use this during the
+    Stage-4 staging window to see what the new system intends to do
+    before letting it loose.
     """
     from app.ledger.runtime import reconcile_user_by_id
-    from app.ledger.verify import preview_pending_outbox
 
-    out = await reconcile_user_by_id(user_id, drain=False)
-    db = await get_database()
-    preview = await preview_pending_outbox(db, user_id=user_id)
+    out = await reconcile_user_by_id(user_id, dry_run=True)
+    preview = out.pop("preview_operations", [])
     return {
         "status": "done",
         "reconcile_counters": out,

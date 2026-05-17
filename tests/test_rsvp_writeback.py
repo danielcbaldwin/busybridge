@@ -111,17 +111,31 @@ async def test_origin_rsvp_projection_never_deletes_the_source_event():
     await s.close()
 
 
-async def test_no_origin_projection_for_event_without_an_rsvp():
-    """A client event the user is not an attendee of has no RSVP, so
-    no origin rsvp projection is planned (no needless patch back)."""
+async def test_no_origin_projection_for_a_locked_event_without_an_rsvp():
+    """A non-editable client event the user has no RSVP on gets no
+    origin writeback projection — there is nothing that could ever be
+    written back to the source, so no needless patch is planned.
+
+    (An *editable* event does get the projection even without an
+    RSVP, so a later time/detail edit on the main copy can propagate
+    — that path is exercised in test_main_edit_writeback.py.)"""
     s = Scenario()
     s.given_calendar("main")
     s.given_calendar("client_a")
     user = await s.given_user("alice", main="main", clients=["client_a"])
-    s.given_event(
-        "client_a", summary="Solo block", start="2026-02-03T09:00:00Z",
-        event_id="solo000000001",
-    )
+    # Organised by someone else, another guest, alice not an attendee,
+    # no guestsCanModify → not editable, and no RSVP for alice.
+    s.google.insert_event(s.cal("client_a"), {
+        "id": "locked00000001",
+        "summary": "Locked block",
+        "start": {"dateTime": "2026-02-03T09:00:00Z", "timeZone": "UTC"},
+        "end": {"dateTime": "2026-02-03T09:30:00Z", "timeZone": "UTC"},
+        "organizer": {"email": "boss@example.com"},
+        "attendees": [
+            {"email": "boss@example.com", "organizer": True,
+             "responseStatus": "accepted"},
+        ],
+    })
     await s.run_reconciler_until_quiescent("alice", max_passes=3)
 
     db = await s.setup_db()
@@ -135,7 +149,5 @@ async def test_no_origin_projection_for_event_without_an_rsvp():
               AND p.target_calendar_id = ?""",
         (user.user_id, ccid),
     )).fetchall()
-    # The only client-target projection for the origin calendar would
-    # be the rsvp one; a no-attendee event must not produce it.
     assert all(r["desired_state"] != "present_full_rsvp_only" for r in rows)
     await s.close()

@@ -62,10 +62,10 @@ async def diff_and_enqueue_for_user(
 
     for proj in rows_sorted:
         # Instance projections: derive google_event_id from the
-        # parent's projection on the same target.  Origin rsvp-only
+        # parent's projection on the same target.  Origin writeback
         # projections are skipped here — they deliberately keep
-        # google_event_id NULL (see _is_origin_rsvp / _do_patch).
-        if proj["parent_canonical_uid"] and not _is_origin_rsvp(proj):
+        # google_event_id NULL (see _is_origin_writeback / _do_patch).
+        if proj["parent_canonical_uid"] and not _is_origin_writeback(proj):
             parent_proj_google_id = await _parent_projection_google_id(
                 db,
                 user_id=user_id,
@@ -192,14 +192,15 @@ async def _diverged_projections(
     return await cursor.fetchall()
 
 
-def _is_origin_rsvp(proj) -> bool:
-    """True for the projection that writes the user's RSVP back to
-    the calendar that *sourced* the event (target calendar == origin
+def _is_origin_writeback(proj) -> bool:
+    """True for the phantom projection that writes the user's edits
+    — RSVP, time, and (for client sources) detail — back to the
+    calendar that *sourced* the event (target calendar == origin
     calendar).  It is rendered as an ``events.patch`` and never
     creates or deletes the source event."""
     if proj["target_kind"] != "client":
         return False
-    if proj["source_type"] != "client":
+    if proj["source_type"] not in ("client", "personal"):
         return False
     sc = proj["source_calendar_id"]
     tc = proj["target_calendar_id"]
@@ -236,15 +237,27 @@ def _decide(
         target_kind=target_kind,
     )
 
-    # Origin rsvp-only projection: the target is the user's real
-    # source event.  It may only ever be PATCHed (write the RSVP) or
-    # be a no-op — never created or deleted.  When the event is
-    # cancelled / intentionally-deleted the planner sets desired to
-    # ABSENT; that must NOT delete the source event.
-    if _is_origin_rsvp(proj):
-        if desired == PRESENT_FULL_RSVP_ONLY:
-            return OP_PATCH, payload, target_cal
-        return None, None, target_cal
+    # Origin writeback projection: the target is the user's real
+    # source event.  It may only ever be PATCHed (write the user's
+    # edits) or be a no-op — never created or deleted.  When the
+    # event is cancelled / intentionally-deleted the planner sets
+    # desired to ABSENT; that must NOT delete the source event.
+    if _is_origin_writeback(proj):
+        if desired != PRESENT_FULL_RSVP_ONLY:
+            return None, None, target_cal
+        # The writeback patches an event we do NOT own, so it must
+        # fire ONLY for a genuine change to the user's edits — never
+        # on a bare version bump (e.g. a recolor, which the writeback
+        # does not carry).  A no-op patch would still touch the
+        # source event and echo back through that calendar's
+        # incremental feed as a spurious change.  A NULL
+        # applied_payload_hash means "not yet baselined": the
+        # projection was just planned from state ingested *from* the
+        # source, so it already matches — snap a baseline, no patch.
+        applied = proj["applied_payload_hash"]
+        if applied is None or applied == proj["desired_payload_hash"]:
+            return None, None, target_cal
+        return OP_PATCH, payload, target_cal
 
     if desired == ABSENT:
         # No google_event_id ever assigned → nothing to delete,
@@ -279,6 +292,7 @@ def _proj_row_to_ledger_dict(proj) -> dict:
         "user_rsvp_status": proj["user_rsvp_status"],
         "recurrence_rule_json": proj["recurrence_rule_json"],
         "attendees_json": proj["attendees_json"],
+        "source_type": proj["source_type"],
     }
 
 

@@ -14,8 +14,10 @@ Five render modes:
   client calendar.
 * ``present_personal_busy``— opaque "Busy (personal)" placeholder
   on main or any client calendar.
-* ``present_full_rsvp_only``— update only the RSVP back to the
-  source calendar (used by the edit-on-main → propagate path).
+* ``present_full_rsvp_only``— events.patch back to the calendar
+  that sourced the event, carrying the user's edits (RSVP, time,
+  and — for client sources — detail).  Used by the edit-on-main
+  → propagate path; never creates or deletes the source.
 * ``absent``               — no payload; outbox emits a delete.
 
 The lock emoji "🔒 " is prepended to the summary when the user
@@ -77,14 +79,20 @@ def render_payload(
     if desired_state == ABSENT:
         return None
 
+    if desired_state == PRESENT_FULL_RSVP_ONLY:
+        # events.patch onto the user's real source event — a calendar
+        # entry we do NOT own.  Returned unstamped: branding the
+        # source with our extendedProperties would make the orphan
+        # scan mis-claim it as one of our managed writes and relink
+        # the writeback projection to it.
+        return _render_origin_writeback(ledger_row)
+
     if desired_state == PRESENT_FULL:
         body = _render_full_copy(ledger_row, target_kind)
     elif desired_state == PRESENT_BUSY:
         body = _render_busy_block(ledger_row)
     elif desired_state == PRESENT_PERSONAL_BUSY:
         body = _render_personal_busy(ledger_row)
-    elif desired_state == PRESENT_FULL_RSVP_ONLY:
-        body = _render_rsvp_only(ledger_row)
     else:
         raise ValueError(f"unknown desired_state: {desired_state!r}")
 
@@ -171,15 +179,46 @@ def _render_personal_busy(row: dict) -> dict:
     return body
 
 
-def _render_rsvp_only(row: dict) -> dict:
-    """Body for an ``events.patch`` that writes the user's RSVP back
+def _render_origin_writeback(row: dict) -> dict:
+    """Body for an ``events.patch`` that writes the user's edits back
     to the calendar that sourced the event.
 
-    The COMPLETE attendee list is included: ``events.patch`` replaces
-    the ``attendees`` array wholesale, so sending only the user's
-    entry would drop every other guest.  Only the user's own entry
-    (``self=True``) has its ``responseStatus`` changed; all other
-    fields of the source event are untouched (patch is field-scoped).
+    ``events.patch`` is field-scoped — only the keys present here are
+    changed on the source event; every other field is left intact.
+
+    Always carries the canonical ``start``/``end``.  It carries the
+    ``attendees`` array only when the user has an RSVP to write (a
+    solo source event has no attendees, and sending the array would
+    spuriously add the user as one).  For a client-sourced event it
+    also carries the editable detail fields, sent as the ledger's
+    own values — a JSON ``null`` (an absent ledger field) clears the
+    field on the source, which both no-ops a field that was never
+    set and propagates a genuine clear.  A personal source omits
+    detail: its main copy is an opaque "Busy (personal)"
+    placeholder, so an edit there is a placeholder edit, never a
+    real-event edit.
+    """
+    body: dict[str, Any] = {
+        "start": _start_dict(row),
+        "end": _end_dict(row),
+    }
+    if row.get("user_rsvp_status"):
+        body["attendees"] = _rsvp_attendees(row)
+    if row.get("source_type") == "client":
+        body["summary"] = row.get("summary")
+        body["description"] = row.get("description")
+        body["location"] = row.get("location")
+    return body
+
+
+def _rsvp_attendees(row: dict) -> list[dict]:
+    """The source event's attendee list with the user's own
+    ``responseStatus`` set to the stored RSVP.
+
+    The COMPLETE list is returned: ``events.patch`` replaces the
+    ``attendees`` array wholesale, so sending only the user's entry
+    would drop every other guest.  Only the user's own entry
+    (``self=True``) is changed.
     """
     rsvp = row.get("user_rsvp_status") or "needsAction"
     raw = row.get("attendees_json")
@@ -197,7 +236,7 @@ def _render_rsvp_only(row: dict) -> dict:
         out.append(att)
     if not found_self:
         out.append({"self": True, "responseStatus": rsvp})
-    return {"attendees": out}
+    return out
 
 
 # ---------------------------------------------------------------------------

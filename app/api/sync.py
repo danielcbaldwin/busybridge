@@ -409,17 +409,16 @@ async def trigger_orphan_scan(
     dry_run: bool = False,
 ):
     """Discovery / orphan scan via the ledger reconciler with
-    run_discovery=True.  The dry_run param is preserved for API
-    compatibility but is currently a no-op — the discovery pass
-    is non-destructive on its own (it just enqueues deletes that
-    the outbox drains; aborting between is possible only at the
-    drain layer)."""
+    run_discovery=True.  With ``dry_run=True`` the pass ingests and
+    plans but never delivers: the delete operations discovery would
+    enqueue are captured and then discarded under the per-user
+    reconcile lock, so no later reconcile can drain them."""
     from app.ledger.runtime import reconcile_user_by_id
     out = await reconcile_user_by_id(
         user.id,
         include_main=False,  # run_discovery walks main itself
         run_discovery=True,
-        drain=not dry_run,
+        dry_run=dry_run,
     )
     db = await get_database()
     await db.execute(

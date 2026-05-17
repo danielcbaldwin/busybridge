@@ -91,6 +91,7 @@ async def reconcile_user(
     include_main: bool = True,
     drain: bool = True,
     run_discovery: bool = False,
+    dry_run: bool = False,
     now: Optional[datetime] = None,
 ) -> dict:
     """Run one full reconciliation pass for one user.
@@ -108,14 +109,25 @@ async def reconcile_user(
             that only exercise client→main propagation).
         drain: skip the outbox drain (useful for assertions about
             queue contents before delivery).
+        dry_run: ingest + plan + diff, but never deliver to Google.
+            The outbox rows the diff enqueues are captured as a
+            preview and then deleted (here, under the per-user
+            reconcile lock) so no later pass can drain them.
 
-    Returns a counters dict aggregating each phase.
+    Returns a counters dict aggregating each phase.  When ``dry_run``
+    is set it also carries ``preview_operations`` — the list of
+    writes the pass would have sent to Google.
     """
     # Offload every Google call to a worker thread (see async_google):
     # the GoogleClient protocol is synchronous, so a blocking call
     # would otherwise freeze the event loop.  Idempotent if already
     # wrapped.
     google = as_async_google(google)
+
+    # A dry-run never delivers: force the drain off so the captured
+    # preview rows are the *only* thing the pass produces for Google.
+    if dry_run:
+        drain = False
 
     # Pause handling has two modes (see _pause_mode):
     #  * global  — a HARD freeze: skip ingest AND diff AND drain.
@@ -137,6 +149,13 @@ async def reconcile_user(
         "paused": paused,
     }
 
+    # Record the outbox high-water mark before any enqueue so a
+    # dry-run can identify — and discard — exactly the rows this pass
+    # creates, without touching real work queued by an earlier pass.
+    dry_run_watermark = (
+        await _outbox_watermark(db, user_id) if dry_run else 0
+    )
+
     # Diff/outbox needs the Google ID for any calendar a projection
     # might target — including disconnected ones we still owe a
     # delete to.  Default to the active list if the caller didn't
@@ -145,6 +164,11 @@ async def reconcile_user(
         int(c["id"]): c["google_calendar_id"]
         for c in (all_known_client_calendars or client_calendars)
     }
+    # Personal calendars are origin writeback targets too — a
+    # personal-sourced event's edits patch back to the personal
+    # source — so the diff must be able to resolve their Google ids.
+    for c in (personal_calendars or []):
+        google_id_for.setdefault(int(c["id"]), c["google_calendar_id"])
 
     if paused:
         # Skip ingest + plan (don't pull new state).  But DO run
@@ -169,6 +193,10 @@ async def reconcile_user(
                 out["drain"][k] = out["drain"].get(k, 0) + v
             if counters["processed"] == 0 and counters["superseded"] == 0:
                 break
+        if dry_run:
+            out["preview_operations"] = await _discard_dry_run_outbox(
+                db, user_id=user_id, watermark=dry_run_watermark,
+            )
         return out
 
     # 1. Ingest each client.  Failures are caught per-calendar so
@@ -307,7 +335,65 @@ async def reconcile_user(
         if drain_counters["processed"] == 0 and drain_counters["superseded"] == 0:
             break
 
+    if dry_run:
+        out["preview_operations"] = await _discard_dry_run_outbox(
+            db, user_id=user_id, watermark=dry_run_watermark,
+        )
+
     return out
+
+
+async def _outbox_watermark(db: aiosqlite.Connection, user_id: int) -> int:
+    """Highest outbox row id for a user, or 0 when the queue is empty."""
+    row = await (await db.execute(
+        "SELECT COALESCE(MAX(id), 0) AS m FROM outbox_operations WHERE user_id = ?",
+        (user_id,),
+    )).fetchone()
+    return int(row["m"])
+
+
+async def _discard_dry_run_outbox(
+    db: aiosqlite.Connection, *, user_id: int, watermark: int,
+) -> list[dict]:
+    """Capture, then delete, the outbox rows a dry-run pass enqueued.
+
+    The diff step always enqueues — there is no preview mode in it —
+    so a dry-run leaves real ``pending`` rows behind.  Left in place a
+    later reconcile would drain them to Google.  Every row above
+    ``watermark`` was created by this pass (rows at or below it are
+    pre-existing real work and are left untouched).  This runs under
+    the per-user reconcile lock, so no drain can claim a row between
+    the capture and the delete.
+    """
+    rows = await (await db.execute(
+        """SELECT o.id, o.operation, o.target_google_calendar_id,
+                  o.payload_json, e.summary, e.canonical_uid,
+                  p.target_kind
+             FROM outbox_operations o
+             JOIN ledger_projections p ON p.id = o.projection_id
+             JOIN ledger_events e ON e.id = p.ledger_event_id
+            WHERE o.user_id = ? AND o.id > ?
+            ORDER BY o.id""",
+        (user_id, watermark),
+    )).fetchall()
+    preview: list[dict] = []
+    for r in rows:
+        payload = json.loads(r["payload_json"]) if r["payload_json"] else None
+        preview.append({
+            "outbox_id": int(r["id"]),
+            "operation": r["operation"],
+            "target_calendar": r["target_google_calendar_id"],
+            "target_kind": r["target_kind"],
+            "event_summary": r["summary"],
+            "canonical_uid": r["canonical_uid"],
+            "would_send_summary": (payload or {}).get("summary"),
+        })
+    await db.execute(
+        "DELETE FROM outbox_operations WHERE user_id = ? AND id > ?",
+        (user_id, watermark),
+    )
+    await db.commit()
+    return preview
 
 
 async def _bump_failure(

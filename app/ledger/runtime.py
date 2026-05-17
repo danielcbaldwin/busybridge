@@ -115,6 +115,7 @@ async def reconcile_user_by_id(
     include_main: bool = True,
     drain: bool = True,
     run_discovery: bool = False,
+    dry_run: bool = False,
     allow_in_maintenance: bool = False,
 ) -> dict:
     """Run one reconciliation pass for a user, under the per-user lock.
@@ -156,6 +157,7 @@ async def reconcile_user_by_id(
                 include_main=include_main,
                 drain=drain,
                 run_discovery=run_discovery,
+                dry_run=dry_run,
             )
 
 
@@ -182,6 +184,7 @@ async def _reconcile_user_once(
     include_main: bool = True,
     drain: bool = True,
     run_discovery: bool = False,
+    dry_run: bool = False,
 ) -> dict:
     """Load this user's calendars + tokens, build a router, and run
     one reconciliation pass.  Always invoked under the per-user lock
@@ -237,6 +240,7 @@ async def _reconcile_user_once(
         include_main=include_main,
         drain=drain,
         run_discovery=run_discovery,
+        dry_run=dry_run,
     )
 
 

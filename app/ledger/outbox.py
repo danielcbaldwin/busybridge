@@ -56,7 +56,8 @@ STATUS_SUPERSEDED = "superseded"
 OP_CREATE = "create"
 OP_UPDATE = "update"
 OP_DELETE = "delete"
-# RSVP-only patch back to the calendar that sourced the event.
+# Field-scoped patch (events.patch) of the user's edits back to the
+# calendar that sourced the event.
 OP_PATCH = "patch"
 
 # Failure handling
@@ -573,16 +574,18 @@ async def _do_patch(
     *,
     now: datetime,
 ) -> str:
-    """RSVP-only patch back onto the calendar that sourced the event.
+    """Write the user's edits back onto the calendar that sourced
+    the event.
 
     The target is the user's real source event, addressed by the
     ledger row's ``source_event_id`` — NOT a projection
-    ``google_event_id``.  The origin rsvp projection deliberately
-    keeps ``google_event_id`` NULL so ingest's loop-prevention does
-    not mistake the source event for one of our writes.
+    ``google_event_id``.  The origin writeback projection
+    deliberately keeps ``google_event_id`` NULL so ingest's
+    loop-prevention does not mistake the source event for one of our
+    writes.
 
-    ``events.patch`` is field-scoped (only the attendees array is
-    sent), so no other field of the source event can be clobbered.
+    ``events.patch`` is field-scoped (only the keys in the payload
+    are sent), so no other field of the source event is clobbered.
     A 404/410 (source event gone) is treated as success — there is
     nothing left to write back.
     """
@@ -594,16 +597,16 @@ async def _do_patch(
         (int(proj["ledger_event_id"]),),
     )).fetchone()
     if led is None or not led["source_event_id"]:
-        await _record_rsvp_applied(db, op, now=now)
+        await _record_origin_writeback_applied(db, op, now=now)
         return "succeeded"
     try:
         await google.patch_event(cal_id, led["source_event_id"], payload)
     except Exception as e:
         if getattr(e, "status", None) in (404, 410):
-            await _record_rsvp_applied(db, op, now=now)
+            await _record_origin_writeback_applied(db, op, now=now)
             return "succeeded"
         raise
-    await _record_rsvp_applied(db, op, now=now)
+    await _record_origin_writeback_applied(db, op, now=now)
     return "succeeded"
 
 
@@ -636,16 +639,16 @@ async def _applied_hash_for(db: aiosqlite.Connection, op: aiosqlite.Row) -> str:
     return proj["desired_payload_hash"]
 
 
-async def _record_rsvp_applied(
+async def _record_origin_writeback_applied(
     db: aiosqlite.Connection,
     op: aiosqlite.Row,
     *,
     now: datetime,
 ) -> None:
-    """Mark an rsvp-only patch done.
+    """Mark an origin writeback patch done.
 
     Unlike :func:`_record_success` this does NOT write
-    ``google_event_id`` onto the projection — the origin rsvp
+    ``google_event_id`` onto the projection — the origin writeback
     projection keeps it NULL so the next ingest of the source
     calendar still processes the source event normally.
     """

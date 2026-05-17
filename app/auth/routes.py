@@ -14,6 +14,7 @@ from app.auth.google import (
     PERSONAL_SCOPES,
     build_auth_url,
     exchange_code_for_tokens,
+    fetch_calendar_list,
     get_oauth_token,
     get_oauth_credentials,
     get_user_info,
@@ -225,14 +226,12 @@ async def oauth_callback(
             expires_in=tokens.get("expires_in")
         )
 
-        # Initialize main calendar if not set — list via the
-        # RealGoogleClient adapter (same client the ledger uses).
+        # Initialize main calendar if not set.  fetch_calendar_list
+        # offloads the blocking Google call with asyncio.to_thread, so
+        # the OAuth callback's event loop is not frozen during it.
         if not user.main_calendar_id:
             try:
-                from app.ledger.real_google_client import RealGoogleClient
-                from google.oauth2.credentials import Credentials
-                cal_client = RealGoogleClient(Credentials(token=access_token))
-                items = cal_client.list_calendar_list().get("items", [])
+                items = await fetch_calendar_list(user.id, email)
                 primary_cal = next((c for c in items if c.get("primary")), None)
                 if primary_cal:
                     db = await get_database()
