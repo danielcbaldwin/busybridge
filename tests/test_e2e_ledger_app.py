@@ -46,13 +46,26 @@ async def seeded_app(test_db):
     Yields a dict with handles tests use to drive the scenario.
     """
     db = await get_database()
+
+    # A configured instance has a real encryption key and an org row
+    # encrypted with it — the lifespan decrypts those at startup.
+    from app.config import get_settings
+    from app.encryption import init_encryption_manager
+    key_file = get_settings().encryption_key_file
+    if os.path.dirname(key_file):
+        os.makedirs(os.path.dirname(key_file), exist_ok=True)
+    with open(key_file, "wb") as f:
+        f.write(b"0" * 32)
+    enc = init_encryption_manager(b"0" * 32)
+
     cursor = await db.execute(
         """INSERT INTO organization
               (google_workspace_domain,
                google_client_id_encrypted,
                google_client_secret_encrypted)
            VALUES (?, ?, ?)""",
-        ("example.com", b"x", b"x"),
+        ("example.com", enc.encrypt("test-client-id"),
+         enc.encrypt("test-client-secret")),
     )
     cursor = await db.execute(
         """INSERT INTO users
@@ -129,6 +142,13 @@ async def seeded_app(test_db):
     }
 
     set_google_client_factory(None)
+    for path in (key_file, os.path.join(
+        os.path.dirname(key_file) or ".", "session_secret",
+    )):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
 
 
 @pytest.fixture

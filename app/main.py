@@ -176,31 +176,41 @@ async def lifespan(app: FastAPI):
             logger.error("=" * 60)
             raise SystemExit(1)
         # A structurally-valid but WRONG 32-byte key loads fine yet
-        # cannot decrypt anything.  Decrypt a stored credential to prove
-        # the key is the one this instance was configured with —
-        # AES-GCM raises InvalidTag when the key does not match.
+        # cannot decrypt anything.  Decrypt BOTH stored Google
+        # credentials to prove the key is the one this instance was
+        # configured with.  Any failure — a wrong key (AES-GCM raises
+        # InvalidTag) or corrupt ciphertext — is fatal: the app cannot
+        # function without these credentials.
         org = await get_organization()
-        if org is not None and org.get("google_client_id_encrypted"):
-            from cryptography.exceptions import InvalidTag
+        if org is not None:
             try:
-                get_encryption_manager().decrypt(
-                    org["google_client_id_encrypted"]
-                )
-            except InvalidTag:
+                enc = get_encryption_manager()
+                enc.decrypt(org["google_client_id_encrypted"])
+                enc.decrypt(org["google_client_secret_encrypted"])
+            except Exception as exc:
                 logger.error("=" * 60)
-                logger.error("ENCRYPTION KEY MISMATCH")
+                logger.error("ENCRYPTION KEY CANNOT DECRYPT STORED CREDENTIALS")
                 logger.error(
-                    "The loaded encryption key cannot decrypt stored "
-                    "credentials — it is not the key this instance was "
-                    "configured with.  Refusing to start."
+                    "Decrypting the stored Google credentials failed (%s) — "
+                    "the encryption key is wrong or the data is corrupt. "
+                    "Refusing to start.",
+                    exc.__class__.__name__,
                 )
                 logger.error("=" * 60)
                 raise SystemExit(1)
-            except Exception as exc:
-                logger.warning(
-                    "could not verify the encryption key against stored "
-                    "credentials: %s", exc,
-                )
+
+    # Resolve the session secret now so a missing or uncreatable
+    # session_secret file fails loudly at startup rather than on the
+    # first login attempt.
+    try:
+        from app.config import get_session_secret
+        get_session_secret()
+    except Exception as exc:
+        logger.error("=" * 60)
+        logger.error(f"SESSION SECRET UNAVAILABLE: {exc}")
+        logger.error("Session cookies cannot be signed — refusing to start.")
+        logger.error("=" * 60)
+        raise SystemExit(1)
 
     # After a startup restore, clear all sync tokens so every calendar does a
     # clean full re-fetch on the first sync rather than using stale tokens.

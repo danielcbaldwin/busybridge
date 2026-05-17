@@ -31,13 +31,26 @@ async def app_with_fake_google(test_db, monkeypatch):
     from app.database import get_database
     db = await get_database()
 
+    # A configured instance has a real encryption key and an org row
+    # whose credentials are encrypted with it — the lifespan decrypts
+    # those at startup, so the fixture must be internally consistent.
+    from app.config import get_settings
+    from app.encryption import init_encryption_manager
+    key_file = get_settings().encryption_key_file
+    if os.path.dirname(key_file):
+        os.makedirs(os.path.dirname(key_file), exist_ok=True)
+    with open(key_file, "wb") as f:
+        f.write(b"0" * 32)
+    enc = init_encryption_manager(b"0" * 32)
+
     # Seed an admin user + 2 client calendars.
     await db.execute(
         """INSERT OR IGNORE INTO organization
               (id, google_workspace_domain, google_client_id_encrypted,
                google_client_secret_encrypted)
            VALUES (1, ?, ?, ?)""",
-        ("example.com", b"x", b"x"),
+        ("example.com", enc.encrypt("test-client-id"),
+         enc.encrypt("test-client-secret")),
     )
     await db.execute(
         "INSERT OR REPLACE INTO settings (key, value_plain, is_sensitive) "
@@ -73,20 +86,23 @@ async def app_with_fake_google(test_db, monkeypatch):
         )
     await db.commit()
 
-    # The org row above marks OOBE complete; a real configured
-    # instance also has an initialised encryption manager, so set one
-    # up — otherwise /health correctly reports the inconsistent state.
-    from app.encryption import init_encryption_manager
-    init_encryption_manager(b"0" * 32)
-
-    with TestClient(main_mod.app) as client:
-        client.cookies.set(
-            "session",
-            create_session_token(
-                user_id=user_id, email="alice@example.com", is_admin=True,
-            ),
-        )
-        yield client, user_id
+    try:
+        with TestClient(main_mod.app) as client:
+            client.cookies.set(
+                "session",
+                create_session_token(
+                    user_id=user_id, email="alice@example.com", is_admin=True,
+                ),
+            )
+            yield client, user_id
+    finally:
+        for path in (key_file, os.path.join(
+            os.path.dirname(key_file) or ".", "session_secret",
+        )):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
 
 
 def test_security_headers_and_vendored_assets(app_with_fake_google):
