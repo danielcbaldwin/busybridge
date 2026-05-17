@@ -367,11 +367,35 @@ async def _ingest_ics_event(
         await _mark_cancelled(db, ledger_event_id=int(existing["id"]), now=now)
         return "cancelled", int(existing["id"]), canonical
 
-    existing = await (await db.execute(
-        """SELECT * FROM ledger_events
-            WHERE user_id = ? AND canonical_uid = ?""",
-        (user_id, canonical),
-    )).fetchone()
+    if unstable:
+        # Distinct unstable events that share a start/end hash to the
+        # same base canonical_uid.  Probe for a free slot so the later
+        # one cannot silently overwrite the earlier (a lost event).  A
+        # row already touched THIS poll (last_seen_at == when) belongs
+        # to a different event processed earlier in the same poll — a
+        # genuine collision; an older row is this same event from a
+        # previous poll and is reused in place (so a rename, which
+        # keeps the same hash, still does NOT duplicate).
+        ordinal = 0
+        while True:
+            canonical = canonical_uid_webcal_unstable(
+                subscription_id, event["start_at"] or "",
+                event["end_at"] or "", ordinal,
+            )
+            existing = await (await db.execute(
+                """SELECT * FROM ledger_events
+                    WHERE user_id = ? AND canonical_uid = ?""",
+                (user_id, canonical),
+            )).fetchone()
+            if existing is None or existing["last_seen_at"] != when:
+                break
+            ordinal += 1
+    else:
+        existing = await (await db.execute(
+            """SELECT * FROM ledger_events
+                WHERE user_id = ? AND canonical_uid = ?""",
+            (user_id, canonical),
+        )).fetchone()
 
     if existing is None:
         cursor = await db.execute(

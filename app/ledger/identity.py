@@ -63,6 +63,7 @@ def canonical_uid_webcal_unstable(
     subscription_id: int,
     start_at: str,
     end_at: str,
+    ordinal: int = 0,
 ) -> str:
     """Event from a webcal feed whose UIDs change every poll.
 
@@ -71,10 +72,17 @@ def canonical_uid_webcal_unstable(
     new canonical_uid (and therefore not a duplicate ledger row).
     This is the fix for today's "Eventbrite renames event → BB
     creates duplicate" bug — REWRITE_PLAN.md §5.4.
+
+    ``ordinal`` disambiguates DISTINCT events that share the same
+    start/end (which would otherwise collide on the same hash and
+    silently overwrite one another).  ``ordinal=0`` yields the
+    original, unsuffixed key so existing rows need no migration; the
+    caller probes 1, 2, … only when a real collision is detected.
     """
     raw = f"{start_at}|{end_at}".encode("utf-8")
     digest = hashlib.sha256(raw).hexdigest()
-    return f"webcal:{subscription_id}:hash:{digest}"
+    base = f"webcal:{subscription_id}:hash:{digest}"
+    return base if ordinal == 0 else f"{base}:{ordinal}"
 
 
 def canonical_uid_for_instance(
