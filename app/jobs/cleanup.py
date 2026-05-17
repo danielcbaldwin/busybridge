@@ -188,8 +188,26 @@ async def run_retention_cleanup() -> dict:
 
 
 async def vacuum_database() -> None:
-    """Run VACUUM on the database to reclaim space."""
+    """Run VACUUM on the database to reclaim space.
+
+    VACUUM rewrites the whole file under an exclusive lock that can
+    outlast ``busy_timeout`` on a large database.  Maintenance mode is
+    held for its duration so the reconciler, webhook, and drain paths
+    freeze rather than collide with it, and any reconcile pass already
+    in flight is drained out first.
+    """
+    from app.maintenance import (
+        enter_maintenance,
+        exit_maintenance,
+        wait_for_reconcile_quiescence,
+    )
+
     db = await get_database()
     logger.info("Running database VACUUM")
-    await db.execute("VACUUM")
+    enter_maintenance()
+    try:
+        await wait_for_reconcile_quiescence()
+        await db.execute("VACUUM")
+    finally:
+        exit_maintenance()
     logger.info("Database VACUUM completed")

@@ -206,6 +206,12 @@ async def get_database() -> aiosqlite.Connection:
             _db_connection.row_factory = aiosqlite.Row
             await _db_connection.execute("PRAGMA foreign_keys = ON")
             await _db_connection.execute("PRAGMA journal_mode = WAL")
+            # Without this, a writer that hits SQLite's write lock fails
+            # immediately with "database is locked".  The whole app shares
+            # this one autocommit connection across ~10 scheduler jobs,
+            # webhook drains, and UI requests, so colliding writes are
+            # routine — wait for the lock instead of erroring out.
+            await _db_connection.execute("PRAGMA busy_timeout = 5000")
             await init_schema(_db_connection)
         return _db_connection
 

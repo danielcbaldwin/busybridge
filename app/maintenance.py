@@ -29,28 +29,39 @@ from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
-_maintenance_active = False
+_maintenance_depth = 0
 _active_reconciles = 0
 
 
 def enter_maintenance() -> None:
-    """Begin maintenance mode — the sync engine hard-stops."""
-    global _maintenance_active
-    _maintenance_active = True
-    logger.warning("maintenance mode ON — sync engine frozen")
+    """Begin maintenance mode — the sync engine hard-stops.
+
+    Reference-counted: independent callers (a DB restore, the weekly
+    VACUUM) each take their own hold, so one starting while the other
+    is underway cannot lift the freeze out from under it.  The freeze
+    is released only when the last hold exits.
+    """
+    global _maintenance_depth
+    _maintenance_depth += 1
+    if _maintenance_depth == 1:
+        logger.warning("maintenance mode ON — sync engine frozen")
 
 
 def exit_maintenance() -> None:
-    """End maintenance mode — normal sync resumes."""
-    global _maintenance_active
-    _maintenance_active = False
-    logger.warning("maintenance mode OFF — sync engine resumed")
+    """Release one maintenance hold — normal sync resumes once the
+    last hold has been released."""
+    global _maintenance_depth
+    if _maintenance_depth == 0:
+        return
+    _maintenance_depth -= 1
+    if _maintenance_depth == 0:
+        logger.warning("maintenance mode OFF — sync engine resumed")
 
 
 def in_maintenance() -> bool:
     """True while a maintenance operation (e.g. DB restore) holds the
     sync engine frozen."""
-    return _maintenance_active
+    return _maintenance_depth > 0
 
 
 @contextmanager
