@@ -68,6 +68,14 @@ Access the setup wizard at `https://your-domain.com`. The wizard walks through 6
 5. **Encryption Key** -- generates master key (save it!), initializes database
 6. **Complete** -- next steps and link to dashboard
 
+> **Secure the first run.** Until the wizard is complete the instance is
+> unconfigured and the `/setup` pages are unauthenticated. Run first-run
+> setup over `localhost`, a VPN, or behind a firewall, complete it in a
+> single browser session, and only expose the service publicly once
+> setup has finished. Setup state lives in memory for the duration of
+> the wizard -- if the container restarts mid-setup, just restart it and
+> rerun the wizard (no reinstall needed).
+
 ### Google Cloud Setup
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
