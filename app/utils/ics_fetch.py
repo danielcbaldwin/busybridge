@@ -3,6 +3,16 @@
 Lifted out of the legacy ``app/sync/ics_parser.py`` so the API
 layer and the new ledger webcal-ingest hook can both use it
 without dragging in the rest of the legacy sync engine.
+
+The fetch is hardened against SSRF on three fronts:
+
+* every hostname is resolved and every resolved address checked
+  against private/reserved ranges before a connection is made;
+* redirects are followed manually, one hop at a time, so an
+  intermediate hop cannot reach an internal service unchecked;
+* the connection is pinned to the exact IP that was validated —
+  httpx never re-resolves the name — which closes the DNS-rebinding
+  window between the check and the connect.
 """
 
 from __future__ import annotations
@@ -54,16 +64,19 @@ _BLOCKED_NETWORKS = [
 
 
 def _is_ip_blocked(ip_str: str) -> bool:
-    try:
-        addr = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return True
+    """True if ``ip_str`` is a private/reserved IP.
+
+    ``ip_str`` must be a literal IP address — callers resolve
+    hostnames themselves and pass the resulting addresses here.
+    """
+    addr = ipaddress.ip_address(ip_str)  # raises ValueError on a non-IP
     if (
         addr.is_private
         or addr.is_reserved
         or addr.is_loopback
         or addr.is_link_local
         or addr.is_multicast
+        or addr.is_unspecified
     ):
         return True
     for network in _BLOCKED_NETWORKS:
@@ -72,20 +85,27 @@ def _is_ip_blocked(ip_str: str) -> bool:
     return False
 
 
-def validate_url_for_ssrf(url: str) -> None:
-    """Raise ``ValueError`` if ``url`` targets a private/reserved network."""
-    parsed = urlparse(url)
-    hostname = parsed.hostname
-    if not hostname:
-        raise ValueError("URL has no hostname")
+def _resolve_and_validate(hostname: str) -> str:
+    """Resolve ``hostname`` (or accept an IP literal) and return one
+    safe IP address to connect to.
+
+    Raises ``ValueError`` if the host is unresolvable or *any* address
+    it maps to is private/reserved.  Rejecting on any blocked address
+    — not just the one we would have picked — defeats a resolver that
+    returns a mix of public and internal records.  The returned IP is
+    meant to be connected to directly so the name is never resolved a
+    second time (DNS-rebinding defence).
+    """
+    # A literal IP needs no DNS lookup.
     try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
         if _is_ip_blocked(hostname):
             raise ValueError("URL points to a blocked address")
-    except ValueError as e:
-        # Re-raise our own "blocked address" string; suppress the
-        # "not an IP" inner ValueError.
-        if "blocked" in str(e):
-            raise
+        return hostname
+
     try:
         addrinfos = socket.getaddrinfo(
             hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM,
@@ -94,10 +114,34 @@ def validate_url_for_ssrf(url: str) -> None:
         raise ValueError(f"Cannot resolve hostname: {hostname}")
     if not addrinfos:
         raise ValueError(f"Cannot resolve hostname: {hostname}")
+
+    safe_ip: Optional[str] = None
     for _family, _type, _proto, _canonname, sockaddr in addrinfos:
         ip = sockaddr[0]
         if _is_ip_blocked(ip):
             raise ValueError("URL resolves to a blocked address")
+        if safe_ip is None:
+            safe_ip = ip
+    assert safe_ip is not None  # addrinfos was non-empty
+    return safe_ip
+
+
+def validate_url_for_ssrf(url: str) -> None:
+    """Raise ``ValueError`` if ``url`` targets a private/reserved
+    network.  Used by the API layer at webcal-subscription creation."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"unsupported URL scheme: {parsed.scheme!r}")
+    if not parsed.hostname:
+        raise ValueError("URL has no hostname")
+    _resolve_and_validate(parsed.hostname)
+
+
+def _host_header(hostname: str, port: int, scheme: str) -> str:
+    """The Host header value — hostname alone, plus the port when it
+    is not the scheme default."""
+    default = 443 if scheme == "https" else 80
+    return hostname if port == default else f"{hostname}:{port}"
 
 
 async def fetch_ics_feed(
@@ -108,39 +152,63 @@ async def fetch_ics_feed(
     """SSRF-safe ICS fetch returning ``(content, new_etag)`` or
     ``(None, None)`` on 304 Not Modified.
 
-    Redirects are followed MANUALLY, one hop at a time, with every hop
-    URL re-validated against private/reserved networks immediately
-    before the connection is made.  httpx's own ``follow_redirects``
-    is deliberately disabled: it validates only the final URL, so an
-    intermediate hop (``public → 169.254.169.254 → public``) could
-    otherwise reach an internal service unchecked.
+    Redirects are followed manually, one hop at a time.  Each hop's
+    hostname is resolved and validated, then the connection is pinned
+    to the validated IP (the request is issued against the IP with the
+    ``Host`` header and TLS SNI set to the original hostname) so httpx
+    cannot re-resolve the name to a rebinding target.
     """
     if url.startswith("webcal://"):
         url = "https://" + url[len("webcal://"):]
 
-    headers = {}
+    base_headers = {}
     if etag:
-        headers["If-None-Match"] = etag
+        base_headers["If-None-Match"] = etag
 
     current_url = url
     async with httpx.AsyncClient(
         follow_redirects=False, timeout=timeout,
     ) as client:
         for _hop in range(_MAX_REDIRECTS + 1):
-            # Validate immediately before connecting; this runs for the
-            # original URL and every redirect target.
-            validate_url_for_ssrf(current_url)
-            async with client.stream(
-                "GET", current_url, headers=headers,
-            ) as response:
+            parsed = urlparse(current_url)
+            if parsed.scheme not in ("http", "https"):
+                raise ValueError(
+                    f"unsupported URL scheme: {parsed.scheme!r}"
+                )
+            hostname = parsed.hostname
+            if not hostname:
+                raise ValueError("URL has no hostname")
+
+            # Resolve + validate, then connect to that exact IP.
+            safe_ip = _resolve_and_validate(hostname)
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            ip_host = f"[{safe_ip}]" if ":" in safe_ip else safe_ip
+            pinned_url = f"{parsed.scheme}://{ip_host}:{port}{parsed.path or '/'}"
+            if parsed.query:
+                pinned_url += f"?{parsed.query}"
+
+            request = client.build_request(
+                "GET", pinned_url,
+                headers={
+                    **base_headers,
+                    "Host": _host_header(hostname, port, parsed.scheme),
+                },
+            )
+            # TLS SNI / certificate verification still use the real
+            # hostname even though the socket connects to the IP.
+            request.extensions["sni_hostname"] = hostname
+
+            response = await client.send(request, stream=True)
+            try:
                 if response.is_redirect:
                     location = response.headers.get("Location")
                     if not location:
                         raise ValueError(
                             "redirect response carried no Location header"
                         )
-                    # Resolve relative redirects against the current URL;
-                    # the next loop iteration validates the result.
+                    # Resolve a relative redirect against the current
+                    # (hostname-based) URL; the next iteration validates
+                    # and pins the result.
                     current_url = str(httpx.URL(current_url).join(location))
                     continue
                 if response.status_code == 304:
@@ -162,4 +230,6 @@ async def fetch_ics_feed(
                     b"".join(chunks).decode("utf-8", "replace"),
                     etag_out,
                 )
+            finally:
+                await response.aclose()
     raise ValueError(f"too many redirects (>{_MAX_REDIRECTS})")

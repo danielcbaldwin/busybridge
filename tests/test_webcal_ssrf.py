@@ -15,11 +15,20 @@ at all — with a transport error that never mentions "blocked".
 
 from __future__ import annotations
 
+import socket
+
 import pytest
 
 from app.ledger.runtime import _default_webcal_fetcher
 
-pytestmark = pytest.mark.asyncio
+# pytest-asyncio runs in auto mode — async tests need no explicit mark.
+
+
+def _fake_getaddrinfo(ip: str):
+    """A getaddrinfo stand-in that resolves any hostname to ``ip``."""
+    def _resolver(host, *_args, **_kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))]
+    return _resolver
 
 
 @pytest.mark.parametrize("url", [
@@ -73,3 +82,58 @@ async def test_fetch_ics_feed_rejects_redirect_to_internal_host(monkeypatch):
     assert "blocked" in str(exc.value).lower(), (
         f"expected the redirect hop to be SSRF-blocked, got: {exc.value}"
     )
+
+
+def test_validate_url_accepts_a_normal_domain(monkeypatch):
+    """A normal domain-based feed URL must be accepted — the SSRF
+    guard must not reject every hostname that is not an IP literal."""
+    from app.utils import ics_fetch
+
+    monkeypatch.setattr(
+        ics_fetch.socket, "getaddrinfo", _fake_getaddrinfo("93.184.216.34"),
+    )
+    # Must not raise.
+    ics_fetch.validate_url_for_ssrf("https://feeds.example.com/calendar.ics")
+
+
+def test_validate_url_rejects_domain_resolving_to_private_ip(monkeypatch):
+    """A hostname that resolves to an internal address is rejected,
+    even though the hostname itself is not an IP literal."""
+    from app.utils import ics_fetch
+
+    monkeypatch.setattr(
+        ics_fetch.socket, "getaddrinfo", _fake_getaddrinfo("10.0.0.5"),
+    )
+    with pytest.raises(ValueError, match="blocked"):
+        ics_fetch.validate_url_for_ssrf("https://internal.example.com/cal.ics")
+
+
+async def test_fetch_ics_feed_succeeds_for_a_public_domain(monkeypatch):
+    """A domain-based feed resolving to a public IP fetches normally —
+    the connection is pinned to the validated IP."""
+    import httpx
+
+    from app.utils import ics_fetch
+
+    monkeypatch.setattr(
+        ics_fetch.socket, "getaddrinfo", _fake_getaddrinfo("93.184.216.34"),
+    )
+
+    def handler(request):
+        # The connection is pinned to the validated IP, with the real
+        # hostname carried in the Host header.
+        assert request.url.host == "93.184.216.34"
+        assert request.headers["host"] == "feeds.example.com"
+        return httpx.Response(200, text="BEGIN:VCALENDAR\nEND:VCALENDAR")
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        ics_fetch.httpx, "AsyncClient",
+        lambda *a, **kw: real_client(*a, **{**kw, "transport": transport}),
+    )
+
+    body, _etag = await ics_fetch.fetch_ics_feed(
+        "https://feeds.example.com/calendar.ics"
+    )
+    assert body is not None and "VCALENDAR" in body
