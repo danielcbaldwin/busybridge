@@ -101,6 +101,14 @@ async def connect_personal_calendars(
             detail="No calendars selected"
         )
 
+    # Each calendar is verified with a Google API round-trip; cap the
+    # batch so one request cannot tie a worker up indefinitely.
+    if len(request.calendars) > 50:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Too many calendars in one request (max 50).",
+        )
+
     # The main calendar must not also be connected as a personal
     # calendar — routing is keyed on google_calendar_id, so an overlap
     # would route main-calendar API calls through the wrong account.
