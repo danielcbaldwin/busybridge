@@ -98,7 +98,7 @@ async def get_system_health(admin: User = Depends(require_admin)):
     # Active users in last 24h
     cursor = await db.execute(
         """SELECT COUNT(*) FROM users
-           WHERE last_login_at > datetime('now', '-1 day')"""
+           WHERE datetime(last_login_at) > datetime('now', '-1 day')"""
     )
     active_users = (await cursor.fetchone())[0]
 
@@ -128,20 +128,20 @@ async def get_system_health(admin: User = Depends(require_admin)):
     # Sync errors in last 24h
     cursor = await db.execute(
         """SELECT COUNT(*) FROM sync_log
-           WHERE status = 'failure' AND created_at > datetime('now', '-1 day')"""
+           WHERE status = 'failure' AND datetime(created_at) > datetime('now', '-1 day')"""
     )
     sync_errors = (await cursor.fetchone())[0]
 
     # Webhooks
     cursor = await db.execute(
-        "SELECT COUNT(*) FROM webhook_channels WHERE expiration > datetime('now')"
+        "SELECT COUNT(*) FROM webhook_channels WHERE datetime(expiration) > datetime('now')"
     )
     active_webhooks = (await cursor.fetchone())[0]
 
     cursor = await db.execute(
         """SELECT COUNT(*) FROM webhook_channels
-           WHERE expiration > datetime('now')
-           AND expiration < datetime('now', '+1 day')"""
+           WHERE datetime(expiration) > datetime('now')
+           AND datetime(expiration) < datetime('now', '+1 day')"""
     )
     expiring_webhooks = (await cursor.fetchone())[0]
 

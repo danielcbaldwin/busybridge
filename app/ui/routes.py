@@ -422,7 +422,7 @@ async def admin_dashboard(request: Request):
 
     cursor = await db.execute(
         """SELECT COUNT(*) FROM sync_log
-           WHERE status = 'failure' AND created_at > datetime('now', '-1 day')"""
+           WHERE status = 'failure' AND datetime(created_at) > datetime('now', '-1 day')"""
     )
     errors_24h = (await cursor.fetchone())[0]
 

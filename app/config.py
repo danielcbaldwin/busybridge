@@ -10,6 +10,8 @@ from pydantic_settings import BaseSettings
 
 # Temporary OOBE session secret (generated once per process)
 _oobe_session_secret: Optional[str] = None
+# Cached resolved session secret (env var or persisted file).
+_session_secret_cache: Optional[str] = None
 
 
 class Settings(BaseSettings):
@@ -147,21 +149,57 @@ def get_encryption_key() -> bytes:
     return key
 
 
+def _read_or_create_session_secret(path: str) -> str:
+    """Return the secret stored at ``path``, generating and persisting
+    a fresh random one (owner-readable only) on first use."""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            stored = f.read().strip()
+        if stored:
+            return stored
+    import secrets
+    new_secret = secrets.token_urlsafe(48)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(new_secret)
+    os.chmod(path, 0o600)
+    return new_secret
+
+
 def get_session_secret() -> str:
-    """Get session secret key, derived from encryption key if not set."""
+    """Return the JWT signing secret.
+
+    Resolution order:
+
+    1. an explicitly configured ``SESSION_SECRET_KEY``;
+    2. otherwise a random secret persisted to a ``session_secret`` file
+       beside the encryption key.  This is deliberately independent of
+       the encryption key — deriving it from the encryption key would
+       make the two a single point of compromise;
+    3. before that directory exists (pre-OOBE) a per-process random
+       secret is used.
+
+    Cases 1 and 2 are cached for the lifetime of the process.
+    """
+    global _session_secret_cache, _oobe_session_secret
+    if _session_secret_cache is not None:
+        return _session_secret_cache
+
     settings = get_settings()
     if settings.session_secret_key:
-        return settings.session_secret_key
+        _session_secret_cache = settings.session_secret_key
+        return _session_secret_cache
 
-    try:
-        key = get_encryption_key()
-        import hashlib
-        return hashlib.sha256(key + b"session_secret").hexdigest()
-    except RuntimeError:
-        # During OOBE, no encryption key exists yet
-        # Generate a random secret (per process, won't persist across restarts)
-        global _oobe_session_secret
-        if _oobe_session_secret is None:
-            import secrets
-            _oobe_session_secret = secrets.token_urlsafe(32)
-        return _oobe_session_secret
+    secret_dir = os.path.dirname(settings.encryption_key_file) or "."
+    if os.path.isdir(secret_dir):
+        secret = _read_or_create_session_secret(
+            os.path.join(secret_dir, "session_secret")
+        )
+        _session_secret_cache = secret
+        return secret
+
+    # No persistent location yet (pre-OOBE) — per-process secret.
+    if _oobe_session_secret is None:
+        import secrets
+        _oobe_session_secret = secrets.token_urlsafe(32)
+    return _oobe_session_secret

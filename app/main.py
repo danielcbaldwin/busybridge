@@ -159,24 +159,48 @@ async def lifespan(app: FastAPI):
             raise SystemExit(1)
         logger.info("Encryption manager initialized")
 
-    # A configured instance (OOBE complete) MUST have a usable
-    # encryption key — every OAuth token is encrypted with it.  If the
-    # key file is simply missing the block above is skipped silently;
-    # catch that here so the app fails closed rather than starting the
-    # scheduler on an instance that cannot decrypt anything.
-    from app.database import is_oobe_completed
-    from app.encryption import is_encryption_initialized
-    if await is_oobe_completed() and not is_encryption_initialized():
-        logger.error("=" * 60)
-        logger.error("CONFIGURED INSTANCE IS MISSING ITS ENCRYPTION KEY")
-        logger.error(
-            "OOBE is complete but no encryption key was loaded — OAuth "
-            "tokens cannot be decrypted.  Restore the key file at %s "
-            "before starting.  Refusing to run.",
-            settings.encryption_key_file,
-        )
-        logger.error("=" * 60)
-        raise SystemExit(1)
+    # A configured instance (OOBE complete) MUST have a usable, correct
+    # encryption key — every OAuth token is encrypted with it.
+    from app.database import get_organization, is_oobe_completed
+    from app.encryption import get_encryption_manager, is_encryption_initialized
+    if await is_oobe_completed():
+        if not is_encryption_initialized():
+            logger.error("=" * 60)
+            logger.error("CONFIGURED INSTANCE IS MISSING ITS ENCRYPTION KEY")
+            logger.error(
+                "OOBE is complete but no encryption key was loaded — OAuth "
+                "tokens cannot be decrypted.  Restore the key file at %s "
+                "before starting.  Refusing to run.",
+                settings.encryption_key_file,
+            )
+            logger.error("=" * 60)
+            raise SystemExit(1)
+        # A structurally-valid but WRONG 32-byte key loads fine yet
+        # cannot decrypt anything.  Decrypt a stored credential to prove
+        # the key is the one this instance was configured with —
+        # AES-GCM raises InvalidTag when the key does not match.
+        org = await get_organization()
+        if org is not None and org.get("google_client_id_encrypted"):
+            from cryptography.exceptions import InvalidTag
+            try:
+                get_encryption_manager().decrypt(
+                    org["google_client_id_encrypted"]
+                )
+            except InvalidTag:
+                logger.error("=" * 60)
+                logger.error("ENCRYPTION KEY MISMATCH")
+                logger.error(
+                    "The loaded encryption key cannot decrypt stored "
+                    "credentials — it is not the key this instance was "
+                    "configured with.  Refusing to start."
+                )
+                logger.error("=" * 60)
+                raise SystemExit(1)
+            except Exception as exc:
+                logger.warning(
+                    "could not verify the encryption key against stored "
+                    "credentials: %s", exc,
+                )
 
     # After a startup restore, clear all sync tokens so every calendar does a
     # clean full re-fetch on the first sync rather than using stale tokens.
@@ -188,13 +212,23 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Could not clear sync tokens after restore: {e}")
 
-    # Start background scheduler
+    # Start background scheduler.  A broken scheduler means no periodic
+    # sync, webhook renewal, backups, or retention ever run — fail
+    # closed rather than serve a healthy-looking instance doing no work.
     try:
         from app.jobs.scheduler import setup_scheduler
         scheduler = setup_scheduler()
+        app.state.scheduler = scheduler
         logger.info("Background scheduler started")
-    except Exception as e:
-        logger.error(f"Failed to start scheduler: {e}")
+    except Exception as exc:
+        logger.error("=" * 60)
+        logger.error(f"SCHEDULER STARTUP FAILED: {exc}")
+        logger.error(
+            "Periodic sync, webhook renewal, backups, and retention "
+            "would never run — refusing to start."
+        )
+        logger.error("=" * 60)
+        raise SystemExit(1)
 
     # Optional: BB_FAKE_GOOGLE=1 boots the app with the in-memory
     # FakeGoogleCalendar wired into the ledger runtime.  Useful for
@@ -380,6 +414,11 @@ async def health_check():
         from app.encryption import is_encryption_initialized
         if await is_oobe_completed() and not is_encryption_initialized():
             raise RuntimeError("encryption manager not initialized")
+        # The background scheduler must be alive — without it no
+        # periodic sync, webhook renewal, or backups run.
+        scheduler = getattr(app.state, "scheduler", None)
+        if scheduler is None or not getattr(scheduler, "running", False):
+            raise RuntimeError("background scheduler is not running")
         return {"status": "healthy", "database": "connected"}
     except Exception as e:
         logger.warning("health check failed: %s", e)

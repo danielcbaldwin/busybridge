@@ -59,23 +59,30 @@ def test_config_get_encryption_key_and_session_secret_paths(tmp_path, monkeypatc
     key = config.get_encryption_key()
     assert len(key) == 32
 
+    # Explicit SESSION_SECRET_KEY wins.
+    config._session_secret_cache = None
     monkeypatch.setattr(config, "get_settings", lambda: SimpleNamespace(encryption_key_file=str(good_key), session_secret_key="explicit-secret"))
     assert config.get_session_secret() == "explicit-secret"
 
+    # No env secret: a random secret is persisted beside the key file
+    # (independent of the encryption key) and is stable across calls.
+    config._session_secret_cache = None
     monkeypatch.setattr(config, "get_settings", lambda: SimpleNamespace(encryption_key_file=str(good_key), session_secret_key=None))
-    derived = config.get_session_secret()
-    assert isinstance(derived, str)
-    assert len(derived) == 64
+    persisted = config.get_session_secret()
+    assert isinstance(persisted, str) and persisted
+    assert (tmp_path / "session_secret").exists()
+    config._session_secret_cache = None
+    assert config.get_session_secret() == persisted  # re-read from the file
 
+    # Pre-OOBE: the key directory does not exist yet — per-process fallback.
+    config._session_secret_cache = None
     config._oobe_session_secret = None
-
-    def missing_key():
-        raise RuntimeError("missing key")
-
-    monkeypatch.setattr(config, "get_encryption_key", missing_key)
+    nodir_key = tmp_path / "nope" / "encryption.key"
+    monkeypatch.setattr(config, "get_settings", lambda: SimpleNamespace(encryption_key_file=str(nodir_key), session_secret_key=None))
     fallback_1 = config.get_session_secret()
     fallback_2 = config.get_session_secret()
     assert fallback_1 == fallback_2
+    config._session_secret_cache = None
     assert len(fallback_1) > 10
 
 
@@ -167,13 +174,13 @@ async def test_main_health_exception_handler_favicon_and_lifespan(monkeypatch, t
         async with main.lifespan(main.app):
             pass
 
-    # Scheduler startup/shutdown failures remain non-fatal — restore a
-    # working encryption key and break only the scheduler.
+    # Scheduler startup failure is also fatal — a broken scheduler
+    # would leave the instance running no background work at all.
     monkeypatch.setattr("app.config.get_encryption_key", lambda: b"2" * 32)
     monkeypatch.setattr("app.jobs.scheduler.setup_scheduler", lambda: (_ for _ in ()).throw(RuntimeError("sched fail")))
-    monkeypatch.setattr("app.jobs.scheduler.shutdown_scheduler", lambda: (_ for _ in ()).throw(RuntimeError("shutdown fail")))
-    async with main.lifespan(main.app):
-        pass
+    with pytest.raises(SystemExit):
+        async with main.lifespan(main.app):
+            pass
 
 
 def test_main_module_main_block_runs_with_stubbed_uvicorn(tmp_path, monkeypatch):

@@ -115,7 +115,7 @@ async def queue_alert(
     # Check for duplicate (same alert type for same calendar within 1 hour)
     cursor = await db.execute(
         """SELECT id FROM alert_queue
-           WHERE alert_type = ? AND created_at > datetime('now', '-1 hour')
+           WHERE alert_type = ? AND datetime(created_at) > datetime('now', '-1 hour')
            AND (? IS NULL OR recipient_email IN (
                SELECT email FROM users WHERE id = ?
            ))""",

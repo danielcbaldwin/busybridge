@@ -400,8 +400,7 @@ _USER_DELETE_ORDER: list[tuple[str, str]] = [
      "ledger_event_id IN (SELECT id FROM ledger_events WHERE user_id = ?)"),
     ("ledger_events",            "user_id = ?"),
     ("reconcile_requests",       "user_id = ?"),
-    ("webhook_channels",
-     "client_calendar_id IN (SELECT id FROM client_calendars WHERE user_id = ?)"),
+    ("webhook_channels",         "user_id = ?"),
     ("calendar_sync_state",
      "client_calendar_id IN (SELECT id FROM client_calendars WHERE user_id = ?)"),
     ("main_calendar_sync_state", "user_id = ?"),
@@ -428,7 +427,7 @@ _USER_COLUMN: dict[str, Optional[str]] = {
     "calendar_sync_state":      None,
     "main_calendar_sync_state": "user_id",
     "sync_log":                 "user_id",
-    "webhook_channels":         None,
+    "webhook_channels":         "user_id",
     "reconcile_requests":       "user_id",
     "ledger_events":            "user_id",
     "ledger_projections":       None,
@@ -437,8 +436,6 @@ _USER_COLUMN: dict[str, Optional[str]] = {
 
 _USER_SUBQUERY: dict[str, str] = {
     "calendar_sync_state":
-        "client_calendar_id IN (SELECT id FROM client_calendars WHERE user_id = ?)",
-    "webhook_channels":
         "client_calendar_id IN (SELECT id FROM client_calendars WHERE user_id = ?)",
     "ledger_projections":
         "ledger_event_id IN (SELECT id FROM ledger_events WHERE user_id = ?)",
