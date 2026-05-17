@@ -188,10 +188,18 @@ async def receive_google_calendar_webhook(
                 finally:
                     _release_webhook_drain(uid)
 
-            create_background_task(
-                _delayed_drain(user_id),
-                f"webhook_drain_user_{user_id}",
-            )
+            try:
+                create_background_task(
+                    _delayed_drain(user_id),
+                    f"webhook_drain_user_{user_id}",
+                )
+            except BaseException:
+                # The drain task never started, so the finally-block
+                # release inside it will never run.  Release the claim
+                # here — otherwise this user's webhooks would never
+                # schedule another drain.
+                _release_webhook_drain(user_id)
+                raise
         else:
             logger.debug(
                 "webhook drain already pending for user %s — folded", user_id,
