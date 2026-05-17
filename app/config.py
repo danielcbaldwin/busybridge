@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     log_dir: str = "/data/logs"
 
     # Session
-    session_secret_key: Optional[str] = None  # Derived from encryption key if not set
+    session_secret_key: Optional[str] = None  # If unset, an independent random secret is generated and persisted
     session_expire_days: int = 7
 
     # Runtime features
