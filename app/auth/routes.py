@@ -58,22 +58,26 @@ async def store_oauth_state(state: str, state_type: str, user_id: Optional[int] 
 
 
 async def get_oauth_state(state: str) -> Optional[dict]:
-    """Retrieve and delete OAuth state from database."""
+    """Atomically consume a one-time OAuth state.
+
+    ``DELETE ... RETURNING`` is a single statement, so two concurrent
+    callbacks carrying the same state cannot both consume it — the
+    loser's DELETE matches no row and returns nothing.  The previous
+    select-then-delete left a window where both could read the row.
+    """
     from datetime import datetime
     db = await get_database()
 
-    # Get state if not expired
     cursor = await db.execute(
-        """SELECT state_type, user_id, next_url FROM oauth_states
-           WHERE state = ? AND expires_at > ?""",
+        """DELETE FROM oauth_states
+            WHERE state = ? AND expires_at > ?
+            RETURNING state_type, user_id, next_url""",
         (state, datetime.utcnow().isoformat())
     )
     row = await cursor.fetchone()
+    await db.commit()
 
     if row:
-        # Delete the state (one-time use)
-        await db.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
-        await db.commit()
         return {
             "type": row[0],
             "user_id": row[1],

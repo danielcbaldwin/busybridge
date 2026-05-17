@@ -793,15 +793,28 @@ async def factory_reset(
         "job_locks",
     ]
 
-    for table in SAFE_TABLES_IN_DELETE_ORDER:
-        try:
-            await db.execute(f"DELETE FROM {table}")
-        except Exception:
-            # Tables we may have already removed in migrations are
-            # tolerated so factory-reset works post-cutover.
-            pass
-
-    await db.commit()
+    # Wipe every table in one transaction so a mid-reset failure rolls
+    # back cleanly instead of leaving a half-erased database.
+    import sqlite3
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        for table in SAFE_TABLES_IN_DELETE_ORDER:
+            try:
+                await db.execute(f"DELETE FROM {table}")
+            except sqlite3.OperationalError as e:
+                # A table a past migration already removed is fine to
+                # skip; any other operational error is a real failure.
+                if "no such table" not in str(e).lower():
+                    raise
+        await db.execute("COMMIT")
+    except BaseException:
+        await db.execute("ROLLBACK")
+        logger.exception("factory reset failed — rolled back, no data deleted")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Factory reset failed; no data was deleted. "
+                   "Check the server logs.",
+        )
 
     # Delete encryption key file
     if os.path.exists(settings.encryption_key_file):

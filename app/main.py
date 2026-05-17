@@ -152,8 +152,8 @@ async def lifespan(app: FastAPI):
             logger.error(f"ENCRYPTION INIT FAILED: {exc}")
             logger.error(
                 "The encryption key file exists but could not be loaded. "
-                "OAuth tokens and the session secret cannot be derived "
-                "without it — refusing to start."
+                "OAuth tokens cannot be decrypted without it — refusing "
+                "to start."
             )
             logger.error("=" * 60)
             raise SystemExit(1)

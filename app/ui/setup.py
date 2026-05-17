@@ -454,10 +454,10 @@ async def setup_step_6(request: Request):
         os.makedirs(key_dir, mode=0o700, exist_ok=True)
 
     # Write the master key 0600 (owner read/write only).  This key
-    # protects every OAuth token and derives the session secret.
-    # os.open with the mode set avoids the brief world-readable window
-    # a plain open() would leave; the explicit chmod also tightens the
-    # file if it somehow already existed with looser permissions.
+    # encrypts every stored OAuth token.  os.open with the mode set
+    # avoids the brief world-readable window a plain open() would
+    # leave; the explicit chmod also tightens the file if it somehow
+    # already existed with looser permissions.
     fd = os.open(
         settings.encryption_key_file,
         os.O_WRONLY | os.O_CREAT | os.O_TRUNC,

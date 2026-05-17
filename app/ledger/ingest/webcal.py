@@ -119,7 +119,6 @@ async def ingest_webcal_subscription(
         return counters
 
     parsed_events = list(_iter_ics_events(cal))
-    unstable_uids = _detect_unstable_uids(parsed_events)
     affected_ledger_ids: list[int] = []
     seen_canonical_uids: set[str] = set()
 
@@ -130,7 +129,6 @@ async def ingest_webcal_subscription(
             user_id=user_id,
             subscription_id=subscription_id,
             event=ev,
-            unstable=unstable_uids,
             now=now,
         )
         counters[outcome] = counters.get(outcome, 0) + 1
@@ -304,19 +302,6 @@ def _normalize_times(dtstart, dtend) -> tuple[Optional[str], Optional[str], bool
     return sdt.isoformat(), e.isoformat(), True
 
 
-def _detect_unstable_uids(events: list[dict]) -> bool:
-    """Heuristic from the existing ics_parser: if every UID is a
-    UUIDv4, treat the feed as unstable.  (Stable feeds use
-    domain-anchored UIDs like ``event-12345@eventbrite.com``.)"""
-    if not events:
-        return False
-    for ev in events:
-        uid = ev.get("uid")
-        if not uid or not _UUID_V4_RE.match(uid):
-            return False
-    return True
-
-
 # ---------------------------------------------------------------------------
 # Upsert
 # ---------------------------------------------------------------------------
@@ -326,7 +311,6 @@ async def _ingest_ics_event(
     user_id: int,
     subscription_id: int,
     event: dict,
-    unstable: bool,
     now: datetime,
 ) -> tuple[str, Optional[int], str]:
     """Upsert one ICS event into the ledger.
@@ -334,10 +318,14 @@ async def _ingest_ics_event(
     Returns ``(outcome, ledger_event_id, canonical_uid)``.
     """
     uid = event.get("uid")
-    if uid is None and not unstable:
-        # Without a UID we cannot dedupe reliably across polls.
-        # Fall back to the unstable hash regardless.
-        unstable = True
+    # Classify per event, not per feed.  An event with no UID or a
+    # UUIDv4 UID (the kind some feeds regenerate every poll) is
+    # "unstable" — deduped by its start/end hash; an event with a
+    # domain-anchored UID is "stable" — deduped by UID.  Per-event
+    # classification means one domain-UID event in an otherwise-UUID
+    # feed cannot flip every other event's canonical_uid scheme and
+    # trigger a mass cancel/recreate.
+    unstable = uid is None or bool(_UUID_V4_RE.match(uid))
 
     # A RECURRENCE-ID override of a stable-UID series is a modified
     # or cancelled single occurrence — route it to its own instance
