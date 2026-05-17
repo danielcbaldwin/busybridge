@@ -12,7 +12,9 @@ modification.
 from __future__ import annotations
 
 import logging
+import secrets
 from datetime import datetime, timedelta
+from typing import Optional
 
 from app.database import get_database, get_setting
 
@@ -34,7 +36,8 @@ async def run_periodic_sync() -> None:
         logger.debug("Sync is paused, skipping periodic sync")
         return
 
-    if not await acquire_job_lock("periodic_sync"):
+    lock = await acquire_job_lock("periodic_sync")
+    if not lock:
         logger.debug("Periodic sync already running, skipping")
         return
     try:
@@ -44,7 +47,7 @@ async def run_periodic_sync() -> None:
         await _check_circuit_breaker()
         await _alert_failing_calendars()
     finally:
-        await release_job_lock("periodic_sync")
+        await release_job_lock("periodic_sync", lock)
 
 
 async def _alert_failing_calendars() -> None:
@@ -190,7 +193,8 @@ async def run_orphan_scan_job() -> None:
     paused = await get_setting("sync_paused")
     if paused and paused.get("value_plain") == "true":
         return
-    if not await acquire_job_lock("orphan_scan"):
+    lock = await acquire_job_lock("orphan_scan")
+    if not lock:
         logger.debug("Orphan scan already running, skipping")
         return
     try:
@@ -209,7 +213,7 @@ async def run_orphan_scan_job() -> None:
             except Exception:
                 logger.exception("orphan scan failed for user %s", r["id"])
     finally:
-        await release_job_lock("orphan_scan")
+        await release_job_lock("orphan_scan", lock)
 
 
 async def refresh_expiring_tokens() -> None:
@@ -249,28 +253,55 @@ async def refresh_expiring_tokens() -> None:
 # ---------------------------------------------------------------------------
 # Job-lock primitives (used by scheduler tests)
 # ---------------------------------------------------------------------------
-async def acquire_job_lock(job_name: str, timeout_minutes: int = 30) -> bool:
-    """Acquire a lock for a job.  Returns True if acquired, False if held."""
+async def acquire_job_lock(
+    job_name: str, timeout_minutes: int = 30,
+) -> Optional[str]:
+    """Acquire a lock for a job.
+
+    Returns a unique owner token on success, or ``None`` if the lock
+    is already held.  The claim is an ``INSERT ... ON CONFLICT DO
+    NOTHING`` checked via ``rowcount`` — so a lock that is genuinely
+    held reports via rowcount 0, while a transient error (e.g. a
+    locked DB) raises rather than being silently mistaken for "held"
+    and skipping the job.
+
+    The returned token must be passed to :func:`release_job_lock` so a
+    job only ever releases its OWN lock — never a successor's that
+    took over after this lock expired.
+    """
     db = await get_database()
     now = datetime.utcnow()
     cutoff = (now - timedelta(minutes=timeout_minutes)).isoformat()
+    owner = secrets.token_hex(16)
     await db.execute(
         "DELETE FROM job_locks WHERE job_name = ? AND locked_at < ?",
         (job_name, cutoff),
     )
+    cursor = await db.execute(
+        """INSERT INTO job_locks (job_name, locked_at, locked_by)
+           VALUES (?, ?, ?)
+           ON CONFLICT(job_name) DO NOTHING""",
+        (job_name, now.isoformat(), owner),
+    )
     await db.commit()
-    try:
-        await db.execute(
-            "INSERT INTO job_locks (job_name, locked_at, locked_by) VALUES (?, ?, ?)",
-            (job_name, now.isoformat(), "worker"),
-        )
-        await db.commit()
-        return True
-    except Exception:
-        return False
+    return owner if (cursor.rowcount or 0) > 0 else None
 
 
-async def release_job_lock(job_name: str) -> None:
+async def release_job_lock(job_name: str, owner: Optional[str] = None) -> None:
+    """Release a job lock.
+
+    When ``owner`` is given, only a lock still held by that owner is
+    deleted — so a job whose lock already expired and was taken over
+    by a successor does not delete the successor's lock.
+    """
     db = await get_database()
-    await db.execute("DELETE FROM job_locks WHERE job_name = ?", (job_name,))
+    if owner is None:
+        await db.execute(
+            "DELETE FROM job_locks WHERE job_name = ?", (job_name,),
+        )
+    else:
+        await db.execute(
+            "DELETE FROM job_locks WHERE job_name = ? AND locked_by = ?",
+            (job_name, owner),
+        )
     await db.commit()
