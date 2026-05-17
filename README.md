@@ -48,10 +48,9 @@ mkdir -p data secrets
 Create a `.env` file:
 
 ```bash
-FQDN=your-domain.com
+PUBLIC_URL=https://your-domain.com
 MANAGED_EVENT_PREFIX=[BusyBridge]
 ENABLE_WEBHOOKS=true
-# SERVICE_ACCOUNT_KEY_FILE=/secrets/sa-key.json  # optional
 ```
 
 Start the service:
@@ -60,15 +59,14 @@ Start the service:
 docker compose up -d
 ```
 
-Access the setup wizard at `https://your-domain.com`. The wizard walks through 7 steps:
+Access the setup wizard at `https://your-domain.com`. The wizard walks through 6 steps:
 
 1. **Welcome** -- overview and prerequisites
 2. **Google Cloud Credentials** -- guided walkthrough to create OAuth credentials
 3. **Admin Authentication** -- sign in with Google, establishes home org domain
 4. **Email Alerts** -- optional SMTP configuration for sync failure notifications
-5. **Service Account** -- optional SA key upload for immovable events
-6. **Encryption Key** -- generates master key (save it!), initializes database
-7. **Complete** -- next steps and link to dashboard
+5. **Encryption Key** -- generates master key (save it!), initializes database
+6. **Complete** -- next steps and link to dashboard
 
 ### Google Cloud Setup
 
@@ -216,7 +214,7 @@ All BusyBridge-created events are tagged with `extendedProperties.private.calend
 
 ```
 app/
-  auth/         OAuth, sessions, service account
+  auth/         OAuth, sessions
   api/          REST API endpoints
   sync/         Core sync engine, rules, Google API wrapper
   jobs/         Background job definitions
@@ -230,36 +228,18 @@ app/
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `FQDN` | Domain name (used to construct `PUBLIC_URL`) | `localhost:3000` |
+| `PUBLIC_URL` | Public base URL of the deployment (sets cookie security and OAuth/webhook URLs) | `http://localhost:3000` |
 | `DATABASE_PATH` | Path to SQLite database | `/data/calendar-sync.db` |
 | `ENCRYPTION_KEY_FILE` | Path to encryption key file | `/secrets/encryption.key` |
 | `LOG_LEVEL` | Logging level | `info` |
 | `TZ` | Timezone for scheduled jobs | `UTC` |
 | `ENABLE_WEBHOOKS` | Enable Google Calendar push notifications | `true` |
 | `MANAGED_EVENT_PREFIX` | Prefix on BusyBridge-created events | `[BusyBridge]` |
-| `SERVICE_ACCOUNT_KEY_FILE` | Path to Google SA JSON key (optional) | _(none)_ |
 | `TEST_MODE` | Enable Gmail-safe testing mode | `false` |
 | `TEST_MODE_ALLOWED_HOME_EMAILS` | Email allowlist for home login in test mode | _(none)_ |
 | `TEST_MODE_ALLOWED_CLIENT_EMAILS` | Email allowlist for client connections in test mode | _(none)_ |
 
 Google OAuth credentials and SMTP settings are stored in the database after the setup wizard, not in environment variables.
-
-### Service Account Mode
-
-When a service account is configured, BusyBridge creates main calendar events using the SA's credentials. This makes non-editable events (events you don't organize) physically immovable in Google Calendar, because the SA is the organizer.
-
-| `sa_tier` | Mode | Behavior |
-|-----------|------|----------|
-| 0 | Fallback | User token creates events; lock emoji + time revert for non-editable |
-| 2 | SA as organizer | SA creates events; non-editable events are natively immovable |
-
-**Setup:**
-
-1. Create a service account in Google Cloud (no domain-wide delegation needed)
-2. Download the JSON key to `secrets/sa-key.json`
-3. Set `SERVICE_ACCOUNT_KEY_FILE=/secrets/sa-key.json` in `.env`
-4. Share each user's main calendar with the SA email ("Make changes to events")
-5. Activate via Admin > Service Account in the dashboard
 
 ### Scheduled Jobs
 
