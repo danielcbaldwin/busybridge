@@ -296,58 +296,63 @@ async def force_user_reauth(
             detail="User not found"
         )
 
-    # Remove dependent client-calendar records first to satisfy foreign keys.
-    # Filter by user_id so MAIN-calendar webhook rows (client_calendar_id
-    # IS NULL) are removed too, not just client-calendar-linked ones.
-    await db.execute(
-        "DELETE FROM webhook_channels WHERE user_id = ?",
-        (user_id,)
-    )
-    await db.execute(
-        """DELETE FROM calendar_sync_state
-           WHERE client_calendar_id IN (
-               SELECT id FROM client_calendars WHERE user_id = ?
-           )""",
-        (user_id,)
-    )
-    # Delete the ledger projections (and, by cascade, the outbox)
-    # explicitly BEFORE the ledger rows: the orphan-guard trigger on
-    # ledger_events refuses a delete while a projection is still
-    # 'present'.  This is a deliberate full sync-state wipe — the
-    # user re-onboards from scratch — so removing the projections
-    # first is the intended path here.
-    await db.execute(
-        """DELETE FROM ledger_projections
-           WHERE ledger_event_id IN (
-               SELECT id FROM ledger_events WHERE user_id = ?
-           )""",
-        (user_id,),
-    )
-    await db.execute(
-        """DELETE FROM ledger_events WHERE user_id = ?""", (user_id,),
-    )
-    await db.execute(
-        """DELETE FROM reconcile_requests WHERE user_id = ?""", (user_id,),
-    )
-    await db.execute(
-        """DELETE FROM sync_log
-           WHERE calendar_id IN (
-               SELECT id FROM client_calendars WHERE user_id = ?
-           )""",
-        (user_id,)
-    )
-    await db.execute("DELETE FROM client_calendars WHERE user_id = ?", (user_id,))
-
-    # Delete all tokens for user.
-    await db.execute("DELETE FROM oauth_tokens WHERE user_id = ?", (user_id,))
-    # Bump the session-token version so the user's existing app session
-    # cookies are invalidated too — not just their Google tokens.
-    await db.execute(
-        "UPDATE users SET session_token_version = session_token_version + 1 "
-        "WHERE id = ?",
-        (user_id,),
-    )
-    await db.commit()
+    # Wipe the user's sync state in one transaction so a crash mid-way
+    # cannot leave some tables cleared and others intact.
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        # Remove dependent client-calendar records first to satisfy
+        # foreign keys.  Filter webhook_channels by user_id so
+        # MAIN-calendar rows (client_calendar_id IS NULL) go too.
+        await db.execute(
+            "DELETE FROM webhook_channels WHERE user_id = ?",
+            (user_id,)
+        )
+        await db.execute(
+            """DELETE FROM calendar_sync_state
+               WHERE client_calendar_id IN (
+                   SELECT id FROM client_calendars WHERE user_id = ?
+               )""",
+            (user_id,)
+        )
+        # Delete the ledger projections (and, by cascade, the outbox)
+        # explicitly BEFORE the ledger rows: the orphan-guard trigger on
+        # ledger_events refuses a delete while a projection is still
+        # 'present'.  This is a deliberate full sync-state wipe — the
+        # user re-onboards from scratch — so removing the projections
+        # first is the intended path here.
+        await db.execute(
+            """DELETE FROM ledger_projections
+               WHERE ledger_event_id IN (
+                   SELECT id FROM ledger_events WHERE user_id = ?
+               )""",
+            (user_id,),
+        )
+        await db.execute(
+            """DELETE FROM ledger_events WHERE user_id = ?""", (user_id,),
+        )
+        await db.execute(
+            """DELETE FROM reconcile_requests WHERE user_id = ?""", (user_id,),
+        )
+        await db.execute(
+            """DELETE FROM sync_log
+               WHERE calendar_id IN (
+                   SELECT id FROM client_calendars WHERE user_id = ?
+               )""",
+            (user_id,)
+        )
+        await db.execute("DELETE FROM client_calendars WHERE user_id = ?", (user_id,))
+        await db.execute("DELETE FROM oauth_tokens WHERE user_id = ?", (user_id,))
+        # Bump the session-token version so the user's existing app
+        # session cookies are invalidated too — not just Google tokens.
+        await db.execute(
+            "UPDATE users SET session_token_version = session_token_version + 1 "
+            "WHERE id = ?",
+            (user_id,),
+        )
+        await db.execute("COMMIT")
+    except BaseException:
+        await db.execute("ROLLBACK")
+        raise
 
     # Log action
     await db.execute(

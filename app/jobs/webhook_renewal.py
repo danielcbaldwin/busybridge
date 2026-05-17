@@ -83,6 +83,31 @@ async def renew_expiring_webhooks() -> None:
             )
 
 
+def schedule_webhook_registration(user_id: int) -> None:
+    """Fire-and-forget (re)registration of a user's push channels.
+
+    Called after a calendar is connected so the new calendar gets
+    real-time webhook sync immediately, rather than only after the
+    next server restart's startup registration.  A no-op when
+    webhooks are disabled.
+    """
+    from app.config import get_settings
+    if not get_settings().enable_webhooks:
+        return
+    from app.utils.tasks import create_background_task
+
+    async def _run() -> None:
+        try:
+            await register_webhooks_for_user(user_id)
+        except Exception:
+            logger.exception(
+                "post-connect webhook registration failed for user %s",
+                user_id,
+            )
+
+    create_background_task(_run(), f"webhook_register_user_{user_id}")
+
+
 async def register_all_webhooks() -> None:
     """Register webhooks for all active users (called on startup)."""
     db = await get_database()

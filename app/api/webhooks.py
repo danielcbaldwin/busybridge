@@ -1,7 +1,7 @@
 """Webhook receiver for Google Calendar push notifications."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
@@ -107,9 +107,13 @@ async def receive_google_calendar_webhook(
         )
         return {"status": "ok", "message": "Resource mismatch"}
 
-    # Check if channel is expired
+    # Check if channel is expired.  Stored expirations are naive UTC,
+    # but fold a tz-aware value to naive so the comparison against a
+    # naive utcnow() cannot raise TypeError.
     if channel["expiration"]:
         expiry = datetime.fromisoformat(channel["expiration"])
+        if expiry.tzinfo is not None:
+            expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
         if datetime.utcnow() > expiry:
             logger.warning(f"Expired webhook channel: {x_goog_channel_id}, cleaning up")
             # Delete expired channel from database

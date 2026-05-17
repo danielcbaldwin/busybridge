@@ -200,6 +200,12 @@ async def connect_personal_calendars(
             sync_status="pending",
         ))
 
+    if results:
+        # Register Google push channels for the new calendars so they
+        # get real-time webhook sync without waiting for a restart.
+        from app.jobs.webhook_renewal import schedule_webhook_registration
+        schedule_webhook_registration(user.id)
+
     return results
 
 

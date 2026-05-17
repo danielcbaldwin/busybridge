@@ -218,6 +218,11 @@ async def connect_client_calendar(
         db, user_id=user.id, source_hint=f"client:{calendar_id}",
     )
 
+    # Register a Google push channel for the new calendar so it gets
+    # real-time webhook sync without waiting for a server restart.
+    from app.jobs.webhook_renewal import schedule_webhook_registration
+    schedule_webhook_registration(user.id)
+
     return ClientCalendarResponse(
         id=calendar_id,
         google_calendar_id=request.calendar_id,
