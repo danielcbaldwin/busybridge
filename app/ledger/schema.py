@@ -238,35 +238,46 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
         "PRAGMA table_info(affected_ledger_events)"
     )).fetchall()
     if cols and not any(c[1] == "id" for c in cols):
-        await db.execute(
-            "ALTER TABLE affected_ledger_events "
-            "RENAME TO affected_ledger_events_old"
-        )
-        await db.execute(
-            """
-            CREATE TABLE affected_ledger_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                ledger_event_id INTEGER NOT NULL
-                    REFERENCES ledger_events(id) ON DELETE CASCADE,
-                enqueued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        # The rebuild is RENAME → CREATE → INSERT → DROP → CREATE INDEX.
+        # On the autocommit connection each statement commits on its
+        # own, so a crash mid-rebuild could leave the table missing
+        # entirely or duplicated.  SQLite supports transactional DDL —
+        # wrap the whole rebuild so it either fully applies or not at
+        # all, leaving the original table untouched on any failure.
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await db.execute(
+                "ALTER TABLE affected_ledger_events "
+                "RENAME TO affected_ledger_events_old"
             )
-            """
-        )
-        await db.execute(
-            """INSERT INTO affected_ledger_events
-                  (user_id, ledger_event_id, enqueued_at)
-               SELECT user_id, ledger_event_id, enqueued_at
-                 FROM affected_ledger_events_old"""
-        )
-        # DROP last: the RENAME carried idx_affected_user onto the
-        # _old table, so creating the index before the drop would
-        # collide on the name (CREATE INDEX IF NOT EXISTS no-ops) and
-        # the drop would then take the only copy.  Drop first, then
-        # create the index fresh on the new table.
-        await db.execute("DROP TABLE affected_ledger_events_old")
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_affected_user "
-            "ON affected_ledger_events(user_id)"
-        )
-        await db.commit()
+            await db.execute(
+                """
+                CREATE TABLE affected_ledger_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    ledger_event_id INTEGER NOT NULL
+                        REFERENCES ledger_events(id) ON DELETE CASCADE,
+                    enqueued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            await db.execute(
+                """INSERT INTO affected_ledger_events
+                      (user_id, ledger_event_id, enqueued_at)
+                   SELECT user_id, ledger_event_id, enqueued_at
+                     FROM affected_ledger_events_old"""
+            )
+            # DROP last: the RENAME carried idx_affected_user onto the
+            # _old table, so creating the index before the drop would
+            # collide on the name (CREATE INDEX IF NOT EXISTS no-ops) and
+            # the drop would then take the only copy.  Drop first, then
+            # create the index fresh on the new table.
+            await db.execute("DROP TABLE affected_ledger_events_old")
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_affected_user "
+                "ON affected_ledger_events(user_id)"
+            )
+            await db.execute("COMMIT")
+        except BaseException:
+            await db.execute("ROLLBACK")
+            raise
