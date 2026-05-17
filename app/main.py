@@ -159,6 +159,25 @@ async def lifespan(app: FastAPI):
             raise SystemExit(1)
         logger.info("Encryption manager initialized")
 
+    # A configured instance (OOBE complete) MUST have a usable
+    # encryption key — every OAuth token is encrypted with it.  If the
+    # key file is simply missing the block above is skipped silently;
+    # catch that here so the app fails closed rather than starting the
+    # scheduler on an instance that cannot decrypt anything.
+    from app.database import is_oobe_completed
+    from app.encryption import is_encryption_initialized
+    if await is_oobe_completed() and not is_encryption_initialized():
+        logger.error("=" * 60)
+        logger.error("CONFIGURED INSTANCE IS MISSING ITS ENCRYPTION KEY")
+        logger.error(
+            "OOBE is complete but no encryption key was loaded — OAuth "
+            "tokens cannot be decrypted.  Restore the key file at %s "
+            "before starting.  Refusing to run.",
+            settings.encryption_key_file,
+        )
+        logger.error("=" * 60)
+        raise SystemExit(1)
+
     # After a startup restore, clear all sync tokens so every calendar does a
     # clean full re-fetch on the first sync rather than using stale tokens.
     if _startup_restored:
