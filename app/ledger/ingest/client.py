@@ -422,12 +422,16 @@ async def _ingest_instance(
     ost = event.get("originalStartTime", {}) or {}
     if "dateTime" in ost:
         original_start = ost["dateTime"]
+        instance_is_all_day = False
     elif "date" in ost:
         original_start = ost["date"]
+        instance_is_all_day = True
     else:
-        original_start = (event.get("start") or {}).get("dateTime") or (
-            event.get("start") or {}
-        ).get("date") or ""
+        start = event.get("start") or {}
+        original_start = start.get("dateTime") or start.get("date") or ""
+        # No originalStartTime — fall back to the instance's own start:
+        # an all-day occurrence carries a date-only start.
+        instance_is_all_day = "dateTime" not in start and "date" in start
 
     instance_canonical = canonical_uid_for_instance(
         parent_canonical, original_start,
@@ -452,17 +456,17 @@ async def _ingest_instance(
                 """INSERT INTO ledger_events
                       (user_id, canonical_uid, parent_canonical_uid,
                        source_type, source_calendar_id, source_event_id,
-                       recurrence_instance_original_start,
+                       recurrence_instance_original_start, is_all_day,
                        status, version, is_recurring,
                        created_at, updated_at, last_seen_at, cancelled_at)
                    VALUES (?, ?, ?,
-                           ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?,
                            'cancelled', 1, 0,
                            ?, ?, ?, ?)""",
                 (
                     user_id, instance_canonical, parent_canonical,
                     source_type, source_calendar_id, event["id"],
-                    original_start,
+                    original_start, instance_is_all_day,
                     when, when, when, when,
                 ),
             )
@@ -470,10 +474,11 @@ async def _ingest_instance(
         await db.execute(
             """UPDATE ledger_events
                   SET status = 'cancelled',
+                      is_all_day = ?,
                       version = version + 1,
                       cancelled_at = ?, updated_at = ?, last_seen_at = ?
                 WHERE id = ?""",
-            (when, when, when, int(existing["id"])),
+            (instance_is_all_day, when, when, when, int(existing["id"])),
         )
         return "cancelled", int(existing["id"])
 
