@@ -132,6 +132,14 @@ def init_encryption_manager(key: bytes) -> EncryptionManager:
     return _encryption_manager
 
 
+def is_encryption_initialized() -> bool:
+    """True if the global encryption manager has been initialized.
+
+    Unlike :func:`get_encryption_manager` this never lazily creates
+    one — it is a pure readiness check for the health probe."""
+    return _encryption_manager is not None
+
+
 def encrypt_value(value: str) -> bytes:
     """Convenience function to encrypt a value."""
     return get_encryption_manager().encrypt(value)

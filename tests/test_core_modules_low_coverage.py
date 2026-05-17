@@ -160,8 +160,16 @@ async def test_main_health_exception_handler_favicon_and_lifespan(monkeypatch, t
     assert calls["setup_sched"] == 1
     assert calls["shutdown_sched"] == 1
 
-    # Lifespan failure paths (encryption init and scheduler startup/shutdown failures)
+    # Lifespan failure path: encryption init failure is fatal — the app
+    # must refuse to start rather than run without crypto (B2).
     monkeypatch.setattr("app.config.get_encryption_key", lambda: (_ for _ in ()).throw(RuntimeError("no key")))
+    with pytest.raises(SystemExit):
+        async with main.lifespan(main.app):
+            pass
+
+    # Scheduler startup/shutdown failures remain non-fatal — restore a
+    # working encryption key and break only the scheduler.
+    monkeypatch.setattr("app.config.get_encryption_key", lambda: b"2" * 32)
     monkeypatch.setattr("app.jobs.scheduler.setup_scheduler", lambda: (_ for _ in ()).throw(RuntimeError("sched fail")))
     monkeypatch.setattr("app.jobs.scheduler.shutdown_scheduler", lambda: (_ for _ in ()).throw(RuntimeError("shutdown fail")))
     async with main.lifespan(main.app):

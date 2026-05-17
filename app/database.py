@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import AsyncGenerator, Optional
@@ -200,19 +201,27 @@ async def get_database() -> aiosqlite.Connection:
     async with _db_lock:
         if _db_connection is None:
             settings = get_settings()
-            _db_connection = await aiosqlite.connect(
+            conn = await aiosqlite.connect(
                 settings.database_path, isolation_level=None
             )
-            _db_connection.row_factory = aiosqlite.Row
-            await _db_connection.execute("PRAGMA foreign_keys = ON")
-            await _db_connection.execute("PRAGMA journal_mode = WAL")
-            # Without this, a writer that hits SQLite's write lock fails
-            # immediately with "database is locked".  The whole app shares
-            # this one autocommit connection across ~10 scheduler jobs,
-            # webhook drains, and UI requests, so colliding writes are
-            # routine — wait for the lock instead of erroring out.
-            await _db_connection.execute("PRAGMA busy_timeout = 5000")
-            await init_schema(_db_connection)
+            conn.row_factory = aiosqlite.Row
+            try:
+                await conn.execute("PRAGMA foreign_keys = ON")
+                await conn.execute("PRAGMA journal_mode = WAL")
+                # Without this, a writer that hits SQLite's write lock
+                # fails immediately with "database is locked".  The whole
+                # app shares this one autocommit connection across ~10
+                # scheduler jobs, webhook drains, and UI requests, so
+                # colliding writes are routine — wait for the lock
+                # instead of erroring out.
+                await conn.execute("PRAGMA busy_timeout = 5000")
+                await init_schema(conn)
+            except BaseException:
+                # A half-initialised connection must not land in the
+                # global slot — a retry would hand it out as if ready.
+                await conn.close()
+                raise
+            _db_connection = conn
         return _db_connection
 
 
@@ -237,25 +246,25 @@ async def init_schema(db: aiosqlite.Connection) -> None:
         try:
             await db.execute(stmt)
             await db.commit()
-        except Exception:
-            pass  # column already exists
+        except sqlite3.OperationalError as e:
+            # "duplicate column name" means the migration already ran —
+            # the only error this loop may safely ignore.  Anything else
+            # (locked DB, disk full, malformed statement) is real: let it
+            # propagate so the app fails to start rather than booting on
+            # a half-migrated schema.
+            if "duplicate column" not in str(e).lower():
+                raise
 
     # Drop pre-cutover legacy tables if they exist (no-op on fresh DBs).
     for legacy_table in ("busy_blocks", "event_mappings"):
-        try:
-            await db.execute(f"DROP TABLE IF EXISTS {legacy_table}")
-            await db.commit()
-        except Exception:
-            pass
+        await db.execute(f"DROP TABLE IF EXISTS {legacy_table}")
+        await db.commit()
 
-    # Ledger tables (REWRITE_PLAN.md §4).  Additive — they sit
-    # alongside the legacy event_mappings/busy_blocks until the
-    # Stage-5 cutover.
-    try:
-        from app.ledger.schema import init_ledger_schema
-        await init_ledger_schema(db)
-    except Exception as e:
-        logger.warning("ledger schema init failed (non-fatal): %s", e)
+    # Ledger tables (REWRITE_PLAN.md §4).  A failure here leaves the
+    # ledger half-built; the app must not boot on it, so the error is
+    # allowed to propagate out of get_database() and abort startup.
+    from app.ledger.schema import init_ledger_schema
+    await init_ledger_schema(db)
 
     logger.info("Database schema initialized")
 

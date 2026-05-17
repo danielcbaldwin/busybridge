@@ -11,6 +11,8 @@ connection.  Safe to call repeatedly (all CREATEs are
 
 from __future__ import annotations
 
+import sqlite3
+
 import aiosqlite
 
 LEDGER_SCHEMA = """
@@ -219,8 +221,12 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
         try:
             await db.execute(stmt)
             await db.commit()
-        except Exception:
-            pass
+        except sqlite3.OperationalError as e:
+            # A "duplicate column" error just means this migration
+            # already ran.  Anything else is a real failure and must
+            # not be swallowed.
+            if "duplicate column" not in str(e).lower():
+                raise
 
     # affected_ledger_events was first shipped with a
     # (user_id, ledger_event_id) primary key, which made a re-enqueue

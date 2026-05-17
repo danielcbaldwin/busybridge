@@ -126,7 +126,17 @@ async def lifespan(app: FastAPI):
             raise SystemExit(1)
 
     # Initialize database (opens aiosqlite — restored file if we just swapped it)
-    await get_database()
+    try:
+        await get_database()
+    except Exception as exc:
+        logger.error("=" * 60)
+        logger.error(f"DATABASE INIT FAILED: {exc}")
+        logger.error(
+            "Schema creation or migration did not complete — refusing to "
+            "start on a half-migrated database."
+        )
+        logger.error("=" * 60)
+        raise SystemExit(1)
     logger.info("Database initialized")
 
     # Initialize encryption manager if key exists
@@ -136,9 +146,17 @@ async def lifespan(app: FastAPI):
             from app.config import get_encryption_key
             key = get_encryption_key()
             init_encryption_manager(key)
-            logger.info("Encryption manager initialized")
-        except Exception as e:
-            logger.warning(f"Could not initialize encryption: {e}")
+        except Exception as exc:
+            logger.error("=" * 60)
+            logger.error(f"ENCRYPTION INIT FAILED: {exc}")
+            logger.error(
+                "The encryption key file exists but could not be loaded. "
+                "OAuth tokens and the session secret cannot be derived "
+                "without it — refusing to start."
+            )
+            logger.error("=" * 60)
+            raise SystemExit(1)
+        logger.info("Encryption manager initialized")
 
     # After a startup restore, clear all sync tokens so every calendar does a
     # clean full re-fetch on the first sync rather than using stale tokens.
@@ -257,10 +275,22 @@ app.add_middleware(
 @app.get("/health")
 @limiter.exempt
 async def health_check():
-    """Health check endpoint for monitoring."""
+    """Readiness probe for monitoring.
+
+    Deliberately checks more than connectivity: a half-migrated schema
+    or an uninitialised encryption manager would let a bare ``SELECT 1``
+    report healthy while sync and auth are silently broken.
+    """
     try:
         db = await get_database()
-        await db.execute("SELECT 1")
+        # Schema readiness — a core ledger table must be queryable.
+        await db.execute("SELECT 1 FROM ledger_projections LIMIT 1")
+        # Once OOBE is complete, OAuth tokens are unreadable without the
+        # encryption manager — an uninitialised one means broken auth.
+        from app.database import is_oobe_completed
+        from app.encryption import is_encryption_initialized
+        if await is_oobe_completed() and not is_encryption_initialized():
+            raise RuntimeError("encryption manager not initialized")
         return {"status": "healthy", "database": "connected"}
     except Exception as e:
         return JSONResponse(
