@@ -820,6 +820,28 @@ async def factory_reset(
     if os.path.exists(settings.encryption_key_file):
         os.remove(settings.encryption_key_file)
 
+    # Invalidate every existing session cookie.  After a reset the
+    # first new admin is created with the same reusable user_id (1)
+    # and session_token_version (0), so an old signed cookie would
+    # otherwise authenticate as that brand-new admin.  Delete the
+    # persisted session secret and clear its in-process cache so the
+    # next session secret is freshly random and old cookies fail
+    # signature verification.
+    import app.config as _config
+    _config._session_secret_cache = None
+    if get_settings().session_secret_key:
+        logger.warning(
+            "factory reset: SESSION_SECRET_KEY is set from the "
+            "environment — rotate it before re-running setup, or old "
+            "session cookies will remain valid."
+        )
+    else:
+        secret_dir = os.path.dirname(settings.encryption_key_file) or "."
+        try:
+            os.remove(os.path.join(secret_dir, "session_secret"))
+        except FileNotFoundError:
+            pass
+
     return {"status": "ok", "message": "Factory reset complete. Please restart the application."}
 
 

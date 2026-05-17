@@ -601,3 +601,57 @@ class TestRestorePreservesLedger:
             "SELECT COUNT(*) AS n FROM users WHERE id = 2"
         )).fetchone()
         assert u2["n"] == 0
+
+    async def test_per_user_restore_brings_back_webcal_subscription(
+        self, test_db, tmp_path, monkeypatch
+    ):
+        """A per-user restore must repopulate webcal_subscriptions —
+        otherwise webcal-sourced ledger events return with no
+        subscription row keeping them polled."""
+        import aiosqlite
+        from app.database import init_schema
+
+        monkeypatch.setenv("BACKUP_PATH", str(tmp_path))
+
+        backup_db = tmp_path / "backup_webcal.db"
+        bconn = await aiosqlite.connect(str(backup_db))
+        bconn.row_factory = aiosqlite.Row
+        await init_schema(bconn)
+        for uid, email in ((1, "u1@example.com"), (2, "u2@example.com")):
+            await bconn.execute(
+                "INSERT INTO users (id, email, google_user_id, display_name) "
+                "VALUES (?, ?, ?, ?)",
+                (uid, email, f"g-{uid}", email.split("@")[0]),
+            )
+        await bconn.execute(
+            "INSERT INTO webcal_subscriptions (id, user_id, url, is_active) "
+            "VALUES (5, 1, 'https://feeds.example.com/cal.ics', 1)"
+        )
+        await bconn.commit()
+        await bconn.close()
+
+        metadata = {
+            "backup_id": "backup-20260101-000000-daily",
+            "backup_type": "daily",
+            "created_at": "2026-01-01T00:00:00",
+            "user_ids_snapshotted": [1, 2],
+        }
+        bid = metadata["backup_id"]
+        (tmp_path / f"{bid}.zip").write_bytes(
+            _make_backup_zip(metadata, db_bytes=backup_db.read_bytes())
+        )
+
+        from app.sync.backup import restore_from_backup
+        result = await restore_from_backup(
+            bid, user_ids=[1], restore_db=True,
+            restore_calendars=False, dry_run=False,
+        )
+        assert result["db_restored"] is True
+
+        live = await get_database()
+        rows = await (await live.execute(
+            "SELECT url FROM webcal_subscriptions WHERE user_id = 1"
+        )).fetchall()
+        assert [r["url"] for r in rows] == [
+            "https://feeds.example.com/cal.ics"
+        ]

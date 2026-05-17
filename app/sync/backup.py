@@ -405,6 +405,8 @@ _USER_DELETE_ORDER: list[tuple[str, str]] = [
      "client_calendar_id IN (SELECT id FROM client_calendars WHERE user_id = ?)"),
     ("main_calendar_sync_state", "user_id = ?"),
     ("sync_log",                 "user_id = ?"),
+    ("webcal_subscriptions",     "user_id = ?"),
+    ("integrity_status",         "user_id = ?"),
     ("client_calendars",         "user_id = ?"),
     ("oauth_tokens",             "user_id = ?"),
     ("users",                    "id = ?"),
@@ -414,6 +416,7 @@ _USER_DELETE_ORDER: list[tuple[str, str]] = [
 _USER_INSERT_ORDER = [
     "users", "oauth_tokens", "client_calendars",
     "calendar_sync_state", "main_calendar_sync_state", "sync_log",
+    "webcal_subscriptions", "integrity_status",
     "webhook_channels", "reconcile_requests",
     "ledger_events", "ledger_projections", "outbox_operations",
 ]
@@ -427,6 +430,8 @@ _USER_COLUMN: dict[str, Optional[str]] = {
     "calendar_sync_state":      None,
     "main_calendar_sync_state": "user_id",
     "sync_log":                 "user_id",
+    "webcal_subscriptions":     "user_id",
+    "integrity_status":         "user_id",
     "webhook_channels":         "user_id",
     "reconcile_requests":       "user_id",
     "ledger_events":            "user_id",

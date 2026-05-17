@@ -277,7 +277,7 @@ BusyBridge creates daily automated backups at 11 PM with a retention policy of 7
 Create and download backups from the web UI at `/app/settings`, or via the API:
 
 ```bash
-curl -X POST https://your-domain/api/backups
+curl -X POST https://your-domain/api/admin/backup
 ```
 
 ### Recovery

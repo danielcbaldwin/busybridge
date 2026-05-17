@@ -114,3 +114,34 @@ async def test_cancelling_an_existing_modified_instance_keeps_is_all_day(test_db
     )).fetchone()
     assert row["status"] == "cancelled"
     assert row["is_all_day"] == 1
+
+
+@pytest.mark.parametrize("recurrence_id,expect_all_day", [
+    ("2026-03-15", 1),                  # RECURRENCE-ID;VALUE=DATE
+    ("2026-03-15T09:00:00Z", 0),        # timed RECURRENCE-ID
+])
+async def test_webcal_cancelled_instance_records_is_all_day(
+    test_db, recurrence_id, expect_all_day,
+):
+    """A cancelled webcal RECURRENCE-ID override must record is_all_day
+    so the diff derives the correct Google instance ID — the webcal
+    twin of the client-path fix."""
+    from datetime import datetime, timezone
+
+    from app.ledger.ingest.webcal import _ingest_ics_instance
+
+    db = await get_database()
+    uid = await _user(db)
+    outcome, led_id, _canon = await _ingest_ics_instance(
+        db,
+        user_id=uid,
+        subscription_id=1,
+        event={"status": "CANCELLED", "recurrence_id": recurrence_id},
+        parent_uid="series@example.com",
+        now=datetime.now(timezone.utc),
+    )
+    assert outcome == "cancelled"
+    row = await (await db.execute(
+        "SELECT is_all_day FROM ledger_events WHERE id = ?", (led_id,),
+    )).fetchone()
+    assert row["is_all_day"] == expect_all_day

@@ -149,10 +149,14 @@ async def ingest_webcal_subscription(
     else:
         poll_interval = 3600
     stale_cutoff = (now - timedelta(seconds=2 * poll_interval)).isoformat()
-    # Instance rows (RECURRENCE-ID overrides) are excluded: they
-    # follow their parent series, and an override dropped from the
-    # feed should revert to the series default, not be cancelled
-    # (which would punch a hole in the recurring busy block).
+    # A stale row — not in this poll's seen set and not seen for >= 2
+    # poll intervals — flips to cancelled.  This INCLUDES RECURRENCE-ID
+    # override rows (parent_canonical_uid set): a modified override
+    # dropped from the feed must be handled intentionally, not left
+    # lingering at its old moved/edited time forever.  Cancelling the
+    # override removes that occurrence's busy block; a true
+    # revert-to-series-default is a richer behaviour the model does
+    # not yet express.
     rows = await (await db.execute(
         """SELECT id, canonical_uid FROM ledger_events
             WHERE user_id = ?
@@ -160,7 +164,6 @@ async def ingest_webcal_subscription(
               AND source_calendar_id = ?
               AND status = 'active'
               AND user_intentionally_deleted = 0
-              AND parent_canonical_uid IS NULL
               AND (last_seen_at IS NULL OR last_seen_at < ?)""",
         (user_id, subscription_id, stale_cutoff),
     )).fetchall()
@@ -444,6 +447,10 @@ async def _ingest_ics_instance(
     Google ID from the parent series' projection."""
     parent_canonical = canonical_uid_webcal_stable(subscription_id, parent_uid)
     original_start = event["recurrence_id"]
+    # An all-day RECURRENCE-ID (;VALUE=DATE) is formatted YYYY-MM-DD
+    # with no time component; a timed one carries a 'T'.  The diff
+    # needs this to build the correct Google instance-ID stamp.
+    instance_is_all_day = bool(original_start) and "T" not in original_start
     instance_canonical = canonical_uid_for_instance(
         parent_canonical, original_start,
     )
@@ -463,24 +470,26 @@ async def _ingest_ics_instance(
                 """INSERT INTO ledger_events
                       (user_id, canonical_uid, parent_canonical_uid,
                        source_type, source_calendar_id, source_event_id,
-                       recurrence_instance_original_start,
+                       recurrence_instance_original_start, is_all_day,
                        status, version, is_recurring,
                        created_at, updated_at, last_seen_at, cancelled_at)
-                   VALUES (?, ?, ?, 'webcal', ?, ?, ?,
+                   VALUES (?, ?, ?, 'webcal', ?, ?, ?, ?,
                            'cancelled', 1, 0, ?, ?, ?, ?)""",
                 (
                     user_id, instance_canonical, parent_canonical,
                     subscription_id, parent_uid, original_start,
+                    instance_is_all_day,
                     when, when, when, when,
                 ),
             )
             return "cancelled", int(cursor.lastrowid), instance_canonical
         await db.execute(
             """UPDATE ledger_events
-                  SET status = 'cancelled', version = version + 1,
+                  SET status = 'cancelled', is_all_day = ?,
+                      version = version + 1,
                       cancelled_at = ?, updated_at = ?, last_seen_at = ?
                 WHERE id = ?""",
-            (when, when, when, int(existing["id"])),
+            (instance_is_all_day, when, when, when, int(existing["id"])),
         )
         return "cancelled", int(existing["id"]), instance_canonical
 

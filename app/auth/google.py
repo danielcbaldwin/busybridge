@@ -212,6 +212,20 @@ async def get_oauth_token(user_id: int, email: str) -> Optional[dict]:
     return None
 
 
+def _parse_expiry_naive_utc(value: str) -> datetime:
+    """Parse a stored ``token_expiry`` into a naive-UTC datetime.
+
+    Stored values are normally naive UTC, but an old, imported, or
+    future tz-aware row would otherwise raise ``TypeError`` when
+    compared against ``datetime.utcnow()``.  A tz-aware value is
+    folded to naive UTC so every comparison is safe.
+    """
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
 async def get_valid_access_token(user_id: int, email: str) -> str:
     """Get a valid access token, refreshing if needed."""
     token_data = await get_oauth_token(user_id, email)
@@ -224,7 +238,7 @@ async def get_valid_access_token(user_id: int, email: str) -> str:
     # Check if token is expired or will expire soon
     expiry = token_data.get("token_expiry")
     if expiry:
-        expiry_dt = datetime.fromisoformat(expiry)
+        expiry_dt = _parse_expiry_naive_utc(expiry)
         if datetime.utcnow() >= expiry_dt - timedelta(minutes=5):
             # Token expired or expiring soon, refresh it
             logger.info(f"Refreshing token for user {user_id}, email {email}")
@@ -307,13 +321,9 @@ async def build_user_credentials(user_id: int, email: str) -> Credentials:
     raw_expiry = token_data.get("token_expiry")
     if raw_expiry:
         try:
-            expiry = datetime.fromisoformat(raw_expiry)
+            credentials.expiry = _parse_expiry_naive_utc(raw_expiry)
         except ValueError:
-            expiry = None
-        if expiry is not None:
-            if expiry.tzinfo is not None:
-                expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
-            credentials.expiry = expiry
+            pass
     return credentials
 
 
