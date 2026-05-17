@@ -141,6 +141,10 @@ async def get_sync_log(
     """Paginated sync activity log.  The ``sync_log`` table is still
     populated (now by the ledger reconciler + admin ops) — see
     REWRITE_PLAN.md §12."""
+    # Clamp pagination so a hostile query can't request a giant page
+    # or drive a negative OFFSET.
+    page = max(1, page)
+    page_size = min(max(1, page_size), 500)
     db = await get_database()
     query = """
         SELECT sl.*, cc.display_name as calendar_name

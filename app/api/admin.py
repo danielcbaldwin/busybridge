@@ -456,12 +456,27 @@ async def set_user_admin(
     """Set admin status for a user."""
     db = await get_database()
 
-    cursor = await db.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-    if not await cursor.fetchone():
+    cursor = await db.execute(
+        "SELECT id, is_admin FROM users WHERE id = ?", (user_id,)
+    )
+    target = await cursor.fetchone()
+    if not target:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found"
         )
+
+    # Refuse to demote the last remaining admin — that would lock
+    # everyone out of the admin surface with no way back in.
+    if not is_admin and target["is_admin"]:
+        admin_count = (await (await db.execute(
+            "SELECT COUNT(*) FROM users WHERE is_admin = TRUE",
+        )).fetchone())[0]
+        if admin_count <= 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot remove admin rights from the last administrator.",
+            )
 
     await db.execute(
         "UPDATE users SET is_admin = ? WHERE id = ?",
@@ -511,6 +526,10 @@ async def get_system_logs(
     action_filter: Optional[str] = None,
 ):
     """Get system-wide sync logs."""
+    # Clamp pagination so a hostile query can't request a giant page
+    # or drive a negative OFFSET.
+    page = max(1, page)
+    page_size = min(max(1, page_size), 500)
     db = await get_database()
 
     query = """
@@ -722,9 +741,10 @@ async def send_test_email(admin: User = Depends(require_admin)):
         )
         return {"status": "ok", "message": f"Test email sent to {admin.email}"}
     except Exception as e:
+        logger.exception("Test email send failed: %s", e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to send email: {str(e)}"
+            detail="Failed to send test email. Check the server logs for details.",
         )
 
 

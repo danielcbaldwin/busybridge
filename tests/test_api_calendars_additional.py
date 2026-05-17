@@ -120,7 +120,7 @@ async def test_connect_calendar_token_missing_and_calendar_verify_failure(test_d
             user=user,
         )
     assert verify_exc.value.status_code == 400
-    assert "Cannot access calendar" in verify_exc.value.detail
+    assert "Cannot access the selected calendar" in verify_exc.value.detail
 
 
 @pytest.mark.asyncio

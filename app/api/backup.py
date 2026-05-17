@@ -85,7 +85,7 @@ async def create_ics_backup_endpoint(admin: User = Depends(require_admin)):
         logger.error(f"ICS backup creation failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"ICS backup failed: {e}",
+            detail="ICS backup failed. Check the server logs for details.",
         )
 
 
@@ -148,7 +148,7 @@ async def create_backup_endpoint(
         logger.error(f"Backup creation failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Backup failed: {e}",
+            detail="Backup failed. Check the server logs for details.",
         )
 
 
@@ -187,7 +187,7 @@ async def restore_backup_endpoint(
         logger.error(f"Restore failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Restore failed: {e}",
+            detail="Restore failed. Check the server logs for details.",
         )
 
 

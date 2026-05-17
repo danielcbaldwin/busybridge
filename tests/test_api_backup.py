@@ -134,7 +134,9 @@ class TestCreateBackupEndpoint:
                 )
 
         assert exc_info.value.status_code == 500
-        assert "disk full" in exc_info.value.detail
+        # The raw exception text must NOT leak to the client.
+        assert "disk full" not in exc_info.value.detail
+        assert "Backup failed" in exc_info.value.detail
 
     @pytest.mark.asyncio
     async def test_create_backup_with_user_ids(self, test_db):
