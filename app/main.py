@@ -271,6 +271,41 @@ app.add_middleware(
 )
 
 
+# Security headers applied to every response.  All front-end assets are
+# served from /static (vendored — no third-party CDN), so the CSP can
+# pin every source to 'self'.  'unsafe-eval' is required by the
+# Tailwind Play runtime and Alpine's expression evaluator; 'unsafe-
+# inline' covers the small inline <script>/<style> blocks in the
+# templates.  img-src allows https: so Google profile avatars render.
+_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: https:; "
+    "font-src 'self'; "
+    "connect-src 'self'; "
+    "frame-ancestors 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'"
+)
+_HSTS_ENABLED = settings.public_url.lower().startswith("https://")
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Attach defensive response headers to every response."""
+    response = await call_next(request)
+    response.headers["Content-Security-Policy"] = _CSP
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    if _HSTS_ENABLED:
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
+    return response
+
+
 # Health check endpoint
 @app.get("/health")
 @limiter.exempt

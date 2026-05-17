@@ -73,6 +73,12 @@ async def app_with_fake_google(test_db, monkeypatch):
         )
     await db.commit()
 
+    # The org row above marks OOBE complete; a real configured
+    # instance also has an initialised encryption manager, so set one
+    # up — otherwise /health correctly reports the inconsistent state.
+    from app.encryption import init_encryption_manager
+    init_encryption_manager(b"0" * 32)
+
     with TestClient(main_mod.app) as client:
         client.cookies.set(
             "session",
@@ -81,6 +87,36 @@ async def app_with_fake_google(test_db, monkeypatch):
             ),
         )
         yield client, user_id
+
+
+def test_security_headers_and_vendored_assets(app_with_fake_google):
+    """Every response carries defensive headers, and front-end assets
+    are served locally rather than from a third-party CDN."""
+    client, _user_id = app_with_fake_google
+
+    r = client.get("/health")
+    assert r.headers["X-Content-Type-Options"] == "nosniff"
+    assert r.headers["X-Frame-Options"] == "DENY"
+    assert r.headers["Referrer-Policy"] == "no-referrer"
+    csp = r.headers["Content-Security-Policy"]
+    assert "default-src 'self'" in csp
+    assert "frame-ancestors 'none'" in csp
+    # The policy must not whitelist any third-party CDN origin.
+    assert "unpkg.com" not in csp
+    assert "cdnjs" not in csp
+    assert "tailwindcss.com" not in csp
+
+    # The vendored assets are actually served from /static.
+    for path in (
+        "/static/vendor/htmx.min.js",
+        "/static/vendor/htmx-ext-json-enc.js",
+        "/static/vendor/alpine.min.js",
+        "/static/vendor/tailwind.js",
+        "/static/vendor/fontawesome/css/all.min.css",
+        "/static/vendor/fontawesome/webfonts/fa-solid-900.woff2",
+    ):
+        rr = client.get(path)
+        assert rr.status_code == 200, path
 
 
 def test_bb_fake_google_end_to_end(app_with_fake_google):
