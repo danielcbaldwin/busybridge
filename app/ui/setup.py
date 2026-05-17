@@ -326,53 +326,69 @@ async def setup_step_6(request: Request):
     # Initialize encryption manager
     enc = init_encryption_manager(key)
 
-    # Save everything to database
+    # Save everything to database.  The organization row, the admin
+    # user, and the admin OAuth token are written as ONE transaction:
+    # on the autocommit connection the organization INSERT would
+    # otherwise commit on its own, and a crash before the users INSERT
+    # would leave an org with no admin — is_oobe_completed() then
+    # reports setup complete and the instance is permanently locked
+    # with no way to log in.
     db = await get_database()
 
-    # Create organization
-    await db.execute(
-        """INSERT INTO organization
-           (google_workspace_domain, google_client_id_encrypted, google_client_secret_encrypted)
-           VALUES (?, ?, ?)""",
-        (
-            _oobe_data["domain"],
-            enc.encrypt(_oobe_data["client_id"]),
-            enc.encrypt(_oobe_data["client_secret"]),
-        )
-    )
-
-    # Create admin user
-    cursor = await db.execute(
-        """INSERT INTO users (email, google_user_id, display_name, is_admin)
-           VALUES (?, ?, ?, TRUE)
-           RETURNING id""",
-        (_oobe_data["admin_email"], _oobe_data["admin_google_id"], _oobe_data["admin_name"])
-    )
-    user_row = await cursor.fetchone()
-    user_id = user_row["id"]
-
-    # Store admin's OAuth tokens with expiry
     from datetime import datetime, timedelta
     token_expiry = None
     if _oobe_data.get("admin_token_expiry"):
         expires_in_seconds = int(_oobe_data["admin_token_expiry"])
-        token_expiry = (datetime.utcnow() + timedelta(seconds=expires_in_seconds)).isoformat()
+        token_expiry = (
+            datetime.utcnow() + timedelta(seconds=expires_in_seconds)
+        ).isoformat()
 
-    await db.execute(
-        """INSERT INTO oauth_tokens
-           (user_id, account_type, google_account_email,
-            access_token_encrypted, refresh_token_encrypted, token_expiry)
-           VALUES (?, 'home', ?, ?, ?, ?)""",
-        (
-            user_id,
-            _oobe_data["admin_email"],
-            enc.encrypt(_oobe_data["admin_access_token"]),
-            enc.encrypt(_oobe_data["admin_refresh_token"]),
-            token_expiry,
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        # Create organization
+        await db.execute(
+            """INSERT INTO organization
+               (google_workspace_domain, google_client_id_encrypted, google_client_secret_encrypted)
+               VALUES (?, ?, ?)""",
+            (
+                _oobe_data["domain"],
+                enc.encrypt(_oobe_data["client_id"]),
+                enc.encrypt(_oobe_data["client_secret"]),
+            )
         )
-    )
 
-    # Save SMTP settings if enabled
+        # Create admin user
+        cursor = await db.execute(
+            """INSERT INTO users (email, google_user_id, display_name, is_admin)
+               VALUES (?, ?, ?, TRUE)
+               RETURNING id""",
+            (_oobe_data["admin_email"], _oobe_data["admin_google_id"], _oobe_data["admin_name"])
+        )
+        user_row = await cursor.fetchone()
+        user_id = user_row["id"]
+
+        # Store admin's OAuth tokens with expiry
+        await db.execute(
+            """INSERT INTO oauth_tokens
+               (user_id, account_type, google_account_email,
+                access_token_encrypted, refresh_token_encrypted, token_expiry)
+               VALUES (?, 'home', ?, ?, ?, ?)""",
+            (
+                user_id,
+                _oobe_data["admin_email"],
+                enc.encrypt(_oobe_data["admin_access_token"]),
+                enc.encrypt(_oobe_data["admin_refresh_token"]),
+                token_expiry,
+            )
+        )
+        await db.execute("COMMIT")
+    except BaseException:
+        await db.execute("ROLLBACK")
+        raise
+
+    # SMTP settings are non-critical and written separately — if the
+    # process dies here the instance is already usable and the admin
+    # can configure email from the dashboard.
     if _oobe_data.get("smtp_enabled"):
         await set_setting("smtp_host", _oobe_data.get("smtp_host", ""))
         await set_setting("smtp_port", str(_oobe_data.get("smtp_port", 587)))
@@ -384,8 +400,6 @@ async def setup_step_6(request: Request):
         await set_setting("alerts_enabled", "true")
     else:
         await set_setting("alerts_enabled", "false")
-
-    await db.commit()
 
     # Service-account activation block was removed at the
     # Stage-5 cutover (REWRITE_PLAN.md §1).
