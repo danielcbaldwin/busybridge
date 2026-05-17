@@ -82,6 +82,23 @@ async def verify_user(
         current = r["current_state"]
         gid = r["google_event_id"]
 
+        # A projection the outbox gave up on, or one still in an
+        # unresolved state, is itself a divergence — the ledger never
+        # reached the state it wanted.  Count it so verify cannot
+        # report "consistent" while such projections exist.
+        if r["permanently_failed"]:
+            divergences.append(
+                f"projection {r['id']} ({r['summary']!r}): permanently "
+                f"FAILED — desired {r['desired_state']!r} was never applied"
+            )
+            continue
+        if current not in ("present", "absent"):
+            divergences.append(
+                f"projection {r['id']} ({r['summary']!r}): unresolved "
+                f"state {current!r} (desired {r['desired_state']!r})"
+            )
+            continue
+
         if current == "present" and gid:
             checked += 1
             try:

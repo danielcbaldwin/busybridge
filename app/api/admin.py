@@ -297,11 +297,10 @@ async def force_user_reauth(
         )
 
     # Remove dependent client-calendar records first to satisfy foreign keys.
+    # Filter by user_id so MAIN-calendar webhook rows (client_calendar_id
+    # IS NULL) are removed too, not just client-calendar-linked ones.
     await db.execute(
-        """DELETE FROM webhook_channels
-           WHERE client_calendar_id IN (
-               SELECT id FROM client_calendars WHERE user_id = ?
-           )""",
+        "DELETE FROM webhook_channels WHERE user_id = ?",
         (user_id,)
     )
     await db.execute(

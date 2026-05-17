@@ -329,11 +329,19 @@ async def get_calendar_sync_progress(
     recent_cutoff = (now - timedelta(minutes=2)).isoformat()
 
     async def _count(extra_sql: str, params: tuple) -> int:
+        # Count outbox work for projections of events SOURCED from this
+        # calendar — its main-calendar copies and the busy blocks it
+        # casts onto other calendars.  Scoping by the event's source
+        # calendar (not "any main-kind projection") keeps one
+        # calendar's progress widget from reflecting unrelated
+        # main-copy work driven by the user's other calendars.
         row = await (await db.execute(
             f"""SELECT COUNT(*) AS n FROM outbox_operations o
                   JOIN ledger_projections p ON p.id = o.projection_id
+                  JOIN ledger_events e ON e.id = p.ledger_event_id
                  WHERE o.user_id = ?
-                   AND (p.target_calendar_id = ? OR p.target_kind = 'main')
+                   AND e.source_calendar_id = ?
+                   AND e.source_type IN ('client', 'personal')
                    {extra_sql}""",
             (user.id, calendar_id, *params),
         )).fetchone()

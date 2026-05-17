@@ -16,10 +16,17 @@ async def process_alert_queue() -> int:
     """
     db = await get_database()
 
-    # Get unsent alerts, limit to batch size
+    # Get unsent alerts that are due, limited to a batch size.
+    # A failed alert is held off for an exponentially-growing window
+    # ((1 << attempts) minutes — 1, 2, 4) measured from its last
+    # attempt, so a transient SMTP outage does not burn all retries
+    # in three back-to-back ticks.
     cursor = await db.execute(
         """SELECT * FROM alert_queue
            WHERE sent_at IS NULL AND attempts < 3
+             AND (last_attempt IS NULL
+                  OR datetime(last_attempt, '+' || (1 << attempts) || ' minutes')
+                     <= datetime('now'))
            ORDER BY created_at ASC
            LIMIT 10"""
     )
@@ -50,10 +57,7 @@ async def process_alert_queue() -> int:
             logger.info(f"Sent alert {alert['id']} to {alert['recipient_email']}")
 
         except Exception as e:
-            logger.error(f"Failed to send alert {alert['id']}: {e}")
-
-            # Update attempt count and last attempt time
-            backoff_minutes = 2 ** alert["attempts"]  # Exponential backoff
+            new_attempts = int(alert["attempts"]) + 1
             await db.execute(
                 """UPDATE alert_queue
                    SET attempts = attempts + 1, last_attempt = ?
@@ -61,6 +65,21 @@ async def process_alert_queue() -> int:
                 (datetime.utcnow().isoformat(), alert["id"])
             )
             await db.commit()
+
+            if new_attempts >= 3:
+                # Out of retries — escalate so an operator can see that
+                # this alert (e.g. a token-revoked notice) was lost.
+                logger.error(
+                    "Alert %s (%s -> %s) PERMANENTLY FAILED after %d "
+                    "attempts: %s",
+                    alert["id"], alert["alert_type"],
+                    alert["recipient_email"], new_attempts, e,
+                )
+            else:
+                logger.warning(
+                    "Alert %s send failed (attempt %d/3), will retry: %s",
+                    alert["id"], new_attempts, e,
+                )
 
     return processed
 
