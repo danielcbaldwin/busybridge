@@ -11,12 +11,22 @@ from starlette.requests import Request
 from app.database import get_database
 
 
+def _oobe_cookie_headers() -> list:
+    """Carry the active OOBE session token so setup requests pass the
+    browser-binding guard the wizard now enforces from request one."""
+    import app.ui.setup as _setup
+    token = _setup._oobe_data.get("_session_token")
+    if not token:
+        return []
+    return [(b"cookie", f"{_setup._OOBE_COOKIE}={token}".encode())]
+
+
 def _request(path: str = "/setup") -> Request:
     scope = {
         "type": "http",
         "method": "GET",
         "path": path,
-        "headers": [],
+        "headers": _oobe_cookie_headers(),
     }
     return Request(scope)
 
@@ -27,6 +37,12 @@ class FakeFormRequest:
     def __init__(self, form_data: dict):
         self._form_data = form_data
         self.url = SimpleNamespace(path="/setup")
+
+    @property
+    def cookies(self) -> dict:
+        import app.ui.setup as _setup
+        token = _setup._oobe_data.get("_session_token")
+        return {_setup._OOBE_COOKIE: token} if token else {}
 
     async def form(self):
         return self._form_data
@@ -43,8 +59,15 @@ async def test_setup_step6_existing_key_context_and_step2_completed_guard(test_d
     from app.ui.setup import setup_step_2, setup_wizard
 
     setup_module._oobe_data.clear()
-    setup_module._oobe_data["encryption_key"] = b"2" * 32
-    setup_module._oobe_data["encryption_key_b64"] = "existing-key-b64"
+    # Step 6 only renders once the earlier steps are complete.
+    setup_module._oobe_data.update({
+        "encryption_key": b"2" * 32,
+        "encryption_key_b64": "existing-key-b64",
+        "client_id": "good.apps.googleusercontent.com",
+        "client_secret": "secret",
+        "admin_email": "admin@example.com",
+        "smtp_enabled": False,
+    })
 
     async def oobe_incomplete():
         return False

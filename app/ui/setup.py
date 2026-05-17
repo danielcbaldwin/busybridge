@@ -1,5 +1,6 @@
 """OOBE (Out-of-Box Experience) setup wizard routes."""
 
+import asyncio
 import json
 import logging
 import os
@@ -33,6 +34,10 @@ _oobe_data: dict = {}
 
 _OOBE_COOKIE = "oobe_session"
 
+# Serialises the first-request bind so two concurrent first visitors
+# cannot both mint a session token.
+_oobe_lock = asyncio.Lock()
+
 # Default path for service account key inside the container
 SA_KEY_PATH = "/secrets/sa-key.json"
 
@@ -43,18 +48,36 @@ async def _reject_if_oobe_done() -> None:
         raise HTTPException(status_code=400, detail="Setup already completed")
 
 
-def _require_oobe_session(request: Request) -> None:
-    """Reject a setup request that does not belong to the browser that
-    started the wizard.
+async def _ensure_oobe_session(request: Request) -> str:
+    """Return the OOBE session token, minting it on the first request.
 
-    The first successful ``POST /step/2`` binds the OOBE flow to a
-    random token held in a cookie.  Once bound, every other setup
-    route must present the matching cookie — otherwise a second,
-    concurrent visitor to a not-yet-configured instance could read the
-    generated encryption key or have their own Google account
-    committed as the admin.  Until the wizard is bound it stays open
-    to the first visitor.
+    The wizard is bound to one browser from its very first request:
+    the first caller mints a random token — under a lock, so two
+    concurrent first visitors cannot both bind — and every later
+    request must present the matching cookie or it is refused.  This
+    is what stops a second, concurrent visitor to a not-yet-configured
+    instance from reading the in-progress state (the generated
+    encryption key) or hijacking the admin account.
     """
+    async with _oobe_lock:
+        token = _oobe_data.get("_session_token")
+        if token is None:
+            token = secrets.token_urlsafe(32)
+            _oobe_data["_session_token"] = token
+            return token
+    cookies = getattr(request, "cookies", None) or {}
+    if cookies.get(_OOBE_COOKIE) != token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Setup is already in progress in another browser session.",
+        )
+    return token
+
+
+def _require_oobe_session(request: Request) -> None:
+    """Reject a setup request not from the browser that started the
+    wizard.  Used by the step POSTs, which are never legitimately the
+    first request in a real flow."""
     token = _oobe_data.get("_session_token")
     if not token:
         return
@@ -66,18 +89,30 @@ def _require_oobe_session(request: Request) -> None:
         )
 
 
-def _bind_oobe_session(response) -> None:
-    """Bind the OOBE flow to this browser, minting the session token on
-    first use, and (re)set the cookie on ``response``."""
-    token = _oobe_data.get("_session_token")
-    if not token:
-        token = secrets.token_urlsafe(32)
-        _oobe_data["_session_token"] = token
+def _with_oobe_cookie(response, token: str):
+    """Attach the OOBE session cookie to ``response`` and return it."""
     response.set_cookie(
         _OOBE_COOKIE, token,
         max_age=3600, httponly=True, samesite="lax",
         secure=get_settings().public_url.lower().startswith("https://"),
     )
+    return response
+
+
+def _first_incomplete_step() -> int:
+    """The earliest setup step whose prerequisite is not yet met.
+
+    Step 6 generates and reveals the master encryption key, so it must
+    not be reachable until Google credentials (step 2), admin OAuth
+    (step 3), and the email step (step 4) have all been completed.
+    """
+    if "client_id" not in _oobe_data:
+        return 2
+    if "admin_email" not in _oobe_data:
+        return 3
+    if "smtp_enabled" not in _oobe_data:
+        return 4
+    return 6
 
 
 class Step2Request(BaseModel):
@@ -108,7 +143,9 @@ async def setup_wizard(
     """OOBE setup wizard."""
     if await is_oobe_completed():
         return RedirectResponse(url="/app", status_code=status.HTTP_302_FOUND)
-    _require_oobe_session(request)
+
+    # Bind the wizard to this browser on its very first request.
+    token = await _ensure_oobe_session(request)
 
     # Step 5 (service-account upload) was removed at the Stage-5
     # cutover; the wizard now jumps step 4 → step 6 (encryption).
@@ -124,7 +161,24 @@ async def setup_wizard(
     }
     if step == 5:
         # Anyone arriving at step 5 gets bounced to step 6.
-        return RedirectResponse(url="/setup?step=6", status_code=status.HTTP_302_FOUND)
+        return _with_oobe_cookie(
+            RedirectResponse(url="/setup?step=6", status_code=status.HTTP_302_FOUND),
+            token,
+        )
+
+    # Step 6 generates and reveals the master encryption key — gate it
+    # behind the earlier steps so a direct ?step=6 can never make the
+    # wizard mint or display a key before credentials + admin OAuth.
+    if step == 6:
+        need = _first_incomplete_step()
+        if need != 6:
+            return _with_oobe_cookie(
+                RedirectResponse(
+                    url=f"/setup?step={need}",
+                    status_code=status.HTTP_302_FOUND,
+                ),
+                token,
+            )
 
     template = template_map.get(step, "setup/step1_welcome.html")
 
@@ -154,14 +208,17 @@ async def setup_wizard(
     elif step == 6:
         context["encryption_key_b64"] = _oobe_data.get("encryption_key_b64")
 
-    return templates.TemplateResponse(request, template, context=context)
+    return _with_oobe_cookie(
+        templates.TemplateResponse(request, template, context=context),
+        token,
+    )
 
 
 @router.post("/step/2")
 async def setup_step_2(request: Request):
     """Handle step 2 - Google credentials."""
     await _reject_if_oobe_done()
-    _require_oobe_session(request)
+    token = await _ensure_oobe_session(request)
 
     form = await request.form()
     client_id = form.get("client_id", "").strip()
@@ -170,31 +227,29 @@ async def setup_step_2(request: Request):
     # Validate
     settings = get_settings()
     if not client_id or not client_secret:
-        return templates.TemplateResponse(request, "setup/step2_credentials.html", context={
+        return _with_oobe_cookie(templates.TemplateResponse(request, "setup/step2_credentials.html", context={
             "step": 2,
             "error": "Client ID and Client Secret are required",
             "client_id": client_id,
             "public_url": settings.public_url.rstrip("/"),
-        })
+        }), token)
 
     if not client_id.endswith(".apps.googleusercontent.com"):
-        return templates.TemplateResponse(request, "setup/step2_credentials.html", context={
+        return _with_oobe_cookie(templates.TemplateResponse(request, "setup/step2_credentials.html", context={
             "step": 2,
             "error": "Invalid Client ID format",
             "client_id": client_id,
             "public_url": settings.public_url.rstrip("/"),
-        })
+        }), token)
 
     # Store temporarily
     _oobe_data["client_id"] = client_id
     _oobe_data["client_secret"] = client_secret
 
-    # First successful step — bind the wizard to this browser.
-    response = RedirectResponse(
-        url="/setup?step=3", status_code=status.HTTP_302_FOUND,
+    return _with_oobe_cookie(
+        RedirectResponse(url="/setup?step=3", status_code=status.HTTP_302_FOUND),
+        token,
     )
-    _bind_oobe_session(response)
-    return response
 
 
 @router.post("/step/2/test")
@@ -313,6 +368,8 @@ async def setup_step_4(request: Request):
     """Handle step 4 - Email settings."""
     await _reject_if_oobe_done()
     _require_oobe_session(request)
+    if "admin_email" not in _oobe_data:
+        return RedirectResponse(url="/setup?step=3", status_code=status.HTTP_302_FOUND)
     form = await request.form()
     enabled = form.get("enabled") == "on"
 
@@ -365,6 +422,14 @@ async def setup_step_6(request: Request):
     """Complete setup and save everything."""
     await _reject_if_oobe_done()
     _require_oobe_session(request)
+    # Never write a key or create the org/admin unless every prior
+    # step is complete — a direct POST /step/6 from a fresh browser
+    # must not be able to mint a key or seed an admin account.
+    if _first_incomplete_step() != 6:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Setup steps are incomplete.",
+        )
     form = await request.form()
     confirmed = form.get("confirmed") == "on"
 

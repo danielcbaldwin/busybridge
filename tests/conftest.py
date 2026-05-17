@@ -64,6 +64,17 @@ async def test_db():
     db_module._db_connection = None
 
 
+@pytest.fixture(autouse=True)
+def _reset_oobe_state():
+    """OOBE wizard state is a process-global dict; clear it around
+    every test so a session token from one test cannot leak into the
+    next and trigger a spurious 403."""
+    import app.ui.setup as _setup
+    _setup._oobe_data.clear()
+    yield
+    _setup._oobe_data.clear()
+
+
 @pytest.fixture
 def client():
     """Create a test client for the FastAPI app."""

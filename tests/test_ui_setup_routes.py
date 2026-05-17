@@ -10,12 +10,22 @@ from starlette.requests import Request
 from app.database import get_database
 
 
+def _oobe_cookie_headers() -> list:
+    """Carry the active OOBE session token so setup requests pass the
+    browser-binding guard the wizard now enforces from request one."""
+    import app.ui.setup as _setup
+    token = _setup._oobe_data.get("_session_token")
+    if not token:
+        return []
+    return [(b"cookie", f"{_setup._OOBE_COOKIE}={token}".encode())]
+
+
 def _request(path: str = "/setup") -> Request:
     scope = {
         "type": "http",
         "method": "GET",
         "path": path,
-        "headers": [],
+        "headers": _oobe_cookie_headers(),
     }
     return Request(scope)
 
@@ -26,6 +36,12 @@ class FakeFormRequest:
     def __init__(self, form_data: dict):
         self._form_data = form_data
         self.url = SimpleNamespace(path="/setup")
+
+    @property
+    def cookies(self) -> dict:
+        import app.ui.setup as _setup
+        token = _setup._oobe_data.get("_session_token")
+        return {_setup._OOBE_COOKIE: token} if token else {}
 
     async def form(self):
         return self._form_data
@@ -55,9 +71,11 @@ async def test_setup_wizard_and_step2_paths(test_db, monkeypatch):
     step5 = await setup_wizard(_request("/setup"), step=5)
     assert step5.status_code == 302
     assert step5.headers["location"] == "/setup?step=6"
+    # Step 6 without the earlier steps must redirect — never render or
+    # mint an encryption key.
     step6 = await setup_wizard(_request("/setup"), step=6)
-    assert step6.status_code == 200
-    assert "encryption_key_b64" in setup_module._oobe_data
+    assert step6.status_code == 302
+    assert "encryption_key_b64" not in setup_module._oobe_data
 
     # Step 2 validation errors.
     missing = await setup_step_2(FakeFormRequest({"client_id": "", "client_secret": ""}))
@@ -171,6 +189,9 @@ async def test_setup_step4_and_step6_completion_flow(test_db, monkeypatch, tmp_p
     from app.ui.setup import setup_complete, setup_step_4, setup_step_6, test_email
 
     setup_module._oobe_data.clear()
+    # Step 4 now requires the admin OAuth step to have completed.
+    setup_module._oobe_data["client_id"] = "good.apps.googleusercontent.com"
+    setup_module._oobe_data["admin_email"] = "admin@example.com"
 
     step4_disabled = await setup_step_4(FakeFormRequest({"enabled": ""}))
     assert step4_disabled.status_code == 302
