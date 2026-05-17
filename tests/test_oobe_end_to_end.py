@@ -21,18 +21,38 @@ import pytest
 from app.database import get_database, is_oobe_completed
 
 
+def _oobe_cookies() -> dict:
+    """The OOBE session cookie for the browser that started the wizard.
+
+    setup_step_2 binds the flow to a random token; every later setup
+    route demands the matching cookie, so the test requests must carry
+    it once step 2 has run.
+    """
+    from app.ui import setup as _setup
+    token = _setup._oobe_data.get("_session_token")
+    return {_setup._OOBE_COOKIE: token} if token else {}
+
+
 def _form_request(fields: dict):
-    """A minimal Request stand-in whose .form() yields ``fields``."""
+    """A minimal Request stand-in whose .form() yields ``fields`` and
+    whose cookies carry the active OOBE session token."""
+    cookies = _oobe_cookies()
+
     class _Req:
         async def form(self):
             return fields
-    return _Req()
+    req = _Req()
+    req.cookies = cookies
+    return req
 
 
 def _get_request(path: str = "/setup"):
     from starlette.requests import Request
+    headers = []
+    for name, value in _oobe_cookies().items():
+        headers.append((b"cookie", f"{name}={value}".encode()))
     return Request({
-        "type": "http", "method": "GET", "path": path, "headers": [],
+        "type": "http", "method": "GET", "path": path, "headers": headers,
         "query_string": b"",
     })
 

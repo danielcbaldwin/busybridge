@@ -245,3 +245,60 @@ async def test_setup_step4_and_step6_completion_flow(test_db, monkeypatch, tmp_p
     done = await setup_complete(_request("/setup/complete"))
     assert done.status_code == 302
     assert done.headers["location"] == "/app"
+
+
+@pytest.mark.asyncio
+async def test_oobe_session_binding_rejects_a_second_browser(test_db, monkeypatch):
+    """Once step 2 binds the wizard to one browser, a setup request
+    without the matching session cookie is rejected — a concurrent
+    visitor cannot hijack the in-progress setup."""
+    import app.ui.setup as setup_module
+    from fastapi import HTTPException
+
+    from app.ui.setup import _OOBE_COOKIE, setup_step_2, step_3_auth
+
+    setup_module._oobe_data.clear()
+
+    async def oobe_incomplete():
+        return False
+
+    monkeypatch.setattr("app.ui.setup.is_oobe_completed", oobe_incomplete)
+
+    # Step 2 binds the flow and issues the session cookie.
+    resp = await setup_step_2(
+        FakeFormRequest({
+            "client_id": "good.apps.googleusercontent.com",
+            "client_secret": "secret",
+        })
+    )
+    assert _OOBE_COOKIE in resp.headers.get("set-cookie", "")
+    token = setup_module._oobe_data["_session_token"]
+
+    def _req(cookie_value):
+        headers = []
+        if cookie_value is not None:
+            headers.append(
+                (b"cookie", f"{_OOBE_COOKIE}={cookie_value}".encode())
+            )
+        return Request({
+            "type": "http", "method": "GET",
+            "path": "/setup/step/3/auth", "headers": headers,
+            "query_string": b"",
+        })
+
+    # A second browser — no cookie — is rejected.
+    with pytest.raises(HTTPException) as exc:
+        await step_3_auth(_req(None))
+    assert exc.value.status_code == 403
+
+    # A forged cookie is rejected.
+    with pytest.raises(HTTPException) as exc:
+        await step_3_auth(_req("not-the-token"))
+    assert exc.value.status_code == 403
+
+    # The original browser, carrying the bound token, proceeds to the
+    # Google OAuth redirect.
+    ok = await step_3_auth(_req(token))
+    assert ok.status_code in (302, 307)
+
+    setup_module._oobe_data.clear()

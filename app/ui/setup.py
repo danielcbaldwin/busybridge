@@ -25,11 +25,59 @@ router = APIRouter(prefix="/setup", tags=["setup"])
 
 templates = Jinja2Templates(directory="app/ui/templates")
 
-# Temporary storage for OOBE data (in production, use secure session storage)
+# Temporary storage for OOBE data.  Single-process by design; the
+# wizard binds it to one browser via the _session_token below so a
+# second, concurrent visitor to a not-yet-configured instance cannot
+# read the in-progress state or hijack the admin account.
 _oobe_data: dict = {}
+
+_OOBE_COOKIE = "oobe_session"
 
 # Default path for service account key inside the container
 SA_KEY_PATH = "/secrets/sa-key.json"
+
+
+async def _reject_if_oobe_done() -> None:
+    """Refuse a setup step once the instance is already configured."""
+    if await is_oobe_completed():
+        raise HTTPException(status_code=400, detail="Setup already completed")
+
+
+def _require_oobe_session(request: Request) -> None:
+    """Reject a setup request that does not belong to the browser that
+    started the wizard.
+
+    The first successful ``POST /step/2`` binds the OOBE flow to a
+    random token held in a cookie.  Once bound, every other setup
+    route must present the matching cookie — otherwise a second,
+    concurrent visitor to a not-yet-configured instance could read the
+    generated encryption key or have their own Google account
+    committed as the admin.  Until the wizard is bound it stays open
+    to the first visitor.
+    """
+    token = _oobe_data.get("_session_token")
+    if not token:
+        return
+    cookies = getattr(request, "cookies", None) or {}
+    if cookies.get(_OOBE_COOKIE) != token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Setup is already in progress in another browser session.",
+        )
+
+
+def _bind_oobe_session(response) -> None:
+    """Bind the OOBE flow to this browser, minting the session token on
+    first use, and (re)set the cookie on ``response``."""
+    token = _oobe_data.get("_session_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        _oobe_data["_session_token"] = token
+    response.set_cookie(
+        _OOBE_COOKIE, token,
+        max_age=3600, httponly=True, samesite="lax",
+        secure=get_settings().public_url.lower().startswith("https://"),
+    )
 
 
 class Step2Request(BaseModel):
@@ -60,6 +108,7 @@ async def setup_wizard(
     """OOBE setup wizard."""
     if await is_oobe_completed():
         return RedirectResponse(url="/app", status_code=status.HTTP_302_FOUND)
+    _require_oobe_session(request)
 
     # Step 5 (service-account upload) was removed at the Stage-5
     # cutover; the wizard now jumps step 4 → step 6 (encryption).
@@ -111,8 +160,8 @@ async def setup_wizard(
 @router.post("/step/2")
 async def setup_step_2(request: Request):
     """Handle step 2 - Google credentials."""
-    if await is_oobe_completed():
-        raise HTTPException(status_code=400, detail="Setup already completed")
+    await _reject_if_oobe_done()
+    _require_oobe_session(request)
 
     form = await request.form()
     client_id = form.get("client_id", "").strip()
@@ -140,12 +189,18 @@ async def setup_step_2(request: Request):
     _oobe_data["client_id"] = client_id
     _oobe_data["client_secret"] = client_secret
 
-    return RedirectResponse(url="/setup?step=3", status_code=status.HTTP_302_FOUND)
+    # First successful step — bind the wizard to this browser.
+    response = RedirectResponse(
+        url="/setup?step=3", status_code=status.HTTP_302_FOUND,
+    )
+    _bind_oobe_session(response)
+    return response
 
 
 @router.post("/step/2/test")
 async def test_credentials(request: Request):
     """Test OAuth credentials."""
+    await _reject_if_oobe_done()
     form = await request.form()
     client_id = form.get("client_id", "").strip()
     client_secret = form.get("client_secret", "").strip()
@@ -160,6 +215,8 @@ async def test_credentials(request: Request):
 @router.get("/step/3/auth")
 async def step_3_auth(request: Request):
     """Initiate OAuth for admin user."""
+    await _reject_if_oobe_done()
+    _require_oobe_session(request)
     if "client_id" not in _oobe_data:
         return RedirectResponse(url="/setup?step=2", status_code=status.HTTP_302_FOUND)
 
@@ -190,6 +247,8 @@ async def step_3_callback(
     error: Optional[str] = None,
 ):
     """OAuth callback for admin user."""
+    await _reject_if_oobe_done()
+    _require_oobe_session(request)
     if error:
         return RedirectResponse(url=f"/setup?step=3&error={error}", status_code=status.HTTP_302_FOUND)
 
@@ -241,6 +300,8 @@ async def step_3_callback(
 @router.post("/step/3/confirm")
 async def step_3_confirm(request: Request):
     """Confirm admin user and domain."""
+    await _reject_if_oobe_done()
+    _require_oobe_session(request)
     if "admin_email" not in _oobe_data:
         return RedirectResponse(url="/setup?step=3", status_code=status.HTTP_302_FOUND)
 
@@ -250,6 +311,8 @@ async def step_3_confirm(request: Request):
 @router.post("/step/4")
 async def setup_step_4(request: Request):
     """Handle step 4 - Email settings."""
+    await _reject_if_oobe_done()
+    _require_oobe_session(request)
     form = await request.form()
     enabled = form.get("enabled") == "on"
 
@@ -270,6 +333,7 @@ async def setup_step_4(request: Request):
 @router.post("/step/4/test")
 async def test_email(request: Request):
     """Send test email."""
+    await _reject_if_oobe_done()
     form = await request.form()
 
     # This would actually test the email settings
@@ -282,21 +346,25 @@ async def setup_step_5(request: Request):
     """Service-account upload step was removed at the Stage-5
     cutover; this handler just redirects to step 6 so existing
     bookmarks / old form submits don't 404."""
+    await _reject_if_oobe_done()
+    _require_oobe_session(request)
     return RedirectResponse(url="/setup?step=6", status_code=status.HTTP_302_FOUND)
-
-    return RedirectResponse(url="/setup?step=5", status_code=status.HTTP_302_FOUND)
 
 
 @router.post("/step/5/skip")
 @router.post("/step/5/continue")
 async def setup_step_5_bypass(request: Request):
     """Legacy handlers — service-account upload step is gone."""
+    await _reject_if_oobe_done()
+    _require_oobe_session(request)
     return RedirectResponse(url="/setup?step=6", status_code=status.HTTP_302_FOUND)
 
 
 @router.post("/step/6")
 async def setup_step_6(request: Request):
     """Complete setup and save everything."""
+    await _reject_if_oobe_done()
+    _require_oobe_session(request)
     form = await request.form()
     confirmed = form.get("confirmed") == "on"
 
