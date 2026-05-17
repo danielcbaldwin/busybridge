@@ -286,6 +286,7 @@ async def reconcile_user(
                 user_id=user_id,
                 main_google_calendar_id=main_google_calendar_id,
                 client_google_calendar_ids=google_id_for,
+                dry_run=dry_run,
                 now=now,
             )
         except Exception as e:

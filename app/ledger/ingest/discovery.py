@@ -43,12 +43,18 @@ async def discover_orphans(
     user_id: int,
     main_google_calendar_id: str,
     client_google_calendar_ids: dict[int, str],
+    dry_run: bool = False,
     now: Optional[datetime] = None,
 ) -> dict:
     """Scan every connected calendar for events that look like ours.
 
     Returns counters: ``{scanned_calendars, candidates_seen,
     relinked, orphans_deleted}``.
+
+    With ``dry_run=True`` the scan only classifies and counts: it
+    performs NO mutation — no relink, and no synthetic ledger /
+    projection / outbox rows for orphan deletes — so a preview
+    leaves no state a later reconcile could act on.
     """
     google = as_async_google(google)
     counters = {
@@ -76,6 +82,7 @@ async def discover_orphans(
                 target_google_calendar_id=google_cal,
                 target_calendar_db_id=client_cal_db_id,
                 event=event,
+                dry_run=dry_run,
                 now=now,
             )
             counters[outcome] = counters.get(outcome, 0) + 1
@@ -126,11 +133,16 @@ async def _classify_and_handle(
     target_google_calendar_id: str,
     target_calendar_db_id: Optional[int],
     event: dict,
+    dry_run: bool = False,
     now: Optional[datetime] = None,
 ) -> str:
     """Decide if a candidate is live, re-linkable, or orphaned.
 
     Returns one of ``relinked``, ``orphans_deleted``, ``live``.
+
+    With ``dry_run=True`` the candidate is classified and counted
+    but no mutation is made — the relink UPDATE is skipped and no
+    orphan-delete tombstone is scheduled.
     """
     eid = event["id"]
     private = (event.get("extendedProperties") or {}).get("private") or {}
@@ -162,26 +174,31 @@ async def _classify_and_handle(
                 (claimed_int, user_id),
             )).fetchone()
             if claimed is not None and claimed["google_event_id"] is None:
-                await db.execute(
-                    """UPDATE ledger_projections
-                          SET google_event_id = ?,
-                              google_etag = ?,
-                              current_state = 'present'
-                        WHERE id = ?""",
-                    (eid, event.get("etag", ""), int(claimed["id"])),
-                )
-                await db.commit()
+                if not dry_run:
+                    await db.execute(
+                        """UPDATE ledger_projections
+                              SET google_event_id = ?,
+                                  google_etag = ?,
+                                  current_state = 'present'
+                            WHERE id = ?""",
+                        (eid, event.get("etag", ""), int(claimed["id"])),
+                    )
+                    await db.commit()
                 return "relinked"
 
-    # Third: not live, not re-linkable → orphan.  Schedule deletion.
-    await _schedule_orphan_delete(
-        db, google,
-        user_id=user_id,
-        target_google_calendar_id=target_google_calendar_id,
-        target_calendar_db_id=target_calendar_db_id,
-        event_id=eid,
-        now=now,
-    )
+    # Third: not live, not re-linkable → orphan.  Schedule deletion —
+    # unless this is a dry-run preview, which must persist nothing
+    # (the synthetic tombstone + projection would otherwise survive
+    # the dry-run and be drained by the next normal reconcile).
+    if not dry_run:
+        await _schedule_orphan_delete(
+            db, google,
+            user_id=user_id,
+            target_google_calendar_id=target_google_calendar_id,
+            target_calendar_db_id=target_calendar_db_id,
+            event_id=eid,
+            now=now,
+        )
     return "orphans_deleted"
 
 

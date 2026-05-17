@@ -702,6 +702,7 @@ async def _scenario_run_reconciler(
     include_main: bool = True,
     drain: bool = True,
     run_discovery: bool = False,
+    dry_run: bool = False,
     webcal_fetch=None,
 ) -> dict:
     """Drive one ingest → plan → diff → drain pass for a user.
@@ -755,6 +756,7 @@ async def _scenario_run_reconciler(
         include_main=include_main,
         drain=drain,
         run_discovery=run_discovery,
+        dry_run=dry_run,
         # Drive outbox timestamps off the simulated clock so backoff
         # is deterministic and advancing the clock fires retries.
         now=self.clock.now(),
