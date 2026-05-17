@@ -38,3 +38,38 @@ async def test_default_webcal_fetcher_rejects_private_addresses(url):
     assert "blocked" in str(exc.value).lower(), (
         f"expected an SSRF-block rejection, got: {exc.value}"
     )
+
+
+async def test_fetch_ics_feed_rejects_redirect_to_internal_host(monkeypatch):
+    """A feed that passes the entry-URL check but 302-redirects to an
+    internal address must be rejected AT the redirect hop.
+
+    httpx's own follow_redirects validates only the final URL; the
+    fetcher follows redirects manually so every hop is checked.
+    """
+    import httpx
+
+    from app.utils import ics_fetch
+
+    def handler(request):
+        # The (public) entry URL redirects straight at cloud metadata.
+        return httpx.Response(
+            302, headers={"Location": "http://169.254.169.254/latest/meta"}
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def client_with_mock(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(ics_fetch.httpx, "AsyncClient", client_with_mock)
+
+    # A public IP literal passes the entry-URL SSRF check hermetically
+    # (no DNS); the redirect target is the link-local metadata host.
+    with pytest.raises(ValueError) as exc:
+        await ics_fetch.fetch_ics_feed("http://93.184.216.34/feed.ics")
+    assert "blocked" in str(exc.value).lower(), (
+        f"expected the redirect hop to be SSRF-blocked, got: {exc.value}"
+    )

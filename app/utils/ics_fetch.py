@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 # body is abandoned mid-download rather than buffered.
 _MAX_ICS_BYTES = 10 * 1024 * 1024  # 10 MiB
 
+# Cap on redirects followed before giving up.  Each hop is validated
+# individually, so this is just a loop guard against a redirect cycle.
+_MAX_REDIRECTS = 5
+
 # Explicit blocklist for defence-in-depth (covers cloud metadata,
 # RFC 1918, carrier-grade NAT, benchmarking, documentation, and
 # broadcast ranges that some older Python ipaddress builds may
@@ -102,33 +106,60 @@ async def fetch_ics_feed(
     timeout: float = 30.0,
 ) -> tuple[Optional[str], Optional[str]]:
     """SSRF-safe ICS fetch returning ``(content, new_etag)`` or
-    ``(None, None)`` on 304 Not Modified."""
+    ``(None, None)`` on 304 Not Modified.
+
+    Redirects are followed MANUALLY, one hop at a time, with every hop
+    URL re-validated against private/reserved networks immediately
+    before the connection is made.  httpx's own ``follow_redirects``
+    is deliberately disabled: it validates only the final URL, so an
+    intermediate hop (``public → 169.254.169.254 → public``) could
+    otherwise reach an internal service unchecked.
+    """
     if url.startswith("webcal://"):
         url = "https://" + url[len("webcal://"):]
-    validate_url_for_ssrf(url)
+
     headers = {}
     if etag:
         headers["If-None-Match"] = etag
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-        async with client.stream("GET", url, headers=headers) as response:
-            # Re-validate the post-redirect host on every fetch (not
-            # only when a redirect occurred): it re-checks the
-            # resolved address, narrowing — though not fully closing —
-            # the DNS-rebinding window between validation and connect.
-            validate_url_for_ssrf(str(response.url))
-            if response.status_code == 304:
-                return None, None
-            response.raise_for_status()
-            # Stream with a running byte cap so an oversized (or
-            # endless) body is abandoned instead of buffered whole.
-            chunks: list[bytes] = []
-            total = 0
-            async for chunk in response.aiter_bytes():
-                total += len(chunk)
-                if total > _MAX_ICS_BYTES:
-                    raise ValueError(
-                        f"ICS feed exceeds the {_MAX_ICS_BYTES}-byte limit"
-                    )
-                chunks.append(chunk)
-            etag_out = response.headers.get("ETag")
-    return b"".join(chunks).decode("utf-8", "replace"), etag_out
+
+    current_url = url
+    async with httpx.AsyncClient(
+        follow_redirects=False, timeout=timeout,
+    ) as client:
+        for _hop in range(_MAX_REDIRECTS + 1):
+            # Validate immediately before connecting; this runs for the
+            # original URL and every redirect target.
+            validate_url_for_ssrf(current_url)
+            async with client.stream(
+                "GET", current_url, headers=headers,
+            ) as response:
+                if response.is_redirect:
+                    location = response.headers.get("Location")
+                    if not location:
+                        raise ValueError(
+                            "redirect response carried no Location header"
+                        )
+                    # Resolve relative redirects against the current URL;
+                    # the next loop iteration validates the result.
+                    current_url = str(httpx.URL(current_url).join(location))
+                    continue
+                if response.status_code == 304:
+                    return None, None
+                response.raise_for_status()
+                # Stream with a running byte cap so an oversized (or
+                # endless) body is abandoned instead of buffered whole.
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > _MAX_ICS_BYTES:
+                        raise ValueError(
+                            f"ICS feed exceeds the {_MAX_ICS_BYTES}-byte limit"
+                        )
+                    chunks.append(chunk)
+                etag_out = response.headers.get("ETag")
+                return (
+                    b"".join(chunks).decode("utf-8", "replace"),
+                    etag_out,
+                )
+    raise ValueError(f"too many redirects (>{_MAX_REDIRECTS})")
