@@ -288,7 +288,8 @@ async def _ingest_one_main_event(
                    source_type, source_event_id,
                    source_etag, source_updated_at,
                    summary, description, location,
-                   start_at, end_at, is_all_day,
+                   start_at, end_at, start_timezone, end_timezone,
+                   is_all_day,
                    show_as, visibility, color_id,
                    organizer_email, user_can_edit, user_rsvp_status,
                    attendees_json, recurrence_rule_json,
@@ -298,7 +299,8 @@ async def _ingest_one_main_event(
                        'main_native', ?,
                        ?, ?,
                        ?, ?, ?,
-                       ?, ?, ?,
+                       ?, ?, ?, ?,
+                       ?,
                        ?, ?, ?,
                        ?, ?, ?,
                        ?, ?,
@@ -309,7 +311,9 @@ async def _ingest_one_main_event(
                 event_id,
                 event.get("etag"), event.get("updated"),
                 fields["summary"], fields["description"], fields["location"],
-                fields["start_at"], fields["end_at"], fields["is_all_day"],
+                fields["start_at"], fields["end_at"],
+                fields["start_timezone"], fields["end_timezone"],
+                fields["is_all_day"],
                 fields["show_as"], fields["visibility"], fields["color_id"],
                 fields["organizer_email"], fields["user_can_edit"],
                 fields["user_rsvp_status"],
@@ -334,7 +338,8 @@ async def _ingest_one_main_event(
               SET source_etag = ?,
                   source_updated_at = ?,
                   summary = ?, description = ?, location = ?,
-                  start_at = ?, end_at = ?, is_all_day = ?,
+                  start_at = ?, end_at = ?,
+                  start_timezone = ?, end_timezone = ?, is_all_day = ?,
                   show_as = ?, visibility = ?, color_id = ?,
                   organizer_email = ?, user_can_edit = ?,
                   user_rsvp_status = ?,
@@ -348,7 +353,9 @@ async def _ingest_one_main_event(
         (
             event.get("etag"), event.get("updated"),
             fields["summary"], fields["description"], fields["location"],
-            fields["start_at"], fields["end_at"], fields["is_all_day"],
+            fields["start_at"], fields["end_at"],
+            fields["start_timezone"], fields["end_timezone"],
+            fields["is_all_day"],
             fields["show_as"], fields["visibility"], fields["color_id"],
             fields["organizer_email"], fields["user_can_edit"],
             fields["user_rsvp_status"],
@@ -421,7 +428,9 @@ async def _maybe_apply_main_edit_back(
         canonical = rendered or {}
 
     new_rsvp = _extract_self_rsvp(event, user_email)
-    new_start, new_end, is_all_day = _extract_start_end(event)
+    new_start, new_end, new_start_tz, new_end_tz, is_all_day = (
+        _extract_start_end(event)
+    )
 
     source_type = ledger["source_type"]
     user_can_edit = bool(ledger["user_can_edit"])
@@ -452,6 +461,8 @@ async def _maybe_apply_main_edit_back(
               SET user_rsvp_status = COALESCE(?, user_rsvp_status),
                   start_at = COALESCE(?, start_at),
                   end_at = COALESCE(?, end_at),
+                  start_timezone = CASE WHEN ? THEN ? ELSE start_timezone END,
+                  end_timezone = CASE WHEN ? THEN ? ELSE end_timezone END,
                   is_all_day = COALESCE(?, is_all_day),
                   summary = CASE WHEN ? THEN ? ELSE summary END,
                   description = CASE WHEN ? THEN ? ELSE description END,
@@ -463,6 +474,8 @@ async def _maybe_apply_main_edit_back(
             new_rsvp if apply_rsvp else None,
             new_start if apply_time else None,
             new_end if apply_time else None,
+            apply_time, new_start_tz,
+            apply_time, new_end_tz,
             is_all_day if apply_time else None,
             apply_detail, event.get("summary"),
             apply_detail, event.get("description"),
@@ -493,14 +506,21 @@ def _extract_self_rsvp(event: dict, user_email: str) -> Optional[str]:
     return None
 
 
-def _extract_start_end(event: dict) -> tuple[Optional[str], Optional[str], Optional[bool]]:
+def _extract_start_end(
+    event: dict,
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[bool]]:
+    """Return ``(start, end, start_timezone, end_timezone, is_all_day)``
+    for an incoming main-copy event.  All-day events carry no zone."""
     start = event.get("start") or {}
     end = event.get("end") or {}
     if "date" in start:
-        return start.get("date"), end.get("date"), True
+        return start.get("date"), end.get("date"), None, None, True
     if "dateTime" in start:
-        return start.get("dateTime"), end.get("dateTime"), False
-    return None, None, None
+        return (
+            start.get("dateTime"), end.get("dateTime"),
+            start.get("timeZone"), end.get("timeZone"), False,
+        )
+    return None, None, None, None, None
 
 
 async def _mark_user_intentionally_deleted(

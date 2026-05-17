@@ -34,6 +34,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
+from zoneinfo import ZoneInfo
 
 from dateutil.parser import isoparse
 from dateutil.rrule import rrulestr
@@ -1211,7 +1212,7 @@ class FakeGoogleCalendar:
         ``time_min`` and ``time_max``.  Overrides take precedence
         over synthesized instances at matching dates.
         """
-        parent_start_dt = _event_start_dt(parent)
+        parent_start_dt = _event_start_dt_for_expansion(parent)
         if parent_start_dt is None:
             return []
 
@@ -1319,6 +1320,28 @@ def _event_start_dt(ev: _StoredEvent) -> Optional[datetime]:
     return None
 
 
+def _event_start_dt_for_expansion(ev: _StoredEvent) -> Optional[datetime]:
+    """Parent start used as the RRULE ``dtstart``.
+
+    Real Google expands a recurring series in the series' declared
+    ``start.timeZone``: each occurrence keeps a fixed WALL-CLOCK time
+    and therefore shifts its UTC instant across a DST transition.
+    Anchoring ``dtstart`` in that zone (rather than UTC) reproduces
+    that behaviour; without it the fake would expand on a fixed UTC
+    grid and never drift, masking the very bug under test.
+    """
+    base = _event_start_dt(ev)
+    if base is None:
+        return None
+    tz_name = (ev.start or {}).get("timeZone")
+    if not tz_name or tz_name == "UTC":
+        return base
+    try:
+        return base.astimezone(ZoneInfo(tz_name))
+    except Exception:
+        return base
+
+
 def _event_end_dt(ev: _StoredEvent) -> Optional[datetime]:
     if not ev.end:
         return None
@@ -1409,7 +1432,7 @@ def _is_dt_in_recurrence(parent: _StoredEvent, dt: datetime) -> bool:
     """
     if not parent.recurrence:
         return False
-    parent_start = _event_start_dt(parent)
+    parent_start = _event_start_dt_for_expansion(parent)
     if parent_start is None:
         return False
     try:

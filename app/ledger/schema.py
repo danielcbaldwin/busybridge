@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS ledger_events (
     location TEXT,
     start_at TEXT,
     end_at TEXT,
+    start_timezone TEXT,
+    end_timezone TEXT,
     is_all_day BOOLEAN DEFAULT FALSE,
     show_as TEXT,
     visibility TEXT,
@@ -217,6 +219,8 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
         "ALTER TABLE outbox_operations ADD COLUMN desired_payload_hash TEXT",
         "ALTER TABLE ledger_projections "
         "ADD COLUMN google_id_generation INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ledger_events ADD COLUMN start_timezone TEXT",
+        "ALTER TABLE ledger_events ADD COLUMN end_timezone TEXT",
     ):
         try:
             await db.execute(stmt)

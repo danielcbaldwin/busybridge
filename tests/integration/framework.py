@@ -167,14 +167,20 @@ class Scenario:
         duration_minutes: int = 30,
         rrule: str = "RRULE:FREQ=WEEKLY;COUNT=4",
         event_id: Optional[str] = None,
+        timezone: str = "UTC",
         **extra: Any,
     ) -> dict:
         """Insert a recurring series.  ``rrule`` is the full RRULE
-        line including the ``RRULE:`` prefix."""
+        line including the ``RRULE:`` prefix.
+
+        ``timezone`` is the IANA zone the series' RRULE expands in;
+        pass e.g. ``"America/New_York"`` (with a ``start`` carrying
+        that zone's offset) to model a DST-sensitive series."""
         body = self._build_event_body(
             summary=summary,
             start=start,
             duration_minutes=duration_minutes,
+            timezone=timezone,
             **extra,
         )
         body["recurrence"] = [rrule]
@@ -392,6 +398,7 @@ class Scenario:
         transparency: Optional[str] = None,
         location: Optional[str] = None,
         description: Optional[str] = None,
+        timezone: str = "UTC",
     ) -> dict:
         start_iso = _coerce_iso(start)
         # All-day if the input had no time component.
@@ -407,13 +414,17 @@ class Scenario:
         else:
             start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
             end_dt = start_dt + timedelta(minutes=duration_minutes)
+            if timezone == "UTC":
+                end_str = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            else:
+                # Preserve the start's own UTC offset on the end so the
+                # fake anchors the event correctly; ``timeZone`` names
+                # the IANA zone the RRULE expands in.
+                end_str = end_dt.isoformat()
             body = {
                 "summary": summary,
-                "start": {"dateTime": start_iso, "timeZone": "UTC"},
-                "end": {
-                    "dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "timeZone": "UTC",
-                },
+                "start": {"dateTime": start_iso, "timeZone": timezone},
+                "end": {"dateTime": end_str, "timeZone": timezone},
             }
         if attendees is not None:
             body["attendees"] = attendees

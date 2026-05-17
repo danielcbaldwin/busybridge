@@ -19,8 +19,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiosqlite
 
@@ -398,6 +400,38 @@ async def _maybe_revert_client_drift(
 # ---------------------------------------------------------------------------
 # Instance handling
 # ---------------------------------------------------------------------------
+# Trailing RFC 3339 UTC-offset, e.g. ``-05:00`` / ``+05:30`` — the
+# date portion's hyphens are never followed by a colon, so this only
+# matches a genuine time-zone offset.
+_OFFSET_RE = re.compile(r"[+-]\d{2}:\d{2}$")
+
+
+def _resolve_original_start(time_dict: dict) -> str:
+    """Normalize a recurring occurrence's start so the same occurrence
+    always yields the same string.
+
+    Google usually delivers ``dateTime`` with an explicit offset; some
+    sources send a naive ``dateTime`` plus a separate IANA ``timeZone``.
+    In the naive+zone case the wall time is resolved in that zone and
+    converted to UTC, so the downstream instance-id derivation — which
+    assumes a naive datetime is UTC — stays correct across DST.  A
+    ``dateTime`` that already carries an offset, or that has no usable
+    ``timeZone``, is returned unchanged.
+    """
+    dt_str = time_dict["dateTime"]
+    if dt_str.endswith("Z") or _OFFSET_RE.search(dt_str):
+        return dt_str
+    tz_name = time_dict.get("timeZone")
+    if not tz_name:
+        return dt_str
+    try:
+        tz = ZoneInfo(tz_name)
+        naive = datetime.fromisoformat(dt_str)
+    except (ZoneInfoNotFoundError, ValueError):
+        return dt_str
+    return naive.replace(tzinfo=tz).astimezone(UTC).isoformat()
+
+
 async def _ingest_instance(
     db: aiosqlite.Connection,
     *,
@@ -421,17 +455,24 @@ async def _ingest_instance(
     """
     ost = event.get("originalStartTime", {}) or {}
     if "dateTime" in ost:
-        original_start = ost["dateTime"]
+        original_start = _resolve_original_start(ost)
         instance_is_all_day = False
     elif "date" in ost:
         original_start = ost["date"]
         instance_is_all_day = True
     else:
         start = event.get("start") or {}
-        original_start = start.get("dateTime") or start.get("date") or ""
         # No originalStartTime — fall back to the instance's own start:
         # an all-day occurrence carries a date-only start.
-        instance_is_all_day = "dateTime" not in start and "date" in start
+        if "dateTime" in start:
+            original_start = _resolve_original_start(start)
+            instance_is_all_day = False
+        elif "date" in start:
+            original_start = start["date"]
+            instance_is_all_day = True
+        else:
+            original_start = ""
+            instance_is_all_day = False
 
     instance_canonical = canonical_uid_for_instance(
         parent_canonical, original_start,
@@ -492,7 +533,8 @@ async def _ingest_instance(
                    recurrence_instance_original_start,
                    source_etag, source_updated_at,
                    summary, description, location,
-                   start_at, end_at, is_all_day,
+                   start_at, end_at, start_timezone, end_timezone,
+                   is_all_day,
                    show_as, visibility, color_id,
                    organizer_email, user_can_edit, user_rsvp_status,
                    attendees_json,
@@ -502,7 +544,8 @@ async def _ingest_instance(
                        ?, ?, ?, ?,
                        ?, ?,
                        ?, ?, ?,
-                       ?, ?, ?,
+                       ?, ?, ?, ?,
+                       ?,
                        ?, ?, ?,
                        ?, ?, ?,
                        ?,
@@ -514,7 +557,9 @@ async def _ingest_instance(
                 original_start,
                 event.get("etag"), event.get("updated"),
                 fields["summary"], fields["description"], fields["location"],
-                fields["start_at"], fields["end_at"], fields["is_all_day"],
+                fields["start_at"], fields["end_at"],
+                fields["start_timezone"], fields["end_timezone"],
+                fields["is_all_day"],
                 fields["show_as"], fields["visibility"], fields["color_id"],
                 fields["organizer_email"], fields["user_can_edit"],
                 fields["user_rsvp_status"],
@@ -536,7 +581,8 @@ async def _ingest_instance(
         """UPDATE ledger_events
               SET source_etag = ?, source_updated_at = ?,
                   summary = ?, description = ?, location = ?,
-                  start_at = ?, end_at = ?, is_all_day = ?,
+                  start_at = ?, end_at = ?,
+                  start_timezone = ?, end_timezone = ?, is_all_day = ?,
                   show_as = ?, visibility = ?, color_id = ?,
                   organizer_email = ?, user_can_edit = ?,
                   user_rsvp_status = ?,
@@ -548,7 +594,9 @@ async def _ingest_instance(
         (
             event.get("etag"), event.get("updated"),
             fields["summary"], fields["description"], fields["location"],
-            fields["start_at"], fields["end_at"], fields["is_all_day"],
+            fields["start_at"], fields["end_at"],
+            fields["start_timezone"], fields["end_timezone"],
+            fields["is_all_day"],
             fields["show_as"], fields["visibility"], fields["color_id"],
             fields["organizer_email"], fields["user_can_edit"],
             fields["user_rsvp_status"],
@@ -579,7 +627,7 @@ async def _insert_ledger_row(
                source_type, source_calendar_id, source_event_id,
                source_etag, source_updated_at,
                summary, description, location,
-               start_at, end_at, is_all_day,
+               start_at, end_at, start_timezone, end_timezone, is_all_day,
                show_as, visibility, color_id,
                organizer_email, user_can_edit, user_rsvp_status,
                attendees_json, recurrence_rule_json,
@@ -589,7 +637,7 @@ async def _insert_ledger_row(
                    'client', ?, ?,
                    ?, ?,
                    ?, ?, ?,
-                   ?, ?, ?,
+                   ?, ?, ?, ?, ?,
                    ?, ?, ?,
                    ?, ?, ?,
                    ?, ?,
@@ -600,7 +648,9 @@ async def _insert_ledger_row(
             client_calendar_id, event["id"],
             event.get("etag"), event.get("updated"),
             fields["summary"], fields["description"], fields["location"],
-            fields["start_at"], fields["end_at"], fields["is_all_day"],
+            fields["start_at"], fields["end_at"],
+            fields["start_timezone"], fields["end_timezone"],
+            fields["is_all_day"],
             fields["show_as"], fields["visibility"], fields["color_id"],
             fields["organizer_email"], fields["user_can_edit"],
             fields["user_rsvp_status"],
@@ -646,7 +696,8 @@ async def _apply_event_to_ledger(
               SET source_etag = ?,
                   source_updated_at = ?,
                   summary = ?, description = ?, location = ?,
-                  start_at = ?, end_at = ?, is_all_day = ?,
+                  start_at = ?, end_at = ?,
+                  start_timezone = ?, end_timezone = ?, is_all_day = ?,
                   show_as = ?, visibility = ?, color_id = ?,
                   organizer_email = ?, user_can_edit = ?,
                   user_rsvp_status = ?,
@@ -660,7 +711,9 @@ async def _apply_event_to_ledger(
         (
             event.get("etag"), event.get("updated"),
             fields["summary"], fields["description"], fields["location"],
-            fields["start_at"], fields["end_at"], fields["is_all_day"],
+            fields["start_at"], fields["end_at"],
+            fields["start_timezone"], fields["end_timezone"],
+            fields["is_all_day"],
             fields["show_as"], fields["visibility"], fields["color_id"],
             fields["organizer_email"], fields["user_can_edit"],
             fields["user_rsvp_status"],
@@ -804,6 +857,11 @@ def _extract_event_fields(event: dict, *, user_email: str) -> dict:
         "location": event.get("location"),
         "start_at": start_at,
         "end_at": end_at,
+        # IANA timezone the source expands its RRULE in.  Preserving it
+        # keeps a "weekly 9am America/New_York" event correct across
+        # DST instead of drifting onto a fixed UTC grid.
+        "start_timezone": start.get("timeZone"),
+        "end_timezone": end.get("timeZone"),
         "is_all_day": is_all_day,
         "show_as": show_as,
         "visibility": event.get("visibility"),
@@ -839,6 +897,8 @@ def _content_hash_from_row(row) -> str:
         "location": row["location"],
         "start_at": row["start_at"],
         "end_at": row["end_at"],
+        "start_timezone": row["start_timezone"],
+        "end_timezone": row["end_timezone"],
         "is_all_day": bool(row["is_all_day"]),
         "show_as": row["show_as"],
         "visibility": row["visibility"],

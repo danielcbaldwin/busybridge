@@ -208,7 +208,9 @@ def _vevent_to_dict(comp) -> dict:
 
     dtstart = comp.get("DTSTART")
     dtend = comp.get("DTEND")
-    start_at, end_at, is_all_day = _normalize_times(dtstart, dtend)
+    start_at, end_at, start_tz, end_tz, is_all_day = _normalize_times(
+        dtstart, dtend,
+    )
 
     # RRULE + EXDATE + RDATE all belong in the `recurrence` array
     # Google materialises instances from.  Dropping EXDATE would
@@ -230,6 +232,8 @@ def _vevent_to_dict(comp) -> dict:
         "location": location,
         "start_at": start_at,
         "end_at": end_at,
+        "start_timezone": start_tz,
+        "end_timezone": end_tz,
         "is_all_day": is_all_day,
         "show_as": show_as,
         "recurrence_rule_json": (
@@ -284,12 +288,17 @@ def _first_str(comp, key: str) -> Optional[str]:
     return s or None
 
 
-def _normalize_times(dtstart, dtend) -> tuple[Optional[str], Optional[str], bool]:
-    """Return ``(start_at, end_at, is_all_day)``.  All-day events
-    keep their ``YYYY-MM-DD`` shape; timed events get an ISO-8601
-    UTC string."""
+def _normalize_times(
+    dtstart, dtend,
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], bool]:
+    """Return ``(start_at, end_at, start_timezone, end_timezone,
+    is_all_day)``.  All-day events keep their ``YYYY-MM-DD`` shape and
+    carry no zone; timed events get an ISO-8601 UTC string plus the
+    IANA zone their RRULE expands in (so a mirrored recurring webcal
+    event stays correct across DST instead of drifting onto a fixed
+    UTC grid)."""
     if dtstart is None:
-        return None, None, False
+        return None, None, None, None, False
     sdt = dtstart.dt
     edt = dtend.dt if dtend is not None else None
     if isinstance(sdt, datetime):
@@ -299,10 +308,32 @@ def _normalize_times(dtstart, dtend) -> tuple[Optional[str], Optional[str], bool
             if isinstance(edt, datetime)
             else (s + timedelta(minutes=30))
         )
-        return s.strftime("%Y-%m-%dT%H:%M:%SZ"), e.strftime("%Y-%m-%dT%H:%M:%SZ"), False
+        return (
+            s.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            e.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            _iana_tz_name(sdt),
+            _iana_tz_name(edt) if isinstance(edt, datetime) else _iana_tz_name(sdt),
+            False,
+        )
     # date-only → all-day
     e = edt if edt is not None else (sdt + timedelta(days=1))
-    return sdt.isoformat(), e.isoformat(), True
+    return sdt.isoformat(), e.isoformat(), None, None, True
+
+
+def _iana_tz_name(dt) -> Optional[str]:
+    """The IANA zone key of a datetime's tzinfo, or ``None``.
+
+    icalendar parses ``DTSTART;TZID=America/New_York:...`` into a
+    ``zoneinfo.ZoneInfo`` whose ``.key`` is the IANA name.  A UTC /
+    fixed-offset / floating time has no ``.key`` — return ``None`` so
+    the renderer falls back to UTC."""
+    tz = getattr(dt, "tzinfo", None)
+    if tz is None:
+        return None
+    key = getattr(tz, "key", None)
+    # "UTC" is not a drift-prone zone — treat it as "no zone" so the
+    # renderer's UTC fallback applies and the column stays NULL.
+    return None if key == "UTC" else key
 
 
 # ---------------------------------------------------------------------------
@@ -403,14 +434,16 @@ async def _ingest_ics_event(
                   (user_id, canonical_uid,
                    source_type, source_calendar_id, source_event_id,
                    summary, description, location,
-                   start_at, end_at, is_all_day,
+                   start_at, end_at, start_timezone, end_timezone,
+                   is_all_day,
                    show_as, recurrence_rule_json, is_recurring,
                    status, version,
                    created_at, updated_at, last_seen_at)
                VALUES (?, ?,
                        'webcal', ?, ?,
                        ?, ?, ?,
-                       ?, ?, ?,
+                       ?, ?, ?, ?,
+                       ?,
                        ?, ?, ?,
                        'active', 1,
                        ?, ?, ?)""",
@@ -418,7 +451,9 @@ async def _ingest_ics_event(
                 user_id, canonical,
                 subscription_id, uid,
                 fields["summary"], fields["description"], fields["location"],
-                fields["start_at"], fields["end_at"], fields["is_all_day"],
+                fields["start_at"], fields["end_at"],
+                fields["start_timezone"], fields["end_timezone"],
+                fields["is_all_day"],
                 fields["show_as"], fields["recurrence_rule_json"],
                 fields["is_recurring"],
                 when, when, when,
@@ -438,7 +473,8 @@ async def _ingest_ics_event(
     await db.execute(
         """UPDATE ledger_events
               SET summary = ?, description = ?, location = ?,
-                  start_at = ?, end_at = ?, is_all_day = ?,
+                  start_at = ?, end_at = ?,
+                  start_timezone = ?, end_timezone = ?, is_all_day = ?,
                   show_as = ?, recurrence_rule_json = ?, is_recurring = ?,
                   status = 'active',
                   version = version + 1,
@@ -446,7 +482,9 @@ async def _ingest_ics_event(
             WHERE id = ?""",
         (
             fields["summary"], fields["description"], fields["location"],
-            fields["start_at"], fields["end_at"], fields["is_all_day"],
+            fields["start_at"], fields["end_at"],
+            fields["start_timezone"], fields["end_timezone"],
+            fields["is_all_day"],
             fields["show_as"], fields["recurrence_rule_json"],
             fields["is_recurring"],
             when, when, int(existing["id"]),
@@ -526,18 +564,21 @@ async def _ingest_ics_instance(
                    source_type, source_calendar_id, source_event_id,
                    recurrence_instance_original_start,
                    summary, description, location,
-                   start_at, end_at, is_all_day, show_as,
+                   start_at, end_at, start_timezone, end_timezone,
+                   is_all_day, show_as,
                    recurrence_rule_json, is_recurring,
                    status, version,
                    created_at, updated_at, last_seen_at)
                VALUES (?, ?, ?, 'webcal', ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        'active', 1, ?, ?, ?)""",
             (
                 user_id, instance_canonical, parent_canonical,
                 subscription_id, parent_uid, original_start,
                 fields["summary"], fields["description"], fields["location"],
-                fields["start_at"], fields["end_at"], fields["is_all_day"],
+                fields["start_at"], fields["end_at"],
+                fields["start_timezone"], fields["end_timezone"],
+                fields["is_all_day"],
                 fields["show_as"], fields["recurrence_rule_json"],
                 fields["is_recurring"],
                 when, when, when,
@@ -556,7 +597,8 @@ async def _ingest_ics_instance(
     await db.execute(
         """UPDATE ledger_events
               SET summary = ?, description = ?, location = ?,
-                  start_at = ?, end_at = ?, is_all_day = ?,
+                  start_at = ?, end_at = ?,
+                  start_timezone = ?, end_timezone = ?, is_all_day = ?,
                   show_as = ?, recurrence_rule_json = ?, is_recurring = ?,
                   status = 'active',
                   version = version + 1,
@@ -564,7 +606,9 @@ async def _ingest_ics_instance(
             WHERE id = ?""",
         (
             fields["summary"], fields["description"], fields["location"],
-            fields["start_at"], fields["end_at"], fields["is_all_day"],
+            fields["start_at"], fields["end_at"],
+            fields["start_timezone"], fields["end_timezone"],
+            fields["is_all_day"],
             fields["show_as"], fields["recurrence_rule_json"],
             fields["is_recurring"],
             when, when, int(existing["id"]),
@@ -581,6 +625,8 @@ def _ics_to_ledger_fields(event: dict) -> dict:
         "location": event.get("location"),
         "start_at": event.get("start_at"),
         "end_at": event.get("end_at"),
+        "start_timezone": event.get("start_timezone"),
+        "end_timezone": event.get("end_timezone"),
         "is_all_day": event.get("is_all_day"),
         "show_as": event.get("show_as"),
         "recurrence_rule_json": event.get("recurrence_rule_json"),
@@ -595,6 +641,8 @@ def _ics_content_hash_from_row(row) -> str:
         "location": row["location"],
         "start_at": row["start_at"],
         "end_at": row["end_at"],
+        "start_timezone": row["start_timezone"],
+        "end_timezone": row["end_timezone"],
         "is_all_day": bool(row["is_all_day"]),
         "show_as": row["show_as"],
         "recurrence_rule_json": row["recurrence_rule_json"],

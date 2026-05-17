@@ -245,13 +245,32 @@ def _rsvp_attendees(row: dict) -> list[dict]:
 def _start_dict(row: dict) -> dict:
     if row.get("is_all_day"):
         return {"date": row["start_at"]}
-    return {"dateTime": row["start_at"], "timeZone": "UTC"}
+    # Carry the source's IANA timezone so a recurring mirror expands
+    # its RRULE on the source's wall-clock grid (correct across DST)
+    # instead of a fixed UTC grid.  Falls back to UTC only when the
+    # source supplied no zone — see REWRITE_PLAN.md timezone notes.
+    return {
+        "dateTime": row["start_at"],
+        "timeZone": _row_get(row, "start_timezone") or "UTC",
+    }
 
 
 def _end_dict(row: dict) -> dict:
     if row.get("is_all_day"):
         return {"date": row["end_at"]}
-    return {"dateTime": row["end_at"], "timeZone": "UTC"}
+    return {
+        "dateTime": row["end_at"],
+        "timeZone": _row_get(row, "end_timezone") or "UTC",
+    }
+
+
+def _row_get(row: dict, key: str) -> Any:
+    """``row.get`` that also tolerates an ``aiosqlite.Row`` (no
+    ``.get``) and a row missing the column entirely."""
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
 
 
 def _stamp_extended_properties(
