@@ -26,7 +26,14 @@ import aiosqlite
 
 from app.ledger.google_client import GoogleClient
 from app.ledger.identity import derive_instance_google_event_id
-from app.ledger.outbox import OP_CREATE, OP_DELETE, OP_PATCH, OP_UPDATE, enqueue
+from app.ledger.outbox import (
+    OP_CREATE,
+    OP_DELETE,
+    OP_DELETE_SOURCE,
+    OP_PATCH,
+    OP_UPDATE,
+    enqueue,
+)
 from app.ledger.payload import ABSENT, PRESENT_FULL_RSVP_ONLY, render_payload
 
 logger = logging.getLogger(__name__)
@@ -98,6 +105,7 @@ async def diff_and_enqueue_for_user(
                               e.start_at, e.end_at,
                               e.start_timezone, e.end_timezone,
                               e.origin_writeback_pending,
+                              e.source_delete_pending,
                               e.is_all_day, e.show_as,
                               e.color_id, e.user_can_edit, e.user_rsvp_status,
                               e.recurrence_rule_json, e.version AS ledger_version,
@@ -179,6 +187,7 @@ async def _diverged_projections(
                   e.start_at, e.end_at,
                   e.start_timezone, e.end_timezone,
                   e.origin_writeback_pending,
+                  e.source_delete_pending,
                   e.is_all_day, e.show_as,
                   e.color_id, e.user_can_edit, e.user_rsvp_status,
                   e.recurrence_rule_json, e.version AS ledger_version,
@@ -249,6 +258,18 @@ def _decide(
     # event is cancelled / intentionally-deleted the planner sets
     # desired to ABSENT; that must NOT delete the source event.
     if _is_origin_writeback(proj):
+        # Destructive single-occurrence delete: the user cancelled one
+        # occurrence of a managed recurring copy on main.  Delete
+        # exactly that occurrence on the source calendar — never the
+        # parent series.  source_delete_pending is set only for a
+        # main-originated cancellation, so a cancellation ingested
+        # FROM the source never re-triggers a delete.
+        if (
+            proj["parent_canonical_uid"]
+            and desired == ABSENT
+            and bool(proj["source_delete_pending"])
+        ):
+            return OP_DELETE_SOURCE, None, target_cal
         if desired != PRESENT_FULL_RSVP_ONLY:
             return None, None, target_cal
         # The writeback patches an event we do NOT own, so it must

@@ -196,9 +196,21 @@ async def _ingest_one_main_event(
     )).fetchone()
     if proj_match is not None or is_our_write:
         if proj_match is not None and status == "cancelled":
+            ledger_id = int(proj_match["ledger_event_id"])
+            matched = await (await db.execute(
+                "SELECT parent_canonical_uid FROM ledger_events WHERE id = ?",
+                (ledger_id,),
+            )).fetchone()
+            if matched is not None and matched["parent_canonical_uid"]:
+                # The user deleted one occurrence of a managed recurring
+                # copy whose instance was already materialised (e.g. by
+                # a prior move).  This is a destructive single-occurrence
+                # cancellation — cancel just this instance row and arm
+                # the source delete; NEVER flag the whole series.
+                await _mark_managed_instance_cancelled(db, ledger_id)
+                return "cancelled_instance", ledger_id
             # User deleted our copy on main → flip
             # user_intentionally_deleted on the source ledger row.
-            ledger_id = int(proj_match["ledger_event_id"])
             await _mark_user_intentionally_deleted(db, ledger_id)
             return "user_deletes", ledger_id
         # Edit-on-main detection: the user has changed our copy.
@@ -386,21 +398,18 @@ async def _ingest_managed_recurring_instance(
 ) -> tuple[str, Optional[int]]:
     """Handle an instance of one of our managed recurring main copies.
 
-    The user moved or edited a single occurrence of a recurring event
-    we mirror onto the main calendar.  Map it back to the SOURCE
-    series' ledger row and upsert a canonical source-parented instance
-    row, so the existing planner / diff propagate the change to the
-    source occurrence and every peer copy (REWRITE_PLAN.md Option A).
+    The user moved, edited or cancelled a single occurrence of a
+    recurring event we mirror onto the main calendar.  Map it back to
+    the SOURCE series' ledger row and upsert a canonical
+    source-parented instance row, so the existing planner / diff
+    propagate the change to the source occurrence and every peer copy
+    (REWRITE_PLAN.md Option A).
 
-    Never mints a ``main_native`` row.  Cancelled instances are a
-    destructive operation handled separately; for now they are skipped.
+    A move/edit arms an origin-writeback patch; a cancellation arms a
+    destructive delete of that one source occurrence.  Never mints a
+    ``main_native`` row, and never touches the parent series.
     """
     status = event.get("status", "confirmed")
-    if status == "cancelled":
-        # Cancelling one occurrence of a managed copy is destructive
-        # (it must delete that occurrence on the real source calendar).
-        # Handled by the dedicated cancellation path; skip here.
-        return "our_writes_skipped", None
 
     # Map the managed parent id back to the SOURCE series ledger row
     # via its 'main' projection.  The bb-id the instance carries as
@@ -426,21 +435,12 @@ async def _ingest_managed_recurring_instance(
         # The mapped row is not a recurring series master — defensive.
         return "our_writes_skipped", None
 
-    # The dragged copy is opaque about edit-rights: its rendered shape
-    # carries neither the real organizer nor guestsCanModify.  Take
-    # edit-rights / organizer / attendees from the SOURCE series; take
-    # the moved time and (for full copies) the detail from the event.
-    fields = _extract_event_fields(event, user_email=user_email)
-    fields["user_can_edit"] = bool(parent["user_can_edit"])
-    fields["organizer_email"] = parent["organizer_email"]
-    fields["attendees_json"] = parent["attendees_json"]
-
-    # The origin writeback patches the source occurrence by id.  No
+    # The origin op addresses the source occurrence by id.  No
     # exception exists on the source yet, but Google addresses an
     # instance as ``<series>_<stamp>`` whether or not one has been
-    # materialised — derive it from the source series id so the
-    # writeback has a target (and so a later source-side ingest of
-    # that same exception keys to the very same row).
+    # materialised — derive it from the source series id so the op has
+    # a target (and so a later source-side ingest of that same
+    # exception keys to the very same row).
     source_event_id: Optional[str] = None
     src_series_id = parent["source_event_id"]
     if parent["source_type"] in ("client", "personal") and src_series_id:
@@ -448,6 +448,45 @@ async def _ingest_managed_recurring_instance(
         source_event_id = derive_instance_google_event_id(
             src_series_id, original_start, instance_is_all_day,
         )
+
+    if status == "cancelled":
+        # Destructive single-occurrence cancellation (Option A): the
+        # source occurrence must be deleted on the real source
+        # calendar.  _ingest_instance writes a sticky cancelled row.
+        outcome, ledger_id = await _ingest_instance(
+            db,
+            user_id=user_id,
+            user_email=user_email,
+            event=event,
+            parent_canonical=parent["canonical_uid"],
+            source_type=parent["source_type"],
+            source_calendar_id=parent["source_calendar_id"],
+            source_event_id=source_event_id,
+        )
+        # Arm the destructive delete only on a genuine new
+        # cancellation ('cancelled'); a re-ingest of an already
+        # cancelled row ('skipped') must not re-arm it.
+        if (
+            ledger_id is not None
+            and outcome == "cancelled"
+            and source_event_id is not None
+        ):
+            await db.execute(
+                "UPDATE ledger_events SET source_delete_pending = 1 "
+                "WHERE id = ?",
+                (ledger_id,),
+            )
+        return outcome, ledger_id
+
+    # Move / edit.  The dragged copy is opaque about edit-rights: its
+    # rendered shape carries neither the real organizer nor
+    # guestsCanModify.  Take edit-rights / organizer / attendees from
+    # the SOURCE series; take the moved time and (for full copies) the
+    # detail from the event.
+    fields = _extract_event_fields(event, user_email=user_email)
+    fields["user_can_edit"] = bool(parent["user_can_edit"])
+    fields["organizer_email"] = parent["organizer_email"]
+    fields["attendees_json"] = parent["attendees_json"]
 
     outcome, ledger_id = await _ingest_instance(
         db,
@@ -642,6 +681,32 @@ async def _mark_user_intentionally_deleted(
                   updated_at = ?
             WHERE id = ?""",
         (when, ledger_event_id),
+    )
+
+
+async def _mark_managed_instance_cancelled(
+    db: aiosqlite.Connection, ledger_event_id: int,
+) -> None:
+    """Cancel one occurrence (an instance ledger row) whose managed
+    main copy the user deleted.
+
+    Sets ``status='cancelled'`` — NOT ``user_intentionally_deleted``,
+    which is a whole-series flag — so only this occurrence is
+    affected.  Arms the destructive source delete when the row has a
+    real source occurrence id (client / personal sources; a webcal
+    feed is read-only and carries none).
+    """
+    when = datetime.now(UTC).isoformat()
+    await db.execute(
+        """UPDATE ledger_events
+              SET status = 'cancelled',
+                  version = version + 1,
+                  cancelled_at = ?, updated_at = ?, last_seen_at = ?,
+                  source_delete_pending =
+                      CASE WHEN source_event_id IS NOT NULL THEN 1
+                           ELSE source_delete_pending END
+            WHERE id = ?""",
+        (when, when, when, ledger_event_id),
     )
 
 

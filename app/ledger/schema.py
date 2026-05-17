@@ -59,6 +59,12 @@ CREATE TABLE IF NOT EXISTS ledger_events (
     -- is still NULL).  Cleared by the outbox once the patch lands.
     origin_writeback_pending BOOLEAN DEFAULT FALSE,
 
+    -- Set when the user cancelled one occurrence of a managed
+    -- recurring copy on the main calendar: that single source
+    -- occurrence must be destructively deleted on the real source
+    -- calendar.  Cleared by the outbox once the delete lands.
+    source_delete_pending BOOLEAN DEFAULT FALSE,
+
     version INTEGER NOT NULL DEFAULT 1,
 
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -229,6 +235,8 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
         "ALTER TABLE ledger_events ADD COLUMN end_timezone TEXT",
         "ALTER TABLE ledger_events "
         "ADD COLUMN origin_writeback_pending BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE ledger_events "
+        "ADD COLUMN source_delete_pending BOOLEAN DEFAULT FALSE",
     ):
         try:
             await db.execute(stmt)

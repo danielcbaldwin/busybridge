@@ -59,6 +59,13 @@ OP_DELETE = "delete"
 # Field-scoped patch (events.patch) of the user's edits back to the
 # calendar that sourced the event.
 OP_PATCH = "patch"
+# Destructive delete of a single source occurrence — the user
+# cancelled one occurrence of a managed recurring copy on the main
+# calendar.  Distinct from OP_DELETE (which removes our own writes by
+# projection google_event_id): this addresses the user's REAL source
+# event by the ledger row's source_event_id, so it is kept explicit
+# rather than overloading the ordinary writeback or delete path.
+OP_DELETE_SOURCE = "delete_source"
 
 # Failure handling
 POISON_PILL_THRESHOLD = 5
@@ -130,7 +137,9 @@ async def enqueue(
 
     Returns the new outbox row id.
     """
-    if operation not in (OP_CREATE, OP_UPDATE, OP_DELETE, OP_PATCH):
+    if operation not in (
+        OP_CREATE, OP_UPDATE, OP_DELETE, OP_PATCH, OP_DELETE_SOURCE,
+    ):
         raise ValueError(f"unknown operation: {operation!r}")
     when = (now or datetime.now(UTC)).isoformat()
     idem = f"proj:{projection_id}:v{ledger_version}:{operation}"
@@ -347,6 +356,8 @@ async def _execute_op(
             await _do_delete(db, google, op, cal_id, now=now)
         elif operation == OP_PATCH:
             return await _do_patch(db, google, op, cal_id, payload, now=now)
+        elif operation == OP_DELETE_SOURCE:
+            await _do_delete_source(db, google, op, cal_id, now=now)
         else:
             raise ValueError(f"unknown operation: {operation!r}")
     except Exception as e:
@@ -562,6 +573,46 @@ async def _do_delete(
             pass  # already gone
         else:
             raise
+    await _record_absent(db, op, now=now)
+
+
+async def _do_delete_source(
+    db: aiosqlite.Connection,
+    google: GoogleClient,
+    op: aiosqlite.Row,
+    cal_id: str,
+    *,
+    now: datetime,
+) -> None:
+    """Destructively delete one occurrence on the user's real source
+    calendar.
+
+    The user cancelled a single occurrence of a managed recurring
+    copy on the main calendar (Option A: propagate it everywhere).
+    The target is the source occurrence, addressed by the ledger
+    row's ``source_event_id`` (``<series>_<stamp>``) — exactly that
+    one occurrence, never the parent series.  Idempotent: a 404/410
+    means the occurrence is already gone, which is the goal.
+    """
+    proj = await _get_projection(db, op["projection_id"])
+    led = await (await db.execute(
+        "SELECT id, source_event_id FROM ledger_events WHERE id = ?",
+        (int(proj["ledger_event_id"]),),
+    )).fetchone()
+    if led is not None and led["source_event_id"]:
+        try:
+            await google.delete_event(cal_id, led["source_event_id"])
+        except Exception as e:
+            if getattr(e, "status", None) not in (404, 410):
+                raise
+    # The destructive delete has landed (or the occurrence was
+    # already gone) — clear the flag so a later reconcile does not
+    # re-delete.
+    if led is not None:
+        await db.execute(
+            "UPDATE ledger_events SET source_delete_pending = 0 WHERE id = ?",
+            (int(led["id"]),),
+        )
     await _record_absent(db, op, now=now)
 
 
