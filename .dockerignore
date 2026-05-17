@@ -1,7 +1,66 @@
-.env
+# Build context exclusions — anything here is kept OUT of the image.
+# COPY . . in the Dockerfile copies the working tree, not just
+# git-tracked files, so secrets present locally would otherwise be
+# baked into the image.
+
+# VCS
 .git
-data
-secrets
-backups
-__pycache__
-*.pyc
+.gitignore
+.dockerignore
+
+# Secrets — never bake credentials into an image
+.env
+.env.*
+secrets/
+e2e/auth/
+**/client_secret*.json
+**/*sa-key*.json
+*.key
+*.pem
+
+# Virtualenvs (large; the image rebuilds deps from requirements.txt)
+.venv/
+venv/
+env/
+ENV/
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+
+# Test / coverage caches
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# Runtime data — must come from a mounted volume, not the image
+data/
+backups/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+
+# Test code — not needed in a production image
+tests/
+e2e/
+
+# Dev tooling / IDE
+.github/
+.idea/
+.vscode/
+*.swp
+*.swo
