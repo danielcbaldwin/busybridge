@@ -250,6 +250,13 @@ def _decide(
         projection_id=int(proj["id"]),
         ledger_version=int(proj["desired_ledger_version"]),
         target_kind=target_kind,
+        # The main calendar's own address is the attendee email on the
+        # user's self-attendee for a main full copy.  Threaded here (the
+        # send path) only: the planner hashes the payload without it,
+        # exactly as it omits the projection-id extendedProperties, and
+        # applied_payload_hash is taken from the planner's stamped hash
+        # — so the send body carrying the email never spuriously diverges.
+        main_calendar_email=main_calendar_id,
     )
 
     # Origin writeback projection: the target is the user's real

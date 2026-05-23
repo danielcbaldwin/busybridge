@@ -62,6 +62,7 @@ def render_payload(
     projection_id: Optional[int] = None,
     ledger_version: Optional[int] = None,
     target_kind: Optional[str] = None,
+    main_calendar_email: Optional[str] = None,
 ) -> Optional[dict]:
     """Render the body to send to Google for one projection.
 
@@ -90,7 +91,7 @@ def render_payload(
         return _render_origin_writeback(ledger_row)
 
     if desired_state == PRESENT_FULL:
-        body = _render_full_copy(ledger_row, target_kind)
+        body = _render_full_copy(ledger_row, target_kind, main_calendar_email)
     elif desired_state == PRESENT_BUSY:
         body = _render_busy_block(ledger_row)
     elif desired_state == PRESENT_PERSONAL_BUSY:
@@ -122,7 +123,11 @@ def hash_payload(payload: Optional[dict]) -> str:
 # ---------------------------------------------------------------------------
 # Internal renderers
 # ---------------------------------------------------------------------------
-def _render_full_copy(row: dict, target_kind: Optional[str] = None) -> dict:
+def _render_full_copy(
+    row: dict,
+    target_kind: Optional[str] = None,
+    main_calendar_email: Optional[str] = None,
+) -> dict:
     """Full-detail copy of a client / webcal event onto main."""
     body: dict[str, Any] = {}
     summary = row.get("summary") or "(no title)"
@@ -146,10 +151,21 @@ def _render_full_copy(row: dict, target_kind: Optional[str] = None) -> dict:
     # stored RSVP (REWRITE_PLAN.md §9) so they can see and change
     # their response there.  An RSVP set on the main copy is
     # detected at main-ingest and written back to the source event.
+    #
+    # The attendee MUST carry an explicit email.  ``events.insert``
+    # rejects a bare ``{"self": True}`` with "400 Missing attendee
+    # email. [required]" — ``self`` only resolves on a patch of an
+    # event Google already ties to the caller, not on a fresh create.
+    # The main copy's owner is the main calendar itself, so its
+    # address is the attendee email.
     if target_kind == "main" and row.get("user_rsvp_status"):
-        body["attendees"] = [
-            {"self": True, "responseStatus": row["user_rsvp_status"]},
-        ]
+        attendee: dict[str, Any] = {
+            "self": True,
+            "responseStatus": row["user_rsvp_status"],
+        }
+        if main_calendar_email:
+            attendee["email"] = main_calendar_email
+        body["attendees"] = [attendee]
     return body
 
 

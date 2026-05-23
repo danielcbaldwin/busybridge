@@ -260,6 +260,19 @@ def _validate_client_id(event_id: str) -> None:
         )
 
 
+def _validate_attendees(body: dict) -> None:
+    """Mirror Google: every attendee on a write must carry an email.
+
+    ``events.insert`` / ``events.update`` reject a bare
+    ``{"self": True}`` (no email) with "400 Missing attendee email.
+    [required]".  The fake enforced no such rule, which let the
+    email-less main-copy self-attendee bug ship undetected.
+    """
+    for att in body.get("attendees") or []:
+        if not att.get("email"):
+            raise _bad_request("Missing attendee email. [required]")
+
+
 def _new_etag() -> str:
     """Issue a fresh opaque ETag string."""
     return f'"{uuid.uuid4().hex}"'
@@ -392,6 +405,7 @@ class FakeGoogleCalendar:
         """
         self._check_failures("insert")
         cal = self._require_calendar(calendar_id)
+        _validate_attendees(body)
 
         # Resolve ID
         if "id" in body and body["id"] is not None:
@@ -481,6 +495,7 @@ class FakeGoogleCalendar:
         """
         self._check_failures("update")
         cal = self._require_calendar(calendar_id)
+        _validate_attendees(body)
         ev = cal.events.get(event_id)
         if ev is None:
             ev = self._materialize_instance_override(cal, event_id)

@@ -59,8 +59,17 @@ async def test_rsvp_set_on_main_is_written_back_to_origin():
 
     # The main copy carries alice as a self-attendee so she can RSVP there.
     main_copy = s.assert_event_exists("main", summary="Team sync")
-    assert any(a.get("self") for a in main_copy.get("attendees") or []), (
+    self_att = next(
+        (a for a in main_copy.get("attendees") or [] if a.get("self")), None,
+    )
+    assert self_att is not None, (
         f"main copy has no self-attendee; attendees={main_copy.get('attendees')}"
+    )
+    # The self-attendee MUST carry an email — events.insert rejects a
+    # bare {"self": True} with "400 Missing attendee email", which is
+    # what kept RSVP'd events off the main calendar in production.
+    assert self_att.get("email"), (
+        f"main-copy self-attendee has no email; attendee={self_att}"
     )
 
     # Alice accepts on the main copy.
