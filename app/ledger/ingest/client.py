@@ -813,6 +813,24 @@ async def _try_rekey_R_parent(
     target = rows[0]
     old_canonical = target["canonical_uid"]
     new_canonical = canonical_for(new_event_id)
+    # Self-collision guard.  The base/sibling lookup above can match a
+    # row that is NOT the one this id belongs to — most importantly when
+    # a recurring meeting has many occurrences each rescheduled into its
+    # own ``<base>_R<date>`` mini-series, so dozens of ``_R`` rows
+    # coexist.  Re-keying a sibling onto ``new_canonical`` when a
+    # DIFFERENT row already holds it violates UNIQUE(user_id,
+    # canonical_uid) and aborts the whole ingest pass (the source of the
+    # observed churn).  When the id already has its own row, it is not a
+    # parent reschedule needing a re-key — the caller's normal upsert
+    # path already tracks it — so skip and let that path handle it.
+    if new_canonical != old_canonical:
+        clash = await (await db.execute(
+            """SELECT 1 FROM ledger_events
+                WHERE user_id = ? AND canonical_uid = ?""",
+            (user_id, new_canonical),
+        )).fetchone()
+        if clash is not None:
+            return None
     when = datetime.now(UTC).isoformat()
     await db.execute(
         """UPDATE ledger_events

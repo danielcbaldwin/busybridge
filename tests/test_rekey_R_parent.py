@@ -257,3 +257,62 @@ async def test_rekey_R_parent_does_not_cross_source_types():
     row = await _row(db, lid)
     assert row["source_event_id"] == base  # untouched
     await s.close()
+
+
+async def test_rekey_R_parent_skips_when_new_canonical_already_exists():
+    """Multi-``_R`` self-collision regression.
+
+    A recurring meeting whose individual occurrences are each
+    rescheduled into their own ``<base>_R<date>`` mini-series produces
+    many coexisting ``_R`` rows.  Re-encountering one must NOT re-key a
+    *sibling* row onto a ``canonical_uid`` another row already holds —
+    that UPDATE violates UNIQUE(user_id, canonical_uid) and aborts the
+    whole ingest pass (the live churn we observed).  The re-key must
+    detect the clash and skip, leaving every row's canonical intact for
+    the normal upsert path.
+    """
+    s = Scenario()
+    s.given_calendar("main")
+    s.given_calendar("client_a")
+    user = await s.given_user("alice", main="main", clients=["client_a"])
+    db = await s.setup_db()
+    ccid = user.client_calendar_ids["client_a"]
+    base = "multirec0001"
+    new_id = f"{base}_R20260601T160000"
+
+    # The occurrence already has its OWN ledger row.
+    own = await _insert_series(
+        db, user_id=user.user_id,
+        canonical_uid=canonical_uid_client(ccid, new_id),
+        source_type="client", source_calendar_id=ccid,
+        source_event_id=new_id,
+    )
+    # A sibling row (the base series) the lookup will match first —
+    # bump its updated_at so ORDER BY updated_at DESC picks it, not the
+    # row that already owns new_id's canonical.
+    sibling = await _insert_series(
+        db, user_id=user.user_id,
+        canonical_uid=canonical_uid_client(ccid, base),
+        source_type="client", source_calendar_id=ccid,
+        source_event_id=base,
+    )
+    await db.execute(
+        "UPDATE ledger_events SET updated_at = '2027-01-01T00:00:00Z' WHERE id = ?",
+        (sibling,),
+    )
+    await db.commit()
+
+    # Must NOT raise UNIQUE; must skip the re-key.
+    rekeyed = await _try_rekey_R_parent(
+        db,
+        user_id=user.user_id,
+        source_type="client",
+        source_calendar_id=ccid,
+        new_event_id=new_id,
+        canonical_for=lambda eid: canonical_uid_client(ccid, eid),
+    )
+    assert rekeyed is None
+    # Both rows keep their original canonical_uids — nothing clobbered.
+    assert (await _row(db, own))["canonical_uid"] == canonical_uid_client(ccid, new_id)
+    assert (await _row(db, sibling))["canonical_uid"] == canonical_uid_client(ccid, base)
+    await s.close()
