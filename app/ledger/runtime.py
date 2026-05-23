@@ -39,6 +39,7 @@ import aiosqlite
 
 from app.auth.google import build_user_credentials
 from app.database import get_database
+from app.ledger.async_google import as_async_google, production_rate_limiter
 from app.ledger.google_router import GoogleRouter
 from app.ledger.reconciler import reconcile_user
 from app.ledger.real_google_client import RealGoogleClient
@@ -346,7 +347,15 @@ async def build_user_google_access(
         else:
             by_calendar[row["google_calendar_id"]] = client
 
-    router = GoogleRouter(default=home_client, by_calendar=by_calendar)
+    # Wrap the router (the single funnel for every real Google call this
+    # reconcile makes) in the async adapter with the shared production
+    # rate limiter, so bulk drains / full-sync ingests are paced under
+    # Google's quota instead of triggering rateLimitExceeded storms.
+    # Downstream as_async_google() calls are idempotent and keep it.
+    router = as_async_google(
+        GoogleRouter(default=home_client, by_calendar=by_calendar),
+        limiter=production_rate_limiter(),
+    )
 
     # Ingest only active calendars whose account is reachable.
     active_clients: list[dict] = []
