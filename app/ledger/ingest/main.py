@@ -34,7 +34,10 @@ from app.ledger.identity import (
     derive_instance_google_event_id,
     is_managed_google_event_id,
 )
-from app.ledger.payload import render_payload, strip_managed_tag
+from app.ledger.payload import (
+    render_payload,
+    strip_full_copy_metadata,
+)
 from app.ledger.ingest.client import (
     _content_hash,
     _content_hash_from_row,
@@ -487,9 +490,9 @@ async def _ingest_managed_recurring_instance(
     fields["user_can_edit"] = bool(parent["user_can_edit"])
     fields["organizer_email"] = parent["organizer_email"]
     fields["attendees_json"] = parent["attendees_json"]
-    # The dragged copy carries our description tag; strip it so the
-    # instance row (and any write-back to the source) stays clean.
-    fields["description"] = strip_managed_tag(fields["description"])
+    # The dragged copy carries our description tag + footer; strip both
+    # so the instance row (and any write-back to the source) stays clean.
+    fields["description"] = strip_full_copy_metadata(fields["description"])
 
     outcome, ledger_id = await _ingest_instance(
         db,
@@ -548,8 +551,20 @@ async def _maybe_apply_main_edit_back(
     planner re-render the canonical copy and the diff revert the
     drift on the main calendar.
     """
+    # Join the source calendar (color + label) so the canonical render
+    # below matches the body we actually wrote to main — otherwise our
+    # own footer ("Source: …") reads as a user edit and churns.  Scoped
+    # to client/personal because source_calendar_id is a webcal
+    # subscription id for webcal sources.
     ledger = await (await db.execute(
-        "SELECT * FROM ledger_events WHERE id = ?",
+        """SELECT e.*,
+                  cc.color_id AS calendar_color_id,
+                  cc.display_name AS source_label
+             FROM ledger_events e
+             LEFT JOIN client_calendars cc
+                    ON cc.id = e.source_calendar_id
+                   AND e.source_type IN ('client', 'personal')
+            WHERE e.id = ?""",
         (ledger_event_id,),
     )).fetchone()
     if ledger is None:
@@ -628,7 +643,7 @@ async def _maybe_apply_main_edit_back(
             apply_time, new_end_tz,
             is_all_day if apply_time else None,
             apply_detail, event.get("summary"),
-            apply_detail, strip_managed_tag(event.get("description")),
+            apply_detail, strip_full_copy_metadata(event.get("description")),
             apply_detail, event.get("location"),
             when, ledger_event_id,
         ),

@@ -43,6 +43,20 @@ LOCK_PREFIX = "🔒 "
 BUSY_SUMMARY = "Busy"
 PERSONAL_BUSY_SUMMARY = "Busy (personal)"
 
+# Guest-list block appended to a main copy's description (v1 parity).
+_ATTENDEE_LIST_LIMIT = 15
+_RSVP_ICON = {
+    "accepted": "✅",
+    "declined": "❌",
+    "tentative": "❓",
+    "needsAction": "⏳",
+}
+_RSVP_WORD = {
+    "declined": "declined",
+    "tentative": "tentative",
+    "needsAction": "no response",
+}
+
 # Extended-property keys we stamp onto every payload as
 # defence-in-depth.  Primary identification is via
 # ledger_projections.google_event_id, but the props let an
@@ -134,15 +148,23 @@ def _render_full_copy(
     if not row.get("user_can_edit"):
         summary = LOCK_PREFIX + summary
     body["summary"] = summary
-    desc = _tag_description(row.get("description"))
+    desc = _full_copy_description(row)
     if desc:
         body["description"] = desc
     if row.get("location"):
         body["location"] = row["location"]
     body["start"] = _start_dict(row)
     body["end"] = _end_dict(row)
-    if row.get("color_id"):
-        body["colorId"] = row["color_id"]
+    # Colour the copy by its SOURCE CALENDAR so events from different
+    # clients are visually distinct on main — the colour the user
+    # picked in the UI (client_calendars.color_id), supplied by the
+    # planner/diff as ``calendar_color_id`` via a join.  Reading it at
+    # render time makes it immune to ingest overwriting the event's own
+    # (usually empty) colorId.  Falls back to the event's own colour
+    # for sources with no assigned calendar colour (native main).
+    color = row.get("calendar_color_id") or row.get("color_id")
+    if color:
+        body["colorId"] = color
     if row.get("show_as") == "free":
         body["transparency"] = "transparent"
     if row.get("recurrence_rule_json"):
@@ -277,6 +299,150 @@ def managed_tag() -> str:
     ``MANAGED_EVENT_PREFIX``; an empty value disables tagging.
     """
     return (get_settings().managed_event_prefix or "").strip()
+
+
+def _attendee_display_name(att: dict) -> str:
+    """Display name for an attendee, falling back to a Title-Cased
+    local-part of the email when displayName is absent."""
+    name = (att.get("displayName") or "").strip()
+    if name:
+        return name
+    email = (att.get("email") or "").strip()
+    if not email:
+        return ""
+    local = email.split("@", 1)[0]
+    cleaned = local.replace("-", " ").replace("_", " ").replace(".", " ")
+    parts = [p for p in cleaned.split() if p]
+    return " ".join(p.capitalize() for p in parts) if parts else email
+
+
+def _format_attendee_block(attendees: list) -> Optional[str]:
+    """Multi-line guest list for the main-copy description (v1 parity).
+
+    Built purely from the stored attendee list with no caller context,
+    so the planner's hash and the diff's send body are identical.  The
+    user's own entry (``self``) and resource rooms are dropped; returns
+    None when nothing survives filtering.
+    """
+    if not attendees:
+        return None
+    filtered = []
+    for att in attendees:
+        if att.get("self") or att.get("resource"):
+            continue
+        if not (att.get("email") or "").strip() and not (
+            att.get("displayName") or ""
+        ).strip():
+            continue
+        filtered.append(att)
+    if not filtered:
+        return None
+    counts = {"accepted": 0, "declined": 0, "tentative": 0, "needsAction": 0}
+    for att in filtered:
+        status = att.get("responseStatus") or "needsAction"
+        counts[status if status in counts else "needsAction"] += 1
+    summary = (
+        f"Attendees ({len(filtered)}): {counts['accepted']} yes, "
+        f"{counts['declined']} no, {counts['tentative']} maybe, "
+        f"{counts['needsAction']} pending"
+    )
+    visible = filtered[:_ATTENDEE_LIST_LIMIT]
+    overflow = len(filtered) - len(visible)
+    lines = []
+    for att in visible:
+        status = att.get("responseStatus") or "needsAction"
+        if status not in _RSVP_ICON:
+            status = "needsAction"
+        line = (
+            f"{_RSVP_ICON[status]} "
+            f"{_attendee_display_name(att) or (att.get('email') or '').strip()}"
+        )
+        if att.get("organizer"):
+            line += " (organizer)"
+        word = _RSVP_WORD.get(status)
+        if word:
+            line += f" — {word}"
+        if att.get("optional"):
+            line += " (optional)"
+        lines.append(line)
+    if overflow > 0:
+        lines.append(f"… and {overflow} more on the original event")
+    emails = [e for e in ((a.get("email") or "").strip() for a in filtered) if e]
+    parts = [summary, "", *lines]
+    if emails:
+        parts.extend(["", "Emails: " + ", ".join(emails)])
+    return "\n".join(parts)
+
+
+_FOOTER_DELIM = "\n\n---\n"
+# A footer section always opens with one of these markers, so the
+# stripper can tell our appended metadata from a user's own "---"
+# rule that happens to sit in their description.
+_FOOTER_MARKERS = ("Attendees (", "Source:", "Original event:")
+
+
+def _full_copy_metadata(row: dict) -> str:
+    """The footer BusyBridge appends to a full copy's description: the
+    guest list plus a ``Source:`` / ``Original event`` trailer.  Empty
+    string when there is nothing to add.  Built only from the ledger
+    row (and its joined source calendar) so the planner hash and the
+    diff send body are identical."""
+    sections: list[str] = []
+    raw = row.get("attendees_json")
+    try:
+        attendees = json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        attendees = []
+    block = _format_attendee_block(attendees)
+    if block:
+        sections.append(block)
+    trailer: list[str] = []
+    label = (row.get("source_label") or "").strip()
+    if label:
+        if len(label) > 80:
+            label = label[:77] + "..."
+        trailer.append(f"Source: {label}")
+    link = (row.get("source_html_link") or "").strip()
+    if link:
+        trailer.append(f"Original event: {link}")
+    if trailer:
+        sections.append("\n".join(trailer))
+    return "\n\n".join(sections)
+
+
+def _full_copy_description(row: dict) -> Optional[str]:
+    """Description for a full copy on main: the source body, the footer
+    metadata, then the managed tag — v1's copy_event_for_main layout."""
+    base = (row.get("description") or "").rstrip()
+    meta = _full_copy_metadata(row)
+    if meta:
+        body = f"{base}{_FOOTER_DELIM}{meta}" if base else meta
+    else:
+        body = base or None
+    return _tag_description(body)
+
+
+def strip_full_copy_metadata(description: Optional[str]) -> Optional[str]:
+    """Recover the user's own description from a full copy on main by
+    removing the managed tag and the footer BusyBridge appended.
+
+    Used when a description edit on the main copy is propagated back to
+    the source, so our guest-list / ``Source:`` footer never leaks onto
+    the user's real event.  Row-independent: it recognises the footer
+    by its delimiter plus a leading marker, so it works wherever a
+    managed copy is read back, even without the source-calendar join."""
+    desc = strip_managed_tag(description)
+    if not desc:
+        return desc
+    # Body-less copy: the description was the footer alone.
+    if desc.lstrip().startswith(_FOOTER_MARKERS):
+        return None
+    idx = desc.rfind(_FOOTER_DELIM)
+    if idx != -1:
+        footer = desc[idx + len(_FOOTER_DELIM):]
+        if footer.lstrip().startswith(_FOOTER_MARKERS):
+            return desc[:idx] or None
+    return desc
 
 
 def _tag_description(description: Optional[str]) -> Optional[str]:

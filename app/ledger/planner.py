@@ -367,8 +367,21 @@ async def _mark_implicit_absent(
 # Helpers
 # ---------------------------------------------------------------------------
 async def _get_ledger_row(db: aiosqlite.Connection, ledger_event_id: int):
+    # Join the source calendar so the renderer can colour the copy by
+    # the calendar the user picked in the UI (calendar_color_id) and
+    # label its description with the source name (source_label).  Both
+    # are read at render time so they stay consistent with the diff's
+    # send body (which joins the same way) — keeping the payload hash
+    # stable.
     row = await (await db.execute(
-        "SELECT * FROM ledger_events WHERE id = ?",
+        """SELECT e.*,
+                  cc.color_id AS calendar_color_id,
+                  cc.display_name AS source_label
+             FROM ledger_events e
+             LEFT JOIN client_calendars cc
+                    ON cc.id = e.source_calendar_id
+                   AND e.source_type IN ('client', 'personal')
+            WHERE e.id = ?""",
         (int(ledger_event_id),),
     )).fetchone()
     if row is None:

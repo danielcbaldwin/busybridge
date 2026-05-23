@@ -159,9 +159,10 @@ async def test_mirrored_writes_are_tagged_but_source_is_not():
     )
     await s.run_reconciler("alice")
 
-    # Full copy on main carries the tag appended to the real description.
+    # Full copy on main carries the real description, then the
+    # source-calendar footer, then the managed tag.
     main_desc = _desc(s, "main", "Quarterly review")
-    assert main_desc == f"bring the deck\n\n{TAG}"
+    assert main_desc == f"bring the deck\n\n---\nSource: client_a\n\n{TAG}"
 
     # Peer busy block is tagged.
     peer_desc = _desc(s, "client_b", "Busy")
@@ -197,10 +198,13 @@ async def test_edit_on_tagged_main_copy_does_not_leak_tag_to_source():
     assert src_desc == "weekly sync — moved to Tuesdays"
     assert TAG not in src_desc
 
-    # The main copy still has exactly one tag (re-rendered), and the
-    # ledger stored the clean description (no tag, no doubling).
+    # The main copy still has exactly one tag (re-rendered, footer
+    # re-applied), and the ledger stored the clean description (no tag,
+    # no footer, no doubling).
     main_desc = _desc(s, "main", "1:1")
-    assert main_desc == f"weekly sync — moved to Tuesdays\n\n{TAG}"
+    assert main_desc == (
+        f"weekly sync — moved to Tuesdays\n\n---\nSource: client_a\n\n{TAG}"
+    )
     assert main_desc.count(TAG) == 1
 
     db = await s.setup_db()

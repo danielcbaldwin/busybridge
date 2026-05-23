@@ -112,9 +112,14 @@ async def diff_and_enqueue_for_user(
                               e.parent_canonical_uid,
                               e.recurrence_instance_original_start,
                               e.source_type, e.source_calendar_id,
-                              e.attendees_json
+                              e.attendees_json,
+                              cc.color_id AS calendar_color_id,
+                              cc.display_name AS source_label
                          FROM ledger_projections p
                          JOIN ledger_events e ON e.id = p.ledger_event_id
+                         LEFT JOIN client_calendars cc
+                                ON cc.id = e.source_calendar_id
+                               AND e.source_type IN ('client', 'personal')
                         WHERE p.id = ?""",
                     (int(proj["id"]),),
                 )).fetchone()
@@ -193,9 +198,14 @@ async def _diverged_projections(
                   e.recurrence_rule_json, e.version AS ledger_version,
                   e.parent_canonical_uid,
                   e.recurrence_instance_original_start,
-                  e.source_type, e.source_calendar_id, e.attendees_json
+                  e.source_type, e.source_calendar_id, e.attendees_json,
+                  cc.color_id AS calendar_color_id,
+                  cc.display_name AS source_label
              FROM ledger_projections p
              JOIN ledger_events e ON e.id = p.ledger_event_id
+             LEFT JOIN client_calendars cc
+                    ON cc.id = e.source_calendar_id
+                   AND e.source_type IN ('client', 'personal')
             WHERE e.user_id = ?
               AND (p.applied_ledger_version IS NULL
                    OR p.applied_ledger_version != p.desired_ledger_version
@@ -337,6 +347,8 @@ def _proj_row_to_ledger_dict(proj) -> dict:
         "recurrence_rule_json": proj["recurrence_rule_json"],
         "attendees_json": proj["attendees_json"],
         "source_type": proj["source_type"],
+        "calendar_color_id": proj["calendar_color_id"],
+        "source_label": proj["source_label"],
     }
 
 
