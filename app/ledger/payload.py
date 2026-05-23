@@ -30,6 +30,8 @@ import hashlib
 import json
 from typing import Any, Optional
 
+from app.config import get_settings
+
 # State constants — keep in sync with planner.py.
 PRESENT_FULL = "present_full"
 PRESENT_BUSY = "present_busy"
@@ -127,8 +129,9 @@ def _render_full_copy(row: dict, target_kind: Optional[str] = None) -> dict:
     if not row.get("user_can_edit"):
         summary = LOCK_PREFIX + summary
     body["summary"] = summary
-    if row.get("description"):
-        body["description"] = row["description"]
+    desc = _tag_description(row.get("description"))
+    if desc:
+        body["description"] = desc
     if row.get("location"):
         body["location"] = row["location"]
     body["start"] = _start_dict(row)
@@ -159,6 +162,9 @@ def _render_busy_block(row: dict) -> dict:
         "transparency": "opaque",
         "visibility": "private",
     }
+    desc = _tag_description(None)
+    if desc:
+        body["description"] = desc
     if row.get("recurrence_rule_json"):
         body["recurrence"] = json.loads(row["recurrence_rule_json"])
     return body
@@ -174,6 +180,9 @@ def _render_personal_busy(row: dict) -> dict:
         "transparency": "opaque",
         "visibility": "private",
     }
+    desc = _tag_description(None)
+    if desc:
+        body["description"] = desc
     if row.get("recurrence_rule_json"):
         body["recurrence"] = json.loads(row["recurrence_rule_json"])
     return body
@@ -242,6 +251,45 @@ def _rsvp_attendees(row: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def managed_tag() -> str:
+    """Visible marker appended to the DESCRIPTION of every event
+    BusyBridge writes, so a user can find — and worst-case bulk
+    delete — all of them by searching their calendar for the tag.
+
+    It lives in the description, not the title, so events still read
+    normally at a glance while remaining searchable.  Configurable via
+    ``MANAGED_EVENT_PREFIX``; an empty value disables tagging.
+    """
+    return (get_settings().managed_event_prefix or "").strip()
+
+
+def _tag_description(description: Optional[str]) -> Optional[str]:
+    """Append the managed tag on its own trailing line.  Returns the
+    description unchanged when tagging is disabled."""
+    tag = managed_tag()
+    if not tag:
+        return description
+    base = (description or "").rstrip()
+    return f"{base}\n\n{tag}" if base else tag
+
+
+def strip_managed_tag(description: Optional[str]) -> Optional[str]:
+    """Inverse of :func:`_tag_description`: remove a trailing managed
+    tag.  Applied when reading one of our OWN copies back (edit-on-main
+    detection, managed-instance re-ingest) so the tag never leaks into
+    the ledger or onto the user's real source event.  ``None`` when
+    nothing but the tag remains."""
+    tag = managed_tag()
+    if not tag or not description:
+        return description
+    stripped = description.rstrip()
+    if stripped == tag:
+        return None
+    if stripped.endswith(tag):
+        return stripped[: -len(tag)].rstrip() or None
+    return description
+
+
 def _start_dict(row: dict) -> dict:
     if row.get("is_all_day"):
         return {"date": row["start_at"]}

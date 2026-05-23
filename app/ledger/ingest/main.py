@@ -34,7 +34,7 @@ from app.ledger.identity import (
     derive_instance_google_event_id,
     is_managed_google_event_id,
 )
-from app.ledger.payload import render_payload
+from app.ledger.payload import render_payload, strip_managed_tag
 from app.ledger.ingest.client import (
     _content_hash,
     _content_hash_from_row,
@@ -487,6 +487,9 @@ async def _ingest_managed_recurring_instance(
     fields["user_can_edit"] = bool(parent["user_can_edit"])
     fields["organizer_email"] = parent["organizer_email"]
     fields["attendees_json"] = parent["attendees_json"]
+    # The dragged copy carries our description tag; strip it so the
+    # instance row (and any write-back to the source) stays clean.
+    fields["description"] = strip_managed_tag(fields["description"])
 
     outcome, ledger_id = await _ingest_instance(
         db,
@@ -625,7 +628,7 @@ async def _maybe_apply_main_edit_back(
             apply_time, new_end_tz,
             is_all_day if apply_time else None,
             apply_detail, event.get("summary"),
-            apply_detail, event.get("description"),
+            apply_detail, strip_managed_tag(event.get("description")),
             apply_detail, event.get("location"),
             when, ledger_event_id,
         ),
