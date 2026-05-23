@@ -11,11 +11,41 @@ A full copy of a client event on the main calendar must:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from app.ledger.payload import PRESENT_FULL, render_payload
 from tests.integration.framework import Scenario
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_main_copy_carries_conference_data_and_original_link():
+    """Meet/Zoom data and a link back to the source event are copied
+    onto the main copy (REWRITE_PLAN.md §9 / v1 parity)."""
+    conf = {
+        "conferenceId": "abc-defg-hij",
+        "entryPoints": [
+            {"entryPointType": "video", "uri": "https://meet.google.com/abc"},
+        ],
+    }
+    row = {
+        "summary": "Standup", "description": "notes", "is_all_day": 0,
+        "start_at": "2026-03-03T09:00:00Z", "end_at": "2026-03-03T09:15:00Z",
+        "user_can_edit": 1, "source_type": "client", "source_label": "client_a",
+        "conference_data_json": json.dumps(conf),
+        "source_html_link": "https://www.google.com/calendar/event?eid=xyz",
+    }
+    body = render_payload(
+        desired_state=PRESENT_FULL, ledger_row=row, projection_id=1,
+        target_kind="main", main_calendar_email="m@example.com",
+    )
+    assert body["conferenceData"] == conf
+    assert (
+        "Original event: https://www.google.com/calendar/event?eid=xyz"
+        in body["description"]
+    )
 
 
 async def test_main_copy_colored_by_calendar_and_lists_attendees():
@@ -54,6 +84,46 @@ async def test_main_copy_colored_by_calendar_and_lists_attendees():
     assert "Attendees (2): 1 yes, 1 no" in desc
     assert "Bob" in desc
     assert "Source: client_a" in desc
+    await s.close()
+
+
+async def test_conference_data_copied_and_no_churn_across_sources():
+    """The Meet link reaches the main copy, and storing conferenceData /
+    html_link in every ingest path (client + personal + main) keeps a
+    second reconcile a no-op — a missed write site would churn here."""
+    conf = {
+        "conferenceId": "x-y-z",
+        "entryPoints": [
+            {"entryPointType": "video", "uri": "https://meet.google.com/xyz"},
+        ],
+    }
+    s = Scenario()
+    s.given_calendar("main")
+    s.given_calendar("client_a")
+    s.given_calendar("personal_a")
+    await s.given_user(
+        "alice", main="main", clients=["client_a"], personals=["personal_a"],
+    )
+    s.given_event(
+        "client_a", summary="Client call", start="2026-03-03T09:00:00Z",
+        conference_data=conf,
+        attendees=[{"email": "alice@example.com", "self": True,
+                    "responseStatus": "accepted"}],
+    )
+    s.given_event(
+        "personal_a", summary="Personal call", start="2026-03-04T09:00:00Z",
+        conference_data=conf,
+    )
+    await s.run_reconciler("alice")
+
+    copy = s.assert_event_exists("main", summary_contains="Client call")
+    assert copy.get("conferenceData") == conf
+
+    # A second pass must be a no-op: nothing re-enqueued, nothing drained.
+    out = await s.run_reconciler("alice")
+    assert out.get("drain", {}).get("succeeded", 0) == 0, (
+        f"conference data / html link caused churn: {out}"
+    )
     await s.close()
 
 

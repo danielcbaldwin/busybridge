@@ -113,6 +113,7 @@ async def diff_and_enqueue_for_user(
                               e.recurrence_instance_original_start,
                               e.source_type, e.source_calendar_id,
                               e.attendees_json,
+                              e.conference_data_json, e.source_html_link,
                               cc.color_id AS calendar_color_id,
                               cc.display_name AS source_label
                          FROM ledger_projections p
@@ -199,6 +200,7 @@ async def _diverged_projections(
                   e.parent_canonical_uid,
                   e.recurrence_instance_original_start,
                   e.source_type, e.source_calendar_id, e.attendees_json,
+                  e.conference_data_json, e.source_html_link,
                   cc.color_id AS calendar_color_id,
                   cc.display_name AS source_label
              FROM ledger_projections p
@@ -349,6 +351,8 @@ def _proj_row_to_ledger_dict(proj) -> dict:
         "source_type": proj["source_type"],
         "calendar_color_id": proj["calendar_color_id"],
         "source_label": proj["source_label"],
+        "conference_data_json": proj["conference_data_json"],
+        "source_html_link": proj["source_html_link"],
     }
 
 

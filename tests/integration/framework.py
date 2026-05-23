@@ -139,6 +139,7 @@ class Scenario:
         transparency: Optional[str] = None,
         location: Optional[str] = None,
         description: Optional[str] = None,
+        conference_data: Optional[dict] = None,
     ) -> dict:
         """Insert a single (non-recurring) event onto a calendar.
 
@@ -153,6 +154,7 @@ class Scenario:
             transparency=transparency,
             location=location,
             description=description,
+            conference_data=conference_data,
         )
         if event_id is not None:
             body["id"] = event_id
@@ -398,6 +400,7 @@ class Scenario:
         transparency: Optional[str] = None,
         location: Optional[str] = None,
         description: Optional[str] = None,
+        conference_data: Optional[dict] = None,
         timezone: str = "UTC",
     ) -> dict:
         start_iso = _coerce_iso(start)
@@ -436,6 +439,8 @@ class Scenario:
             body["location"] = location
         if description is not None:
             body["description"] = description
+        if conference_data is not None:
+            body["conferenceData"] = conference_data
         return body
 
     @staticmethod

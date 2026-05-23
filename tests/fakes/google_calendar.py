@@ -126,6 +126,7 @@ class _StoredEvent:
     sequence: int
     # Internal: monotonic per-calendar; used by incremental sync.
     change_seq: int = 0
+    conference_data: Optional[dict] = None
 
     def to_api_dict(self) -> dict:
         """Render as the dict shape Google's API returns."""
@@ -168,6 +169,8 @@ class _StoredEvent:
             out["originalStartTime"] = copy.deepcopy(self.original_start_time)
         if self.guests_can_modify is not None:
             out["guestsCanModify"] = self.guests_can_modify
+        if self.conference_data is not None:
+            out["conferenceData"] = copy.deepcopy(self.conference_data)
         return out
 
 
@@ -451,6 +454,7 @@ class FakeGoogleCalendar:
             updated=now_iso,
             sequence=int(body.get("sequence", 0) or 0),
             change_seq=cal.change_counter,
+            conference_data=copy.deepcopy(body.get("conferenceData")),
         )
         cal.events[event_id] = ev
         self._check_post_write("insert")
@@ -528,6 +532,7 @@ class FakeGoogleCalendar:
         if "originalStartTime" in body:
             ev.original_start_time = copy.deepcopy(body["originalStartTime"])
         ev.guests_can_modify = body.get("guestsCanModify")
+        ev.conference_data = copy.deepcopy(body.get("conferenceData"))
         ev.updated = now_iso
         ev.sequence += 1
         ev.etag = _new_etag()

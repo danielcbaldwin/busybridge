@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS ledger_events (
     user_rsvp_status TEXT,
     attendees_json TEXT,
     conference_data_json TEXT,
+    source_html_link TEXT,
     attachments_json TEXT,
     recurrence_rule_json TEXT,
     recurrence_instance_original_start TEXT,
@@ -237,6 +238,9 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
         "ADD COLUMN origin_writeback_pending BOOLEAN DEFAULT FALSE",
         "ALTER TABLE ledger_events "
         "ADD COLUMN source_delete_pending BOOLEAN DEFAULT FALSE",
+        # Link back to the source event, shown in the main copy's
+        # description footer ("Original event: …").
+        "ALTER TABLE ledger_events ADD COLUMN source_html_link TEXT",
     ):
         try:
             await db.execute(stmt)

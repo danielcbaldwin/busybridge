@@ -565,7 +565,7 @@ async def _ingest_instance(
                    is_all_day,
                    show_as, visibility, color_id,
                    organizer_email, user_can_edit, user_rsvp_status,
-                   attendees_json,
+                   attendees_json, conference_data_json, source_html_link,
                    status, is_recurring, version,
                    created_at, updated_at, last_seen_at)
                VALUES (?, ?, ?,
@@ -576,7 +576,7 @@ async def _ingest_instance(
                        ?,
                        ?, ?, ?,
                        ?, ?, ?,
-                       ?,
+                       ?, ?, ?,
                        'active', 0, 1,
                        ?, ?, ?)""",
             (
@@ -591,7 +591,8 @@ async def _ingest_instance(
                 fields["show_as"], fields["visibility"], fields["color_id"],
                 fields["organizer_email"], fields["user_can_edit"],
                 fields["user_rsvp_status"],
-                fields["attendees_json"],
+                fields["attendees_json"], fields["conference_data_json"],
+                fields["source_html_link"],
                 when, when, when,
             ),
         )
@@ -615,6 +616,7 @@ async def _ingest_instance(
                   organizer_email = ?, user_can_edit = ?,
                   user_rsvp_status = ?,
                   attendees_json = ?,
+                  conference_data_json = ?, source_html_link = ?,
                   status = 'active',
                   version = version + 1,
                   updated_at = ?, last_seen_at = ?
@@ -629,6 +631,7 @@ async def _ingest_instance(
             fields["organizer_email"], fields["user_can_edit"],
             fields["user_rsvp_status"],
             fields["attendees_json"],
+            fields["conference_data_json"], fields["source_html_link"],
             when, when, int(existing["id"]),
         ),
     )
@@ -659,6 +662,7 @@ async def _insert_ledger_row(
                show_as, visibility, color_id,
                organizer_email, user_can_edit, user_rsvp_status,
                attendees_json, recurrence_rule_json,
+               conference_data_json, source_html_link,
                status, is_recurring, version,
                created_at, updated_at, last_seen_at)
            VALUES (?, ?,
@@ -668,6 +672,7 @@ async def _insert_ledger_row(
                    ?, ?, ?, ?, ?,
                    ?, ?, ?,
                    ?, ?, ?,
+                   ?, ?,
                    ?, ?,
                    'active', ?, 1,
                    ?, ?, ?)""",
@@ -683,6 +688,7 @@ async def _insert_ledger_row(
             fields["organizer_email"], fields["user_can_edit"],
             fields["user_rsvp_status"],
             fields["attendees_json"], fields["recurrence_rule_json"],
+            fields["conference_data_json"], fields["source_html_link"],
             fields["is_recurring"],
             when, when, when,
         ),
@@ -730,6 +736,7 @@ async def _apply_event_to_ledger(
                   organizer_email = ?, user_can_edit = ?,
                   user_rsvp_status = ?,
                   attendees_json = ?, recurrence_rule_json = ?,
+                  conference_data_json = ?, source_html_link = ?,
                   is_recurring = ?,
                   status = 'active',
                   version = version + 1,
@@ -746,6 +753,7 @@ async def _apply_event_to_ledger(
             fields["organizer_email"], fields["user_can_edit"],
             fields["user_rsvp_status"],
             fields["attendees_json"], fields["recurrence_rule_json"],
+            fields["conference_data_json"], fields["source_html_link"],
             fields["is_recurring"],
             when, when, ledger_event_id,
         ),
@@ -920,6 +928,14 @@ def _extract_event_fields(event: dict, *, user_email: str) -> dict:
             json.dumps(event["recurrence"]) if event.get("recurrence") else None
         ),
         "is_recurring": bool(event.get("recurrence")),
+        # Video-call data (Meet/Zoom) and a link back to the real event,
+        # carried onto the main copy.  In the content hash so a source
+        # change (or first capture after the column was added) re-renders.
+        "conference_data_json": (
+            json.dumps(event["conferenceData"])
+            if event.get("conferenceData") else None
+        ),
+        "source_html_link": event.get("htmlLink"),
     }
 
 
@@ -955,6 +971,8 @@ def _content_hash_from_row(row) -> str:
         "attendees_json": row["attendees_json"],
         "recurrence_rule_json": row["recurrence_rule_json"],
         "is_recurring": bool(row["is_recurring"]),
+        "conference_data_json": row["conference_data_json"],
+        "source_html_link": row["source_html_link"],
     }
     return _content_hash(fields)
 

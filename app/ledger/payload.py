@@ -169,6 +169,16 @@ def _render_full_copy(
         body["transparency"] = "transparent"
     if row.get("recurrence_rule_json"):
         body["recurrence"] = json.loads(row["recurrence_rule_json"])
+    # Carry the source event's video-call (Meet/Zoom) data so the join
+    # link is on the main copy too.  Sent with conferenceDataVersion=1
+    # (set on the Google insert/update), which preserves the existing
+    # entry points rather than minting a new conference.
+    raw_conf = row.get("conference_data_json")
+    if raw_conf:
+        try:
+            body["conferenceData"] = json.loads(raw_conf)
+        except (TypeError, ValueError):
+            pass
     # On the main copy, carry the user as an attendee with their
     # stored RSVP (REWRITE_PLAN.md §9) so they can see and change
     # their response there.  An RSVP set on the main copy is
