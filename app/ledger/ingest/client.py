@@ -944,11 +944,42 @@ def _user_is_organizer(event: dict, user_email: str) -> bool:
     return (organizer.get("email") or "").lower() == user_email.lower()
 
 
-def _content_hash(fields: dict) -> str:
-    canonical = json.dumps(
-        {k: fields[k] for k in sorted(fields)},
-        sort_keys=True, separators=(",", ":"),
+# Fields hashed via a normalised form rather than their raw value.
+# The raw conferenceData JSON varies between Google reads (entry-point
+# order / volatile sub-fields), so hashing it verbatim makes every Meet
+# event look "changed" on every sync — an endless version-bump →
+# re-plan → re-send churn.  Instead we hash a stable SIGNATURE (the
+# conference id + the actual entry-point URIs, sorted): a genuine
+# Meet-link change IS detected and re-synced, the serialisation noise
+# is not.  htmlLink is stable and display-only, so it is dropped from
+# change detection entirely.  Both are still stored and rendered in full.
+_HASH_EXCLUDE = frozenset({"conference_data_json", "source_html_link"})
+
+
+def _conference_signature(conf_json: Optional[str]) -> str:
+    """Stable identity of a conferenceData blob — its conference id and
+    the sorted set of entry-point URIs — ignoring ordering and volatile
+    sub-fields.  Falls back to the raw value if it isn't parseable."""
+    if not conf_json:
+        return ""
+    try:
+        data = json.loads(conf_json)
+    except (TypeError, ValueError):
+        return conf_json
+    uris = sorted(
+        (ep.get("uri") or "") for ep in (data.get("entryPoints") or [])
     )
+    return (data.get("conferenceId") or "") + "|" + "|".join(uris)
+
+
+def _content_hash(fields: dict) -> str:
+    hashable = {k: fields[k] for k in sorted(fields) if k not in _HASH_EXCLUDE}
+    if fields.get("conference_data_json"):
+        # Detect a real Meet-link change without churning on read noise.
+        hashable["conference_sig"] = _conference_signature(
+            fields["conference_data_json"]
+        )
+    canonical = json.dumps(hashable, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

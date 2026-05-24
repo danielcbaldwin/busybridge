@@ -21,6 +21,44 @@ from tests.integration.framework import Scenario
 pytestmark = pytest.mark.asyncio
 
 
+async def test_content_hash_conference_data_signature():
+    """conferenceData change detection uses a normalised signature.
+
+    Google's conferenceData serialisation varies between reads, so
+    hashing it verbatim makes every Meet event churn.  Read-noise
+    (entry-point order, extra labels) must hash identically, but a
+    GENUINE Meet-link change (a different entry-point URI) must be
+    detected so the new link propagates — and so must a real field.
+    htmlLink is display-only and never drives a bump.
+    """
+    from app.ledger.ingest.client import _content_hash
+
+    base = {
+        "summary": "Sync", "start_at": "2026-03-03T09:00:00Z",
+        "conference_data_json":
+            '{"entryPoints":[{"uri":"https://meet.google.com/abc"}]}',
+        "source_html_link": "https://cal/eid=1",
+    }
+    # Read-noise (reordered/extra labels) + different htmlLink → same hash.
+    noise = dict(
+        base,
+        conference_data_json=(
+            '{"conferenceSolution":{"name":"Meet"},'
+            '"entryPoints":[{"label":"x","uri":"https://meet.google.com/abc"}]}'
+        ),
+        source_html_link="https://cal/eid=2",
+    )
+    assert _content_hash(base) == _content_hash(noise)
+    # A genuinely different Meet link → different hash (must re-sync).
+    new_link = dict(
+        base,
+        conference_data_json='{"entryPoints":[{"uri":"https://meet.google.com/xyz"}]}',
+    )
+    assert _content_hash(base) != _content_hash(new_link)
+    # A real field change → different hash.
+    assert _content_hash(base) != _content_hash(dict(base, summary="Changed"))
+
+
 async def test_main_copy_carries_conference_data_and_original_link():
     """Meet/Zoom data and a link back to the source event are copied
     onto the main copy (REWRITE_PLAN.md §9 / v1 parity)."""
