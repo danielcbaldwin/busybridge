@@ -276,6 +276,20 @@ def _validate_attendees(body: dict) -> None:
             raise _bad_request("Missing attendee email. [required]")
 
 
+def _can_revive_cancelled(ev: "_Event", body: dict) -> bool:
+    """Whether a cancelled event may be revived by this write.
+
+    Mirrors real Google: a cancelled *instance exception* (it carries a
+    ``recurringEventId``) can be brought back by updating/patching it to
+    a non-cancelled status — Google re-creates that occurrence.  A
+    cancelled *top-level* event stays gone (the write 404s).  ``body``
+    without an explicit ``status`` defaults to ``confirmed`` (a revive).
+    """
+    if ev.recurring_event_id is None:
+        return False
+    return body.get("status", "confirmed") != "cancelled"
+
+
 def _new_etag() -> str:
     """Issue a fresh opaque ETag string."""
     return f'"{uuid.uuid4().hex}"'
@@ -505,7 +519,7 @@ class FakeGoogleCalendar:
             ev = self._materialize_instance_override(cal, event_id)
             if ev is None:
                 raise _not_found(f"event {event_id} not found on {calendar_id}")
-        if ev.status == "cancelled":
+        if ev.status == "cancelled" and not _can_revive_cancelled(ev, body):
             raise _not_found(f"event {event_id} not found on {calendar_id}")
         self._check_if_match(ev, if_match)
 
@@ -559,7 +573,7 @@ class FakeGoogleCalendar:
             ev = self._materialize_instance_override(cal, event_id)
             if ev is None:
                 raise _not_found(f"event {event_id} not found on {calendar_id}")
-        if ev.status == "cancelled":
+        if ev.status == "cancelled" and not _can_revive_cancelled(ev, body):
             raise _not_found(f"event {event_id} not found on {calendar_id}")
         self._check_if_match(ev, if_match)
 
