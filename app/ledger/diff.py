@@ -138,6 +138,20 @@ async def diff_and_enqueue_for_user(
         # transparently).  No INSERT path for instances.
         if proj["parent_canonical_uid"] and op_kind == OP_CREATE:
             op_kind = OP_UPDATE
+        # Re-creating a deleted instance copy: if the occurrence's
+        # mirror was deleted (churn / orphan scan), Google left a
+        # *cancelled* exception at the derived ID, and a plain update
+        # 404s on it (target_event_gone → endless UPDATE→404 loop).
+        # Sending status=confirmed un-cancels — i.e. re-creates — the
+        # occurrence.  Harmless when it is already confirmed.  Applied
+        # to the op payload only, so the planner's desired_payload_hash
+        # (and thus convergence accounting) is unaffected.
+        if (
+            proj["parent_canonical_uid"]
+            and op_kind == OP_UPDATE
+            and payload is not None
+        ):
+            payload = {**payload, "status": "confirmed"}
         await enqueue(
             db,
             user_id=user_id,
