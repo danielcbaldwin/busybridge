@@ -295,29 +295,18 @@ async def _ingest_one_event(
 
     canonical = canonical_uid_client(client_calendar_id, event_id)
 
-    # 3. Rescheduled-parent ``_R`` quirk.  Re-key existing ledger
-    # row before treating this as a new event.
-    if (
-        status != "cancelled"
-        and "_R" in event_id
-        and event.get("recurrence")
-    ):
-        rekeyed = await _try_rekey_R_parent(
-            db,
-            user_id=user_id,
-            source_type="client",
-            source_calendar_id=client_calendar_id,
-            new_event_id=event_id,
-            canonical_for=lambda eid: canonical_uid_client(
-                client_calendar_id, eid,
-            ),
-        )
-        if rekeyed is not None:
-            await _apply_event_to_ledger(
-                db, ledger_event_id=rekeyed,
-                event=event, user_email=user_email,
-            )
-            return "rekeyed", rekeyed
+    # A ``<base>_R<date>`` event is Google's "this and following" split:
+    # an ADDITIVE new series segment that coexists with the (now
+    # UNTIL-truncated) base series and any earlier ``_R`` segments, each
+    # covering a distinct date range.  We deliberately do NOT re-key the
+    # base onto it — each segment is ingested as its own recurring series
+    # (the normal upsert below), and a modified instance stays parented to
+    # whichever segment its ``recurringEventId`` names (handled above).
+    # Re-keying collapsed coexisting segments and bulk-re-parented
+    # pre-boundary instances onto a later segment whose expansion lacks
+    # their date, so ``events.update`` on the derived instance id 404'd
+    # forever (the MLC-meeting residual).  See
+    # test_moved_instance_survives_this_and_following.
 
     existing = await (await db.execute(
         """SELECT * FROM ledger_events
@@ -775,101 +764,6 @@ async def _mark_cancelled(
             WHERE id = ?""",
         (when, when, when, ledger_event_id),
     )
-
-
-async def _try_rekey_R_parent(
-    db: aiosqlite.Connection,
-    *,
-    user_id: int,
-    source_type: str,
-    source_calendar_id: Optional[int],
-    new_event_id: str,
-    canonical_for: Callable[[str], str],
-) -> Optional[int]:
-    """Look up an existing ledger row under the base ID (everything
-    before ``_R``) and re-key it to ``new_event_id``.  Returns the
-    ledger event id if a re-key happened, else None.
-
-    Source-neutral: ``source_type`` / ``source_calendar_id`` scope
-    the search, and ``canonical_for`` maps a source event id to its
-    canonical_uid (``canonical_uid_client`` / ``_personal`` /
-    ``_main_native``).  Searches for both the bare base and any
-    prior ``_R<ts>`` variant.
-    """
-    base = new_event_id.split("_R")[0]
-    bare_uid = canonical_for(base)
-    rows = await (await db.execute(
-        """SELECT id, canonical_uid, source_event_id
-             FROM ledger_events
-            WHERE user_id = ?
-              AND source_type = ?
-              AND COALESCE(source_calendar_id, -1) = COALESCE(?, -1)
-              AND status = 'active'
-              AND user_intentionally_deleted = 0
-              AND (canonical_uid = ?
-                   OR source_event_id = ?
-                   OR source_event_id LIKE ?)
-            ORDER BY updated_at DESC
-            LIMIT 1""",
-        (
-            user_id, source_type, source_calendar_id,
-            bare_uid, base, f"{base}_R%",
-        ),
-    )).fetchall()
-    if not rows:
-        return None
-    target = rows[0]
-    old_canonical = target["canonical_uid"]
-    new_canonical = canonical_for(new_event_id)
-    # Self-collision guard.  The base/sibling lookup above can match a
-    # row that is NOT the one this id belongs to — most importantly when
-    # a recurring meeting has many occurrences each rescheduled into its
-    # own ``<base>_R<date>`` mini-series, so dozens of ``_R`` rows
-    # coexist.  Re-keying a sibling onto ``new_canonical`` when a
-    # DIFFERENT row already holds it violates UNIQUE(user_id,
-    # canonical_uid) and aborts the whole ingest pass (the source of the
-    # observed churn).  When the id already has its own row, it is not a
-    # parent reschedule needing a re-key — the caller's normal upsert
-    # path already tracks it — so skip and let that path handle it.
-    if new_canonical != old_canonical:
-        clash = await (await db.execute(
-            """SELECT 1 FROM ledger_events
-                WHERE user_id = ? AND canonical_uid = ?""",
-            (user_id, new_canonical),
-        )).fetchone()
-        if clash is not None:
-            return None
-    when = datetime.now(UTC).isoformat()
-    await db.execute(
-        """UPDATE ledger_events
-              SET canonical_uid = ?,
-                  source_event_id = ?,
-                  updated_at = ?
-            WHERE id = ?""",
-        (new_canonical, new_event_id, when, int(target["id"])),
-    )
-    # Re-parent any modified-instance ledger rows that pointed at the
-    # old series canonical, so they stay attached to the re-keyed
-    # parent (REWRITE_PLAN.md §8 — "old instance rows get their
-    # parent_canonical_uid updated").  Without this the diff's
-    # parent-projection lookup resolves to nothing and the instance
-    # is orphaned.  Post-boundary instance overrides that the source
-    # cancels are handled by the normal cancelled-instance path.
-    cur = await db.execute(
-        """UPDATE ledger_events
-              SET parent_canonical_uid = ?,
-                  updated_at = ?
-            WHERE user_id = ?
-              AND parent_canonical_uid = ?""",
-        (new_canonical, when, user_id, old_canonical),
-    )
-    logger.info(
-        "re-keyed ledger_event %s from source_event_id=%s to %s "
-        "(_R reschedule); re-parented %s instance row(s)",
-        target["id"], target["source_event_id"], new_event_id,
-        getattr(cur, "rowcount", "?"),
-    )
-    return int(target["id"])
 
 
 # ---------------------------------------------------------------------------
