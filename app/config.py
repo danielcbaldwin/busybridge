@@ -59,12 +59,13 @@ class Settings(BaseSettings):
     auth_rate_limit_per_minute: int = 10
     # Sustained cap (calls/sec) on OUTBOUND Google Calendar API calls,
     # applied across the whole process so a bulk drain or full-sync
-    # ingest is paced under Google's per-user quota instead of triggering
-    # rateLimitExceeded 403 storms.  Kept conservative: Google's
-    # per-user write quota is ~5/s and a temporary penalty after a burst
-    # is slow to lift, so a gentle steady rate stays clear of both.
-    # <= 0 disables pacing.
-    google_api_rate_limit_per_second: float = 3.0
+    # ingest is paced under Google's quota instead of triggering
+    # rateLimitExceeded 403 storms.  Google's documented limits are
+    # 600 requests/min per user (=10/s, sliding window) and 10,000/min
+    # per project.  8/s = 480/min stays under the per-user ceiling with
+    # margin even if all traffic lands on one account; with three
+    # connected accounts there is ample project headroom.  <= 0 disables.
+    google_api_rate_limit_per_second: float = 8.0
     # Whether to trust X-Real-IP / X-Forwarded-For for the client IP.
     # Only enable when the app sits behind a reverse proxy that
     # overwrites these headers; otherwise a client can spoof them to
