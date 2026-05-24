@@ -74,7 +74,7 @@ The fake exposes this through `reschedule_series_this_and_following()` as a test
 | Modified-instance overrides on/after the boundary are cancelled | `test_reschedule_cancels_post_boundary_overrides` |
 | 400 when called on a non-recurring event | `test_reschedule_400_for_non_recurring` |
 
-The ledger ingest (`app/ledger/ingest/client.py`) recognises this quirk in `_try_rekey_R_parent` and re-keys the existing ledger row to the new `_R<stamp>` event ID without producing a duplicate series.
+The ledger ingest treats each `<base>_R<stamp>` segment as its **own** recurring series (an additive "this and following" split coexists with the UNTIL-truncated base and any earlier segments). It does **not** re-key the base onto the new segment: a modified instance stays parented to whichever segment its `recurringEventId` names, so its derived instance id materialises against a series that actually contains its date. (An earlier `_try_rekey_R_parent` collapsed coexisting segments and bulk-re-parented pre-boundary instances onto a later segment, causing permanent `events.update` 404s — see `test_moved_instance_survives_this_and_following`.)
 
 ## Failure injection
 

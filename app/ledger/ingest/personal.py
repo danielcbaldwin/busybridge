@@ -33,7 +33,6 @@ from app.ledger.ingest.client import (
     _ingest_instance,
     _is_recurring_parent,
     _record_affected,
-    _try_rekey_R_parent,
     scan_full_sync_recurring_cancellations,
 )
 
@@ -199,25 +198,12 @@ async def _ingest_one(
             source_calendar_id=personal_calendar_id,
         )
 
-    # Rescheduled-parent ``_R`` quirk: re-key the existing series
-    # ledger row to the new event id so its projections (and the
-    # busy blocks they drive) are reused rather than orphaned.  The
-    # normal upsert below then applies the new content to it.
-    if (
-        status != "cancelled"
-        and "_R" in event_id
-        and event.get("recurrence")
-    ):
-        await _try_rekey_R_parent(
-            db,
-            user_id=user_id,
-            source_type="personal",
-            source_calendar_id=personal_calendar_id,
-            new_event_id=event_id,
-            canonical_for=lambda eid: canonical_uid_personal(
-                personal_calendar_id, eid,
-            ),
-        )
+    # A ``<base>_R<date>`` event is Google's "this and following" split —
+    # an ADDITIVE new series segment, not a replacement.  Ingest it as its
+    # own recurring series (normal upsert below) rather than re-keying the
+    # base onto it; modified instances stay parented to the segment their
+    # ``recurringEventId`` names.  See the client-ingest note and
+    # test_moved_instance_survives_this_and_following.
 
     canonical = canonical_uid_personal(personal_calendar_id, event_id)
     existing = await (await db.execute(
