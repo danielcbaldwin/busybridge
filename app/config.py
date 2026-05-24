@@ -62,10 +62,11 @@ class Settings(BaseSettings):
     # ingest is paced under Google's quota instead of triggering
     # rateLimitExceeded 403 storms.  Google's documented limits are
     # 600 requests/min per user (=10/s, sliding window) and 10,000/min
-    # per project.  8/s = 480/min stays under the per-user ceiling with
-    # margin even if all traffic lands on one account; with three
-    # connected accounts there is ample project headroom.  <= 0 disables.
-    google_api_rate_limit_per_second: float = 8.0
+    # per project.  5/s = 300/min is half the per-user ceiling — quiet
+    # (no 403 noise) with ample margin even if all traffic lands on one
+    # account.  Recovery is pass-cadence bound, not rate bound, so a
+    # gentler rate does not slow it.  <= 0 disables.
+    google_api_rate_limit_per_second: float = 5.0
     # Whether to trust X-Real-IP / X-Forwarded-For for the client IP.
     # Only enable when the app sits behind a reverse proxy that
     # overwrites these headers; otherwise a client can spoof them to
