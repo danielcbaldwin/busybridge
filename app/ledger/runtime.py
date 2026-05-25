@@ -41,7 +41,7 @@ from app.auth.google import build_user_credentials
 from app.database import get_database
 from app.ledger.async_google import as_async_google, production_rate_limiter
 from app.ledger.google_router import GoogleRouter
-from app.ledger.reconciler import reconcile_user
+from app.ledger.reconciler import audit_user, reconcile_user
 from app.ledger.real_google_client import RealGoogleClient
 from app.ledger.triggers import (
     claim_due_request,
@@ -242,6 +242,43 @@ async def _reconcile_user_once(
         drain=drain,
         run_discovery=run_discovery,
         dry_run=dry_run,
+    )
+
+
+async def audit_user_by_id(user_id: int) -> dict:
+    """Run one content-audit pass for a user, under the per-user lock.
+
+    The audit (``reconciler.audit_user``) re-lists client source
+    calendars over a forward window and re-ingests any event whose
+    content drifted from the ledger — the backstop for changes Google
+    never re-delivered via incremental sync (the create-race).  Shares
+    the per-user reconcile lock so it can't interleave with a reconcile.
+    Skipped during maintenance (a DB restore)."""
+    from app.maintenance import in_maintenance, track_reconcile
+    if in_maintenance():
+        return {"skipped": "maintenance"}
+    with track_reconcile():
+        async with _user_lock(user_id):
+            return await _audit_user_once(user_id)
+
+
+async def _audit_user_once(user_id: int) -> dict:
+    """Load this user's calendars + tokens, build a router, run one
+    content-audit pass.  Always invoked under the per-user lock."""
+    db = await get_database()
+    user = await _load_user(db, user_id)
+    if user is None or user["main_calendar_id"] is None:
+        return {"skipped": "no_main_calendar"}
+    access = await build_user_google_access(db, user_id)
+    if access is None:
+        return {"skipped": "no_home_oauth_token"}
+    return await audit_user(
+        db, access["router"],
+        user_id=user_id,
+        user_email=access["main_email"],
+        main_google_calendar_id=user["main_calendar_id"],
+        client_calendars=access["client_calendars"],
+        all_known_client_calendars=access["all_known"],
     )
 
 

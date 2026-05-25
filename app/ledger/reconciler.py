@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import aiosqlite
@@ -30,6 +30,7 @@ from app.ledger.ingest import (
     ingest_personal_calendar,
     ingest_webcal_subscription,
 )
+from app.ledger.ingest.client import _ingest_one_event, _record_affected
 from app.ledger.outbox import drain_user
 from app.ledger.planner import plan_for_ledger_event
 
@@ -342,6 +343,161 @@ async def reconcile_user(
         )
 
     return out
+
+
+async def audit_user(
+    db: aiosqlite.Connection,
+    google: GoogleClient,
+    *,
+    user_id: int,
+    user_email: str,
+    main_google_calendar_id: str,
+    client_calendars: list[dict],
+    all_known_client_calendars: Optional[list[dict]] = None,
+    window_back_days: int = 1,
+    window_fwd_days: int = 90,
+    drain: bool = True,
+    now: Optional[datetime] = None,
+) -> dict:
+    """Source-content audit (the periodic backstop the incremental sync
+    cannot provide).
+
+    For each client source calendar, re-``list`` events over a forward
+    window and re-ingest any whose content has drifted from the ledger.
+    This catches the create-race (and any edit) where Google folded a
+    change into a revision without advancing the sync cursor, so
+    incremental sync never re-delivered it.
+
+    Safety invariants (see ONBOARDING / the incident notes):
+      * Reads with ``timeMin/timeMax`` — never advances or resets a sync
+        token, so it cannot trigger the full-sync cancellation scan that
+        once bloated the ledger.
+      * Never infers a deletion from the windowed list (a window
+        legitimately omits past / far-future events); cancelled rows are
+        skipped, deletions remain incremental sync's job.
+      * Passes ``skip_if_older`` so a stale-replica read can never revert
+        fresher ledger data.
+
+    Scope: client calendars only for now (personal + native-main use the
+    same pattern and can be added later).
+    """
+    google = as_async_google(google)
+    mode = await _pause_mode(db, user_id)
+    if mode == "global":
+        return {"audited": 0, "reingested": 0, "planned": 0,
+                "enqueued": 0, "drain": {}, "paused": True}
+
+    now = now or datetime.now(UTC)
+    time_min = now - timedelta(days=window_back_days)
+    time_max = now + timedelta(days=window_fwd_days)
+    out: dict = {
+        "audited": 0, "reingested": 0, "planned": 0, "enqueued": 0,
+        "drain": {"processed": 0, "succeeded": 0, "retried": 0,
+                  "failed_permanent": 0, "superseded": 0},
+    }
+
+    for cal in client_calendars:
+        try:
+            await _audit_client_calendar(
+                db, google,
+                user_id=user_id,
+                user_email=user_email,
+                client_calendar_id=int(cal["id"]),
+                google_calendar_id=cal["google_calendar_id"],
+                time_min=time_min,
+                time_max=time_max,
+                out=out,
+            )
+        except Exception as e:
+            logger.warning(
+                "content audit failed user_id=%s cal=%s: %s",
+                user_id, cal["id"], e,
+            )
+
+    # Plan re-ingested rows, then diff + drain (same convergence loop as
+    # reconcile_user) so a corrected source propagates to its mirrors.
+    affected_rows = await _read_affected_ledger_rows(db, user_id=user_id)
+    for ledger_id in sorted({lid for _, lid in affected_rows}):
+        await plan_for_ledger_event(db, ledger_event_id=ledger_id)
+        out["planned"] += 1
+    if affected_rows:
+        await _clear_affected_ledger_rows(
+            db, row_ids=[rid for rid, _ in affected_rows],
+        )
+
+    google_id_for = {
+        int(c["id"]): c["google_calendar_id"]
+        for c in (all_known_client_calendars or client_calendars)
+    }
+    for _ in range(3):
+        out["enqueued"] += await diff_and_enqueue_for_user(
+            db,
+            user_id=user_id,
+            main_calendar_id=main_google_calendar_id,
+            google_calendar_id_for=google_id_for,
+            now=now,
+        )
+        await db.commit()
+        if not drain:
+            break
+        dc = await drain_user(db, google, user_id=user_id, now=now)
+        for k, v in dc.items():
+            out["drain"][k] = out["drain"].get(k, 0) + v
+        if dc["processed"] == 0 and dc["superseded"] == 0:
+            break
+    return out
+
+
+async def _audit_client_calendar(
+    db: aiosqlite.Connection,
+    google: GoogleClient,
+    *,
+    user_id: int,
+    user_email: str,
+    client_calendar_id: int,
+    google_calendar_id: str,
+    time_min: datetime,
+    time_max: datetime,
+    out: dict,
+) -> None:
+    """List one client calendar over the forward window and re-ingest any
+    drifted event.  Pagination follows ``nextPageToken``; cancellations
+    are skipped (never inferred from a windowed list)."""
+    page_token: Optional[str] = None
+    while True:
+        resp = await google.list_events(
+            google_calendar_id,
+            time_min=time_min,
+            time_max=time_max,
+            single_events=False,
+            show_deleted=False,
+            page_token=page_token,
+            max_results=250,
+        )
+        affected: list[int] = []
+        for ev in resp.get("items", []):
+            if ev.get("status") == "cancelled":
+                continue
+            out["audited"] += 1
+            outcome, ledger_id = await _ingest_one_event(
+                db,
+                user_id=user_id,
+                client_calendar_id=client_calendar_id,
+                user_email=user_email,
+                event=ev,
+                skip_if_older=True,
+            )
+            if outcome in ("updated", "created", "rekeyed", "cancelled"):
+                out["reingested"] += 1
+                if ledger_id is not None:
+                    affected.append(ledger_id)
+        # Queue only the events that actually changed for replan — a
+        # no-op audit records nothing, so plan/diff/drain stay idle.
+        await _record_affected(db, user_id=user_id, ledger_ids=affected)
+        await db.commit()
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
 
 
 async def _outbox_watermark(db: aiosqlite.Connection, user_id: int) -> int:

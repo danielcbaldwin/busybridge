@@ -48,12 +48,14 @@ def setup_scheduler() -> AsyncIOScheduler:
     else:
         logger.info("Webhook renewal job disabled (ENABLE_WEBHOOKS=false)")
 
-    # Consistency check - every hour
+    # Content audit - re-verify source content vs the ledger and correct
+    # drift incremental sync can't see (the create-race). Cheap (a few
+    # list calls/run), so it runs frequently; default every 10 minutes.
     _scheduler.add_job(
         "app.jobs.sync_job:run_consistency_check_job",
-        trigger=IntervalTrigger(hours=settings.consistency_check_hours),
+        trigger=IntervalTrigger(minutes=settings.content_audit_minutes),
         id="consistency_check",
-        name="Consistency Check",
+        name="Content Audit",
         replace_existing=True,
     )
 

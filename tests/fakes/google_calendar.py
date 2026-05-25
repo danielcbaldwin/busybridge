@@ -493,6 +493,29 @@ class FakeGoogleCalendar:
             return synthesized
         raise _not_found(f"event {event_id} not found on {calendar_id}")
 
+    def silently_edit_event(
+        self, calendar_id: str, event_id: str, **fields: Any,
+    ) -> None:
+        """Mutate an event's content WITHOUT advancing its change
+        cursor, etag, or ``updated`` timestamp.
+
+        Models the create-race quirk: a rapid create-then-rename where
+        Google folds the title edit into the same revision, so an
+        incremental sync (which keys off the change cursor) never
+        re-delivers it — yet a full ``events.list`` returns the new
+        content.  Test helper only; supports ``summary``, ``description``,
+        ``location``.
+        """
+        cal = self._require_calendar(calendar_id)
+        ev = cal.events.get(event_id)
+        if ev is None:
+            raise _not_found(f"event {event_id} not found on {calendar_id}")
+        for key, value in fields.items():
+            if not hasattr(ev, key):
+                raise ValueError(f"silently_edit_event: unknown field {key!r}")
+            setattr(ev, key, value)
+        # Deliberately do NOT touch ev.change_seq / ev.updated / ev.etag.
+
     def update_event(
         self,
         calendar_id: str,
