@@ -78,6 +78,11 @@ class Settings(BaseSettings):
     sync_interval_minutes: int = 5
     webhook_renewal_hours: int = 6
     consistency_check_hours: int = 1
+    # How often the content-audit job runs (re-verifies ingested source
+    # content against Google to catch drift incremental sync can't see —
+    # the create-then-rename race).  Cheap (a few list calls/run), so it
+    # runs every 10 minutes by default.
+    content_audit_minutes: int = 10
     token_refresh_minutes: int = 30
     alert_process_minutes: int = 1
 

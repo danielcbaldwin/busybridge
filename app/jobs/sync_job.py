@@ -176,16 +176,42 @@ async def _check_circuit_breaker() -> None:
 
 
 async def run_consistency_check_job() -> None:
-    """Consistency-check job under the ledger architecture is a no-op:
-    consistency is structurally enforced by the planner + outbox.
-    Kept for backwards-compat with the scheduler config."""
+    """Content audit: re-verify that ingested source content still
+    matches Google, and correct drift incremental sync can't see.
+
+    The planner + outbox structurally enforce consistency for whatever
+    has been *ingested* — but if Google folds an edit into a revision
+    without advancing the sync cursor (the create-then-rename race),
+    incremental sync never re-delivers it and BB latches a stale value.
+    This pass re-lists each client source calendar over a forward window
+    and re-ingests any drifted event.  It never touches sync tokens and
+    never infers deletions from the windowed list (see
+    ``reconciler.audit_user``)."""
     paused = await get_setting("sync_paused")
     if paused and paused.get("value_plain") == "true":
         return
-    logger.debug(
-        "consistency_check job: no-op (ledger architecture handles "
-        "consistency structurally)",
-    )
+    lock = await acquire_job_lock("content_audit")
+    if not lock:
+        logger.debug("Content audit already running, skipping")
+        return
+    try:
+        from app.ledger.runtime import audit_user_by_id
+        db = await get_database()
+        rows = await (await db.execute(
+            "SELECT id FROM users WHERE COALESCE(sync_paused, 0) = 0",
+        )).fetchall()
+        for r in rows:
+            try:
+                out = await audit_user_by_id(int(r["id"]))
+                if out.get("reingested"):
+                    logger.info(
+                        "content audit user=%s corrected %s drifted event(s)",
+                        r["id"], out["reingested"],
+                    )
+            except Exception:
+                logger.exception("content audit failed for user %s", r["id"])
+    finally:
+        await release_job_lock("content_audit", lock)
 
 
 async def run_orphan_scan_job() -> None:

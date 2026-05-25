@@ -254,8 +254,15 @@ async def _ingest_one_event(
     client_calendar_id: int,
     user_email: str,
     event: dict,
+    skip_if_older: bool = False,
 ) -> tuple[str, Optional[int]]:
-    """Process one Google event.  Returns (outcome, ledger_event_id)."""
+    """Process one Google event.  Returns (outcome, ledger_event_id).
+
+    ``skip_if_older`` (used by the content-audit pass): never apply a
+    read whose ``updated`` is strictly older than what's already stored
+    for that event — a stale replica we must not let revert fresher
+    data.  Equal timestamps still apply (the create-race carries an
+    identical ``updated`` and must be corrected)."""
     event_id = event["id"]
     status = event.get("status", "confirmed")
 
@@ -291,6 +298,7 @@ async def _ingest_one_event(
             parent_canonical=parent_canonical,
             source_type="client",
             source_calendar_id=client_calendar_id,
+            skip_if_older=skip_if_older,
         )
 
     canonical = canonical_uid_client(client_calendar_id, event_id)
@@ -339,6 +347,7 @@ async def _ingest_one_event(
         ledger_event_id=int(existing["id"]),
         event=event,
         user_email=user_email,
+        skip_if_older=skip_if_older,
     )
     return ("updated" if changed else "skipped"), int(existing["id"])
 
@@ -461,6 +470,7 @@ async def _ingest_instance(
     source_calendar_id: Optional[int],
     source_event_id: Any = _USE_EVENT_ID,
     fields: Optional[dict] = None,
+    skip_if_older: bool = False,
 ) -> tuple[str, Optional[int]]:
     """Upsert a modified or cancelled instance of a recurring series.
 
@@ -540,6 +550,12 @@ async def _ingest_instance(
         return "cancelled", int(existing["id"])
 
     # Modified instance — single-instance override on the series.
+    if skip_if_older and existing is not None and _read_is_stale(event, existing):
+        await db.execute(
+            "UPDATE ledger_events SET last_seen_at = ? WHERE id = ?",
+            (when, int(existing["id"])),
+        )
+        return "skipped", int(existing["id"])
     if fields is None:
         fields = _extract_event_fields(event, user_email=user_email)
     if existing is None:
@@ -685,22 +701,61 @@ async def _insert_ledger_row(
     return int(cursor.lastrowid)
 
 
+def _parse_iso_utc(s: Optional[str]) -> Optional[datetime]:
+    """Parse an RFC3339 timestamp to a tz-aware UTC datetime, or None."""
+    if not s:
+        return None
+    try:
+        t = (s[:-1] + "+00:00") if s.endswith("Z") else s
+        dt = datetime.fromisoformat(t)
+    except (ValueError, TypeError):
+        return None
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def _read_is_stale(event: dict, existing) -> bool:
+    """True if ``event``'s source ``updated`` is strictly OLDER than the
+    stored ``source_updated_at`` — a stale replica read the audit must
+    not apply (it would revert fresher data).  Equal or unparsable
+    timestamps are NOT stale: the create-race carries an identical
+    ``updated`` and must still be corrected."""
+    if existing is None:
+        return False
+    a = _parse_iso_utc(event.get("updated"))
+    b = _parse_iso_utc(existing["source_updated_at"])
+    if a is None or b is None:
+        return False
+    return a < b
+
+
 async def _apply_event_to_ledger(
     db: aiosqlite.Connection,
     *,
     ledger_event_id: int,
     event: dict,
     user_email: str,
+    skip_if_older: bool = False,
 ) -> bool:
     """Update an existing ledger row.  Returns True if any material
     field changed (and version was bumped).  A row resurrecting
-    from ``cancelled`` to ``active`` always counts as changed."""
+    from ``cancelled`` to ``active`` always counts as changed.
+
+    ``skip_if_older`` (audit pass): if this read's ``updated`` is
+    strictly older than the stored ``source_updated_at``, treat it as a
+    stale replica and do not apply (would revert fresher data)."""
     fields = _extract_event_fields(event, user_email=user_email)
     existing = await (await db.execute(
         "SELECT * FROM ledger_events WHERE id = ?",
         (ledger_event_id,),
     )).fetchone()
     when = datetime.now(UTC).isoformat()
+
+    if skip_if_older and _read_is_stale(event, existing):
+        await db.execute(
+            "UPDATE ledger_events SET last_seen_at = ? WHERE id = ?",
+            (when, ledger_event_id),
+        )
+        return False
 
     new_hash = _content_hash(fields)
     old_hash = _content_hash_from_row(existing)

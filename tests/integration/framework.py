@@ -811,6 +811,47 @@ async def _scenario_run_reconciler_until_quiescent(
     return out
 
 
+async def _scenario_run_audit(
+    self: Scenario,
+    user_nick: str,
+    *,
+    drain: bool = True,
+    window_back_days: int = 3650,
+    window_fwd_days: int = 3650,
+) -> dict:
+    """Drive one content-audit pass for a user (``reconciler.audit_user``).
+
+    The window defaults wide so test events at any date are in range;
+    production uses a narrow forward window.
+    """
+    from app.ledger.reconciler import audit_user
+
+    user = self.user(user_nick)
+    db = await _scenario_setup_db(self)
+    active_clients: list[dict] = []
+    all_clients: list[dict] = []
+    for nick, cid in user.client_calendar_ids.items():
+        row = await (await db.execute(
+            "SELECT is_active FROM client_calendars WHERE id = ?", (cid,),
+        )).fetchone()
+        entry = {"id": cid, "google_calendar_id": self.cal(nick)}
+        all_clients.append(entry)
+        if row is not None and row["is_active"]:
+            active_clients.append(entry)
+    return await audit_user(
+        db, self.google,
+        user_id=user.user_id,
+        user_email=user.email,
+        main_google_calendar_id=user.main_google_calendar_id,
+        client_calendars=active_clients,
+        all_known_client_calendars=all_clients,
+        drain=drain,
+        window_back_days=window_back_days,
+        window_fwd_days=window_fwd_days,
+        now=self.clock.now(),
+    )
+
+
 def _scenario_user(self: Scenario, nickname: str) -> _LedgerUser:
     try:
         return self._users_by_nick[nickname]
@@ -837,6 +878,7 @@ Scenario.setup_db = _scenario_setup_db  # type: ignore[attr-defined]
 Scenario.given_user = _scenario_given_user  # type: ignore[attr-defined]
 Scenario.given_webcal = _scenario_given_webcal  # type: ignore[attr-defined]
 Scenario.run_reconciler = _scenario_run_reconciler  # type: ignore[attr-defined]
+Scenario.run_audit = _scenario_run_audit  # type: ignore[attr-defined]
 Scenario.run_reconciler_until_quiescent = (  # type: ignore[attr-defined]
     _scenario_run_reconciler_until_quiescent
 )
