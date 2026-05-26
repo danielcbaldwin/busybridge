@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Iterable, Optional
 
 import aiosqlite
 
@@ -48,6 +48,7 @@ async def ingest_personal_calendar(
     personal_calendar_id: int,
     google_calendar_id: str,
     user_email: str,
+    owned_emails: Optional[Iterable[str]] = None,
 ) -> dict:
     """Run one ingest pass for one personal calendar.
 
@@ -100,6 +101,7 @@ async def ingest_personal_calendar(
                 user_id=user_id,
                 personal_calendar_id=personal_calendar_id,
                 user_email=user_email,
+                owned_emails=owned_emails,
                 event=event,
             )
             counters[outcome] = counters.get(outcome, 0) + 1
@@ -121,6 +123,7 @@ async def ingest_personal_calendar(
                 user_id=user_id,
                 personal_calendar_id=personal_calendar_id,
                 user_email=user_email,
+                owned_emails=owned_emails,
                 event=inst,
             )
         scan_failures = await scan_full_sync_recurring_cancellations(
@@ -168,6 +171,7 @@ async def _ingest_one(
     personal_calendar_id: int,
     user_email: str,
     event: dict,
+    owned_emails: Optional[Iterable[str]] = None,
 ) -> tuple[str, Optional[int]]:
     event_id = event["id"]
     status = event.get("status", "confirmed")
@@ -192,6 +196,7 @@ async def _ingest_one(
             db,
             user_id=user_id,
             user_email=user_email,
+            owned_emails=owned_emails,
             event=event,
             parent_canonical=parent_canonical,
             source_type="personal",
@@ -220,7 +225,9 @@ async def _ingest_one(
         await _mark_cancelled(db, ledger_event_id=int(existing["id"]))
         return "cancelled", int(existing["id"])
 
-    fields = _extract_event_fields(event, user_email=user_email)
+    fields = _extract_event_fields(
+        event, user_email=user_email, owned_emails=owned_emails,
+    )
     when = datetime.now(UTC).isoformat()
     if existing is None:
         cursor = await db.execute(

@@ -21,7 +21,7 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiosqlite
@@ -46,6 +46,7 @@ async def ingest_client_calendar(
     client_calendar_id: int,
     google_calendar_id: str,
     user_email: str,
+    owned_emails: Optional[Iterable[str]] = None,
 ) -> dict:
     """Run one ingest pass for one client calendar.
 
@@ -107,6 +108,7 @@ async def ingest_client_calendar(
                 user_id=user_id,
                 client_calendar_id=client_calendar_id,
                 user_email=user_email,
+                owned_emails=owned_emails,
                 event=event,
             )
             counters[outcome] = counters.get(outcome, 0) + 1
@@ -128,6 +130,7 @@ async def ingest_client_calendar(
                 user_id=user_id,
                 client_calendar_id=client_calendar_id,
                 user_email=user_email,
+                owned_emails=owned_emails,
                 event=inst,
             )
         scan_failures = await scan_full_sync_recurring_cancellations(
@@ -254,6 +257,7 @@ async def _ingest_one_event(
     client_calendar_id: int,
     user_email: str,
     event: dict,
+    owned_emails: Optional[Iterable[str]] = None,
     skip_if_older: bool = False,
 ) -> tuple[str, Optional[int]]:
     """Process one Google event.  Returns (outcome, ledger_event_id).
@@ -294,6 +298,7 @@ async def _ingest_one_event(
             db,
             user_id=user_id,
             user_email=user_email,
+            owned_emails=owned_emails,
             event=event,
             parent_canonical=parent_canonical,
             source_type="client",
@@ -340,6 +345,7 @@ async def _ingest_one_event(
             client_calendar_id=client_calendar_id,
             event=event,
             user_email=user_email,
+            owned_emails=owned_emails,
         )
         return "created", new_id
     changed = await _apply_event_to_ledger(
@@ -347,6 +353,7 @@ async def _ingest_one_event(
         ledger_event_id=int(existing["id"]),
         event=event,
         user_email=user_email,
+        owned_emails=owned_emails,
         skip_if_older=skip_if_older,
     )
     return ("updated" if changed else "skipped"), int(existing["id"])
@@ -464,6 +471,7 @@ async def _ingest_instance(
     *,
     user_id: int,
     user_email: str,
+    owned_emails: Optional[Iterable[str]] = None,
     event: dict,
     parent_canonical: str,
     source_type: str,
@@ -557,7 +565,9 @@ async def _ingest_instance(
         )
         return "skipped", int(existing["id"])
     if fields is None:
-        fields = _extract_event_fields(event, user_email=user_email)
+        fields = _extract_event_fields(
+            event, user_email=user_email, owned_emails=owned_emails,
+        )
     if existing is None:
         cursor = await db.execute(
             """INSERT INTO ledger_events
@@ -654,8 +664,11 @@ async def _insert_ledger_row(
     client_calendar_id: int,
     event: dict,
     user_email: str,
+    owned_emails: Optional[Iterable[str]] = None,
 ) -> int:
-    fields = _extract_event_fields(event, user_email=user_email)
+    fields = _extract_event_fields(
+        event, user_email=user_email, owned_emails=owned_emails,
+    )
     when = datetime.now(UTC).isoformat()
     cursor = await db.execute(
         """INSERT INTO ledger_events
@@ -734,6 +747,7 @@ async def _apply_event_to_ledger(
     ledger_event_id: int,
     event: dict,
     user_email: str,
+    owned_emails: Optional[Iterable[str]] = None,
     skip_if_older: bool = False,
 ) -> bool:
     """Update an existing ledger row.  Returns True if any material
@@ -743,7 +757,9 @@ async def _apply_event_to_ledger(
     ``skip_if_older`` (audit pass): if this read's ``updated`` is
     strictly older than the stored ``source_updated_at``, treat it as a
     stale replica and do not apply (would revert fresher data)."""
-    fields = _extract_event_fields(event, user_email=user_email)
+    fields = _extract_event_fields(
+        event, user_email=user_email, owned_emails=owned_emails,
+    )
     existing = await (await db.execute(
         "SELECT * FROM ledger_events WHERE id = ?",
         (ledger_event_id,),
@@ -824,7 +840,23 @@ async def _mark_cancelled(
 # ---------------------------------------------------------------------------
 # Field extraction
 # ---------------------------------------------------------------------------
-def _extract_event_fields(event: dict, *, user_email: str) -> dict:
+def _extract_event_fields(
+    event: dict,
+    *,
+    user_email: str,
+    owned_emails: Optional[Iterable[str]] = None,
+) -> dict:
+    """Project a Google event dict into the columns the ledger stores.
+
+    ``user_email`` is the user's primary (home) email.  ``owned_emails``
+    optionally lists every email the user owns — home, client OAuth
+    accounts, personal accounts.  Identity checks (organizer match,
+    self-attendee match) treat ANY of those emails as 'you', so an
+    event you organise under a non-home identity (e.g. via your
+    mlcommons account) correctly reads as editable rather than landing
+    with a lock prefix on the main copy.  Defaults to ``{user_email}``
+    when the caller passes only the primary email."""
+    owned = _normalise_owned_emails(user_email, owned_emails)
     start = event.get("start", {}) or {}
     end = event.get("end", {}) or {}
     is_all_day = "date" in start
@@ -836,19 +868,19 @@ def _extract_event_fields(event: dict, *, user_email: str) -> dict:
         end_at = end.get("dateTime")
 
     show_as = "free" if event.get("transparency") == "transparent" else "busy"
-    # User can edit if: they are the organizer, OR the event explicitly
-    # marks guestsCanModify=True.  Solo events (no attendees, no
-    # explicit organizer set) are also editable.
+    # User can edit if: they are the organizer (under ANY owned email),
+    # OR the event explicitly marks guestsCanModify=True.  Solo events
+    # (no attendees, no explicit organizer set) are also editable.
     has_attendees = bool(event.get("attendees"))
     user_can_edit = (
-        _user_is_organizer(event, user_email)
+        _user_is_organizer(event, owned_emails=owned)
         or bool(event.get("guestsCanModify"))
         or not has_attendees
     )
 
     user_rsvp = None
     for att in (event.get("attendees") or []):
-        if att.get("self") or att.get("email", "").lower() == user_email.lower():
+        if att.get("self") or (att.get("email", "").lower() in owned):
             user_rsvp = att.get("responseStatus")
             break
 
@@ -888,9 +920,34 @@ def _extract_event_fields(event: dict, *, user_email: str) -> dict:
     }
 
 
-def _user_is_organizer(event: dict, user_email: str) -> bool:
-    organizer = event.get("organizer") or {}
-    return (organizer.get("email") or "").lower() == user_email.lower()
+def _normalise_owned_emails(
+    user_email: str, owned: Optional[Iterable[str]] = None,
+) -> frozenset[str]:
+    """Build a case-folded set of the user's owned emails.  Always
+    includes the primary ``user_email``."""
+    out = {user_email.lower()} if user_email else set()
+    for e in (owned or ()):
+        if e:
+            out.add(e.lower())
+    return frozenset(out)
+
+
+def _user_is_organizer(
+    event: dict,
+    user_email: Optional[str] = None,
+    *,
+    owned_emails: Optional[Iterable[str]] = None,
+) -> bool:
+    """Is the event's organizer one of the user's owned identities?
+
+    Either pass the primary ``user_email`` (back-compat single-identity
+    check) or ``owned_emails`` (the full owned set — recognises the user
+    as organizer under any of their accounts)."""
+    organizer = (event.get("organizer") or {}).get("email", "").lower()
+    if not organizer:
+        return False
+    owned = _normalise_owned_emails(user_email or "", owned_emails)
+    return organizer in owned
 
 
 # Fields hashed via a normalised form rather than their raw value.

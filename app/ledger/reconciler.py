@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Iterable, Optional
 
 import aiosqlite
 
@@ -94,6 +94,7 @@ async def reconcile_user(
     run_discovery: bool = False,
     dry_run: bool = False,
     now: Optional[datetime] = None,
+    owned_emails: Optional["Iterable[str]"] = None,
 ) -> dict:
     """Run one full reconciliation pass for one user.
 
@@ -213,6 +214,7 @@ async def reconcile_user(
                 client_calendar_id=int(cal["id"]),
                 google_calendar_id=cal["google_calendar_id"],
                 user_email=user_email,
+                owned_emails=owned_emails,
             )
             out["ingest"][f"client:{cal['id']}"] = counters
         except Exception as e:
@@ -232,6 +234,7 @@ async def reconcile_user(
                 personal_calendar_id=int(cal["id"]),
                 google_calendar_id=cal["google_calendar_id"],
                 user_email=user_email,
+                owned_emails=owned_emails,
             )
         except Exception as e:
             logger.warning(
@@ -273,6 +276,7 @@ async def reconcile_user(
                 user_id=user_id,
                 google_main_calendar_id=main_google_calendar_id,
                 user_email=user_email,
+                owned_emails=owned_emails,
             )
         except Exception as e:
             logger.warning("main ingest failed user_id=%s: %s", user_id, e)
@@ -358,6 +362,7 @@ async def audit_user(
     window_fwd_days: int = 90,
     drain: bool = True,
     now: Optional[datetime] = None,
+    owned_emails: Optional[Iterable[str]] = None,
 ) -> dict:
     """Source-content audit (the periodic backstop the incremental sync
     cannot provide).
@@ -402,6 +407,7 @@ async def audit_user(
                 db, google,
                 user_id=user_id,
                 user_email=user_email,
+                owned_emails=owned_emails,
                 client_calendar_id=int(cal["id"]),
                 google_calendar_id=cal["google_calendar_id"],
                 time_min=time_min,
@@ -454,6 +460,7 @@ async def _audit_client_calendar(
     *,
     user_id: int,
     user_email: str,
+    owned_emails: Optional[Iterable[str]] = None,
     client_calendar_id: int,
     google_calendar_id: str,
     time_min: datetime,
@@ -484,6 +491,7 @@ async def _audit_client_calendar(
                 user_id=user_id,
                 client_calendar_id=client_calendar_id,
                 user_email=user_email,
+                owned_emails=owned_emails,
                 event=ev,
                 skip_if_older=True,
             )
