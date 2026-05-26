@@ -305,25 +305,28 @@ def _decide(
             return OP_DELETE_SOURCE, None, target_cal
         if desired != PRESENT_FULL_RSVP_ONLY:
             return None, None, target_cal
-        # The writeback patches an event we do NOT own, so it must
-        # fire ONLY for a genuine change to the user's edits — never
-        # on a bare version bump (e.g. a recolor, which the writeback
-        # does not carry).  A no-op patch would still touch the
-        # source event and echo back through that calendar's
-        # incremental feed as a spurious change.  A NULL
-        # applied_payload_hash means "not yet baselined": the
-        # projection was just planned from state ingested *from* the
-        # source, so it already matches — snap a baseline, no patch.
+        # The writeback patches an event we do NOT own, so it must fire
+        # ONLY when a confirmed MAIN-side edit needs to reach the source
+        # — never on a desired_hash bump from re-ingesting the source.
+        # ``origin_writeback_pending`` is the only safe signal: it is set
+        # by ``_maybe_apply_main_edit_back`` when an edit on our main
+        # copy is classified as RSVP/time/detail-propagatable, and
+        # cleared by the outbox after a successful patch.  Without this
+        # guard, a normal source-side update (the user RSVPing on the
+        # SOURCE itself, an attendee responding, anything that touches
+        # ``attendees_json``) would re-render the writeback payload,
+        # bump desired_hash, and trigger a patch with BB's cached
+        # attendee snapshot — clobbering whatever the user just did on
+        # the source.  Live regression: an "accepted" RSVP on mlcommons
+        # was reverted to "needsAction" by a stale writeback.  See
+        # test_rsvp_only_does_not_clobber_source_on_source_side_change.
+        if not bool(proj["origin_writeback_pending"]):
+            return None, None, target_cal
         applied = proj["applied_payload_hash"]
         if applied is not None and applied == proj["desired_payload_hash"]:
-            # Already written back — nothing to do.
-            return None, None, target_cal
-        if applied is None and not bool(proj["origin_writeback_pending"]):
-            # First sight with a NULL baseline normally means the
-            # projection was just planned from state ingested FROM the
-            # source, so the source already matches — snap a baseline,
-            # no patch.  origin_writeback_pending overrides this: a
-            # main-side edit produced a change the source has not seen.
+            # Flag is set but the source already matches (e.g. the
+            # patch just ran).  Outbox will clear the flag on the next
+            # successful patch; here just no-op.
             return None, None, target_cal
         return OP_PATCH, payload, target_cal
 
