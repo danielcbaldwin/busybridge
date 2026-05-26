@@ -96,8 +96,43 @@ def canonical_uid_for_instance(
     the original start time, so they survive parent re-keying
     (the `_R` reschedule case) by being re-parented rather than
     deleted.
+
+    ``original_start`` is normalised to a canonical UTC instant before
+    being embedded in the UID — Google returns the same occurrence's
+    ``originalStartTime`` with different timezone offsets across reads
+    (e.g. ``-04:00`` from a New-York-local user, ``+02:00`` after the
+    user travels to Europe), and embedding the raw string would
+    fingerprint the SAME occurrence into multiple distinct UIDs and
+    DUPLICATE the ledger row.  Live regression: when the account moved
+    between EDT and CEST, BB created a second row per modified instance
+    and both rows fought over the main copy.  See
+    test_instance_canonical_is_timezone_stable.  All-day occurrences
+    keep their ``YYYY-MM-DD`` form (no offset to normalise).
     """
-    return f"{parent_canonical_uid}:inst:{original_start}"
+    return f"{parent_canonical_uid}:inst:{_canonical_instant_for_uid(original_start)}"
+
+
+def _canonical_instant_for_uid(value: str) -> str:
+    """UTC-normalised form of an ISO timestamp for use inside a UID.
+
+    A timed value with any offset becomes ``YYYY-MM-DDTHH:MM:SSZ``; an
+    all-day value (bare ``YYYY-MM-DD``) is returned unchanged; an
+    unparsable value falls back to the raw string so malformed inputs
+    still produce a deterministic (if non-normalised) UID.
+    """
+    if not value:
+        return value
+    if "T" not in value:
+        # Bare date — all-day occurrence; already canonical.
+        return value
+    iso = (value[:-1] + "+00:00") if value.endswith("Z") else value
+    try:
+        dt = datetime.fromisoformat(iso)
+    except (ValueError, TypeError):
+        return value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ---------------------------------------------------------------------------
