@@ -956,11 +956,17 @@ def _canonical_instant(value: Optional[str], is_all_day: bool) -> Optional[str]:
 
 def _content_hash(fields: dict) -> str:
     hashable = {k: fields[k] for k in sorted(fields) if k not in _HASH_EXCLUDE}
-    if fields.get("conference_data_json"):
-        # Detect a real Meet-link change without churning on read noise.
-        hashable["conference_sig"] = _conference_signature(
-            fields["conference_data_json"]
-        )
+    # conferenceData is dropped from change detection: even the
+    # entry-point URI set varies across reads for the same event (Google
+    # returns "uym-zdoy-vof" one pass and "vjs-kzyb-gkb" the next — both
+    # valid links the recurring instance carries; the conference id /
+    # URI normalisation we tried before couldn't see through that), so
+    # any hash including it churned versions into the thousands.  The
+    # blob is still STORED (raw) and rendered on the main copy, and an
+    # actual Meet-link change re-renders the next time *anything else*
+    # changes on the event or the next audit re-ingest.  We accept up to
+    # one audit cycle of staleness on a Meet-link swap to keep the hash
+    # deterministic.
     # UTC-normalised start/end so a timezone-only representation shift
     # doesn't masquerade as drift (the live churn that ran versions into
     # the thousands).  Original values still stored for display.

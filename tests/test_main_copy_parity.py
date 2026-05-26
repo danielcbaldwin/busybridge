@@ -21,15 +21,17 @@ from tests.integration.framework import Scenario
 pytestmark = pytest.mark.asyncio
 
 
-async def test_content_hash_conference_data_signature():
-    """conferenceData change detection uses a normalised signature.
+async def test_content_hash_ignores_conference_data_and_html_link():
+    """conferenceData and htmlLink are excluded from change detection.
 
-    Google's conferenceData serialisation varies between reads, so
-    hashing it verbatim makes every Meet event churn.  Read-noise
-    (entry-point order, extra labels) must hash identically, but a
-    GENUINE Meet-link change (a different entry-point URI) must be
-    detected so the new link propagates — and so must a real field.
-    htmlLink is display-only and never drives a bump.
+    Google's API returns different conferenceData entry-point URIs
+    across reads of the same recurring event (both valid links the
+    event carries), so any contribution to the hash — even a normalised
+    signature — churns versions into the thousands.  Both fields are
+    still STORED and RENDERED onto the main copy; only the hash that
+    drives 'did the event change?' ignores them.  A real Meet-link
+    change still propagates on the next ingest of any OTHER field
+    change or via the periodic content audit.
     """
     from app.ledger.ingest.client import _content_hash
 
@@ -39,23 +41,15 @@ async def test_content_hash_conference_data_signature():
             '{"entryPoints":[{"uri":"https://meet.google.com/abc"}]}',
         "source_html_link": "https://cal/eid=1",
     }
-    # Read-noise (reordered/extra labels) + different htmlLink → same hash.
-    noise = dict(
-        base,
-        conference_data_json=(
-            '{"conferenceSolution":{"name":"Meet"},'
-            '"entryPoints":[{"label":"x","uri":"https://meet.google.com/abc"}]}'
-        ),
-        source_html_link="https://cal/eid=2",
-    )
-    assert _content_hash(base) == _content_hash(noise)
-    # A genuinely different Meet link → different hash (must re-sync).
-    new_link = dict(
+    # Different Meet link, different htmlLink, different conferenceData
+    # serialisation — must all hash identically.
+    different = dict(
         base,
         conference_data_json='{"entryPoints":[{"uri":"https://meet.google.com/xyz"}]}',
+        source_html_link="https://cal/eid=2",
     )
-    assert _content_hash(base) != _content_hash(new_link)
-    # A real field change → different hash.
+    assert _content_hash(base) == _content_hash(different)
+    # A real field change → different hash (sanity).
     assert _content_hash(base) != _content_hash(dict(base, summary="Changed"))
 
 

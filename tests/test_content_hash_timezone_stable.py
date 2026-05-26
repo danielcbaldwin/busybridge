@@ -53,6 +53,39 @@ def test_genuinely_different_times_hash_differently():
     assert h1 != h2, "moving the event by an hour must change the hash"
 
 
+def test_conference_data_does_not_affect_hash():
+    """Google returns different Meet entry-point URIs across reads of the
+    same recurring event — both valid links it carries — so any
+    conference-derived contribution to the hash churns versions into the
+    thousands.  Hash must ignore conferenceData entirely (the data is
+    still stored + rendered)."""
+    def _with_meet(uri: str) -> dict:
+        return {
+            "id": "x",
+            "summary": "S",
+            "start": {"dateTime": "2026-05-28T09:00:00Z"},
+            "end": {"dateTime": "2026-05-28T10:00:00Z"},
+            "conferenceData": {
+                "conferenceId": uri.rsplit("/", 1)[-1],
+                "entryPoints": [
+                    {"entryPointType": "video", "uri": uri},
+                ],
+            },
+        }
+    h1 = _content_hash(_extract_event_fields(
+        _with_meet("https://meet.google.com/uym-zdoy-vof"),
+        user_email="u@example.com",
+    ))
+    h2 = _content_hash(_extract_event_fields(
+        _with_meet("https://meet.google.com/vjs-kzyb-gkb"),
+        user_email="u@example.com",
+    ))
+    assert h1 == h2, (
+        "different conferenceData on the same event must NOT change the "
+        f"hash; got {h1[:8]} != {h2[:8]}"
+    )
+
+
 def test_all_day_event_hash_stable():
     """All-day events use ``date`` not ``dateTime``; the YYYY-MM-DD form
     has no offset to normalise, so this is just a guard against the
