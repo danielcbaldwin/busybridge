@@ -232,6 +232,7 @@ async def _reconcile_user_once(
         db, access["router"],
         user_id=user_id,
         user_email=access["main_email"],
+        owned_emails=access.get("owned_emails"),
         main_google_calendar_id=user["main_calendar_id"],
         client_calendars=access["client_calendars"],
         all_known_client_calendars=access["all_known"],
@@ -276,6 +277,7 @@ async def _audit_user_once(user_id: int) -> dict:
         db, access["router"],
         user_id=user_id,
         user_email=access["main_email"],
+        owned_emails=access.get("owned_emails"),
         main_google_calendar_id=user["main_calendar_id"],
         client_calendars=access["client_calendars"],
         all_known_client_calendars=access["all_known"],
@@ -420,12 +422,22 @@ async def build_user_google_access(
         {"id": int(r["id"]), "google_calendar_id": r["google_calendar_id"]}
         for r in cal_rows
     ]
+    # Every email this user owns — the home account plus each connected
+    # OAuth account (client / personal).  Ingest treats ANY of these as
+    # 'you' for organizer / self-attendee matching, so an event you
+    # organise under a non-home identity (e.g. via your work account)
+    # correctly reads as editable instead of landing with a 🔒 prefix.
+    owned_emails = {main_email.lower()} | {
+        (row["google_account_email"] or "").lower() for row in cal_rows
+        if row["google_account_email"]
+    }
     return {
         "main_email": main_email,
         "router": router,
         "client_calendars": active_clients,
         "personal_calendars": active_personals,
         "all_known": all_known,
+        "owned_emails": owned_emails,
     }
 
 

@@ -23,7 +23,7 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Iterable, Optional
 
 import aiosqlite
 
@@ -60,6 +60,7 @@ async def ingest_main_calendar(
     user_id: int,
     google_main_calendar_id: str,
     user_email: str,
+    owned_emails: Optional[Iterable[str]] = None,
 ) -> dict:
     """Run one ingest pass for the user's main calendar.
 
@@ -114,6 +115,7 @@ async def ingest_main_calendar(
                 db,
                 user_id=user_id,
                 user_email=user_email,
+                owned_emails=owned_emails,
                 event=event,
             )
             counters[outcome] = counters.get(outcome, 0) + 1
@@ -134,6 +136,7 @@ async def ingest_main_calendar(
                 db,
                 user_id=user_id,
                 user_email=user_email,
+                owned_emails=owned_emails,
                 event=inst,
             )
         scan_failures = await scan_full_sync_recurring_cancellations(
@@ -180,6 +183,7 @@ async def _ingest_one_main_event(
     user_id: int,
     user_email: str,
     event: dict,
+    owned_emails: Optional[Iterable[str]] = None,
 ) -> tuple[str, Optional[int]]:
     event_id = event["id"]
     status = event.get("status", "confirmed")
@@ -228,6 +232,7 @@ async def _ingest_one_main_event(
         if proj_match is not None and status != "cancelled":
             outcome = await _maybe_apply_main_edit_back(
                 db, user_email=user_email,
+                owned_emails=owned_emails,
                 ledger_event_id=int(proj_match["ledger_event_id"]),
                 event=event,
             )
@@ -250,6 +255,7 @@ async def _ingest_one_main_event(
             db,
             user_id=user_id,
             user_email=user_email,
+            owned_emails=owned_emails,
             event=event,
             managed_parent_id=recurring_parent,
         )
@@ -262,6 +268,7 @@ async def _ingest_one_main_event(
             db,
             user_id=user_id,
             user_email=user_email,
+            owned_emails=owned_emails,
             event=event,
             parent_canonical=parent_canonical,
             source_type="main_native",
@@ -291,7 +298,9 @@ async def _ingest_one_main_event(
         await _mark_native_cancelled(db, ledger_event_id=int(existing["id"]))
         return "cancelled_native", int(existing["id"])
 
-    fields = _extract_event_fields(event, user_email=user_email)
+    fields = _extract_event_fields(
+        event, user_email=user_email, owned_emails=owned_emails,
+    )
     when = datetime.now(UTC).isoformat()
     if existing is None:
         cursor = await db.execute(
@@ -391,6 +400,7 @@ async def _ingest_managed_recurring_instance(
     user_email: str,
     event: dict,
     managed_parent_id: str,
+    owned_emails: Optional[Iterable[str]] = None,
 ) -> tuple[str, Optional[int]]:
     """Handle an instance of one of our managed recurring main copies.
 
@@ -453,6 +463,7 @@ async def _ingest_managed_recurring_instance(
             db,
             user_id=user_id,
             user_email=user_email,
+            owned_emails=owned_emails,
             event=event,
             parent_canonical=parent["canonical_uid"],
             source_type=parent["source_type"],
@@ -479,7 +490,9 @@ async def _ingest_managed_recurring_instance(
     # guestsCanModify.  Take edit-rights / organizer / attendees from
     # the SOURCE series; take the moved time and (for full copies) the
     # detail from the event.
-    fields = _extract_event_fields(event, user_email=user_email)
+    fields = _extract_event_fields(
+        event, user_email=user_email, owned_emails=owned_emails,
+    )
     fields["user_can_edit"] = bool(parent["user_can_edit"])
     fields["organizer_email"] = parent["organizer_email"]
     fields["attendees_json"] = parent["attendees_json"]
@@ -491,6 +504,7 @@ async def _ingest_managed_recurring_instance(
         db,
         user_id=user_id,
         user_email=user_email,
+        owned_emails=owned_emails,
         event=event,
         parent_canonical=parent["canonical_uid"],
         source_type=parent["source_type"],
@@ -519,6 +533,7 @@ async def _maybe_apply_main_edit_back(
     user_email: str,
     ledger_event_id: int,
     event: dict,
+    owned_emails: Optional[Iterable[str]] = None,
 ) -> Optional[str]:
     """The user edited our copy of an event on the main calendar.
     Classify the edit and either propagate it to the source event or
@@ -585,7 +600,7 @@ async def _maybe_apply_main_edit_back(
         )
         canonical = rendered or {}
 
-    new_rsvp = _extract_self_rsvp(event, user_email)
+    new_rsvp = _extract_self_rsvp(event, user_email, owned_emails=owned_emails)
     new_start, new_end, new_start_tz, new_end_tz, is_all_day = (
         _extract_start_end(event)
     )
@@ -667,9 +682,18 @@ def _detail_differs(event: dict, canonical: dict) -> bool:
     return False
 
 
-def _extract_self_rsvp(event: dict, user_email: str) -> Optional[str]:
+def _extract_self_rsvp(
+    event: dict,
+    user_email: str,
+    *,
+    owned_emails: Optional[Iterable[str]] = None,
+) -> Optional[str]:
+    """The user's RSVP on an event, matched against any of their owned
+    identities (home + every connected OAuth account)."""
+    from app.ledger.ingest.client import _normalise_owned_emails
+    owned = _normalise_owned_emails(user_email, owned_emails)
     for att in (event.get("attendees") or []):
-        if att.get("self") or att.get("email", "").lower() == user_email.lower():
+        if att.get("self") or att.get("email", "").lower() in owned:
             return att.get("responseStatus")
     return None
 
