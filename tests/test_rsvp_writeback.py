@@ -120,6 +120,65 @@ async def test_origin_rsvp_projection_never_deletes_the_source_event():
     await s.close()
 
 
+async def test_rsvp_only_does_not_clobber_source_on_source_side_change():
+    """When ANY change comes in on the SOURCE event itself (the user
+    RSVPs there directly, another attendee responds, etc.), BB must NOT
+    write its cached attendee snapshot back to the source — that's a
+    clobber that reverts whatever the user just did.
+
+    Live regression: an accepted RSVP on mlcommons was reverted to
+    needsAction because re-ingesting the source bumped desired_hash on
+    the rsvp_only writeback projection and the diff fired a patch with
+    BB's stale attendees_json.
+
+    The writeback patch is allowed to fire ONLY when
+    ``origin_writeback_pending=1`` — i.e. when the change came from a
+    user edit on the BB main copy.  A source-ingest bump alone never
+    triggers it.
+    """
+    s = Scenario()
+    s.given_calendar("main")
+    s.given_calendar("client_a")
+    await s.given_user("alice", main="main", clients=["client_a"])
+    _client_event_with_attendees(s, "client_a", "srcrsvp00001")
+
+    await s.run_reconciler_until_quiescent("alice", max_passes=4)
+    # Stamp a hash baseline so the next diff sees a settled state.
+    await s.run_reconciler_until_quiescent("alice", max_passes=2)
+
+    # Alice accepts directly on the SOURCE (mlcommons-style flow), and
+    # any other change happens on it too (e.g. bob's RSVP changes) — the
+    # whole point is that the source state is now non-equal to whatever
+    # BB has cached.  BB must ingest this and update the ledger, but
+    # MUST NOT echo it back as a patch.
+    s.update_event(
+        "client_a", "srcrsvp00001",
+        attendees=[
+            {"email": "alice@example.com", "self": True,
+             "responseStatus": "accepted"},
+            {"email": "bob@example.com", "responseStatus": "declined"},
+        ],
+    )
+
+    # Snapshot the source state, then reconcile, then assert the source
+    # is byte-identical (or at least: alice still accepted, bob still
+    # declined).  A clobbering patch would have reverted these to
+    # whatever BB had cached from the first ingest.
+    await s.run_reconciler_until_quiescent("alice", max_passes=5)
+    source = s.google.get_event(s.cal("client_a"), "srcrsvp00001")
+    alice = _attendee(source, "alice@example.com")
+    bob = _attendee(source, "bob@example.com")
+    assert alice is not None and alice["responseStatus"] == "accepted", (
+        f"source RSVP for alice was CLOBBERED by BB; attendees="
+        f"{source.get('attendees')}"
+    )
+    assert bob is not None and bob["responseStatus"] == "declined", (
+        f"source RSVP for bob was clobbered too; attendees="
+        f"{source.get('attendees')}"
+    )
+    await s.close()
+
+
 async def test_no_origin_projection_for_a_locked_event_without_an_rsvp():
     """A non-editable client event the user has no RSVP on gets no
     origin writeback projection — there is nothing that could ever be

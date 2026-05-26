@@ -614,6 +614,13 @@ async def _maybe_apply_main_edit_back(
     apply_detail = detail_changed and user_can_edit and detail_writeback
 
     when = datetime.now(UTC).isoformat()
+    # When ANY category is being propagated (rsvp/time/detail), flag the
+    # ledger row so the diff's origin-writeback patch fires.  Without
+    # this flag set, the diff treats a desired_hash bump as a
+    # source-ingest echo and snaps a baseline — which is the correct
+    # default to prevent the source-clobber regression
+    # (test_rsvp_only_does_not_clobber_source_on_source_side_change).
+    propagating = apply_rsvp or apply_time or apply_detail
     await db.execute(
         """UPDATE ledger_events
               SET user_rsvp_status = COALESCE(?, user_rsvp_status),
@@ -625,6 +632,8 @@ async def _maybe_apply_main_edit_back(
                   summary = CASE WHEN ? THEN ? ELSE summary END,
                   description = CASE WHEN ? THEN ? ELSE description END,
                   location = CASE WHEN ? THEN ? ELSE location END,
+                  origin_writeback_pending =
+                      CASE WHEN ? THEN 1 ELSE origin_writeback_pending END,
                   version = version + 1,
                   updated_at = ?
             WHERE id = ?""",
@@ -638,10 +647,11 @@ async def _maybe_apply_main_edit_back(
             apply_detail, event.get("summary"),
             apply_detail, strip_full_copy_metadata(event.get("description")),
             apply_detail, event.get("location"),
+            propagating,
             when, ledger_event_id,
         ),
     )
-    if apply_rsvp or apply_time or apply_detail:
+    if propagating:
         return "main_edit_propagated"
     return "main_drift_reverted"
 
