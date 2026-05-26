@@ -902,7 +902,17 @@ def _user_is_organizer(event: dict, user_email: str) -> bool:
 # Meet-link change IS detected and re-synced, the serialisation noise
 # is not.  htmlLink is stable and display-only, so it is dropped from
 # change detection entirely.  Both are still stored and rendered in full.
-_HASH_EXCLUDE = frozenset({"conference_data_json", "source_html_link"})
+#
+# start_at / end_at are excluded for the same reason: Google returns the
+# same instant in different timezone offsets across reads / accounts (a
+# user travelling will see "+02:00" one pass and "-04:00" the next), so
+# the raw string churns even though the moment in time is unchanged.
+# We hash a canonical UTC instant instead.  Display-time values stay
+# whatever Google last delivered — only change DETECTION is normalised.
+_HASH_EXCLUDE = frozenset({
+    "conference_data_json", "source_html_link",
+    "start_at", "end_at",
+})
 
 
 def _conference_signature(conf_json: Optional[str]) -> str:
@@ -921,6 +931,29 @@ def _conference_signature(conf_json: Optional[str]) -> str:
     return (data.get("conferenceId") or "") + "|" + "|".join(uris)
 
 
+def _canonical_instant(value: Optional[str], is_all_day: bool) -> Optional[str]:
+    """Hash-friendly form of an event start/end.
+
+    For timed values: parse the offset-bearing ISO string to a UTC
+    instant — same moment hashes the same regardless of which timezone
+    Google chose to render it in.  For all-day values: the bare
+    ``YYYY-MM-DD`` is already canonical.  Unparsable inputs fall back to
+    the raw string so a malformed value still detects change."""
+    if not value:
+        return None
+    if is_all_day:
+        return value[:10]
+    s = value
+    iso = (s[:-1] + "+00:00") if s.endswith("Z") else s
+    try:
+        dt = datetime.fromisoformat(iso)
+    except (ValueError, TypeError):
+        return s
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _content_hash(fields: dict) -> str:
     hashable = {k: fields[k] for k in sorted(fields) if k not in _HASH_EXCLUDE}
     if fields.get("conference_data_json"):
@@ -928,6 +961,12 @@ def _content_hash(fields: dict) -> str:
         hashable["conference_sig"] = _conference_signature(
             fields["conference_data_json"]
         )
+    # UTC-normalised start/end so a timezone-only representation shift
+    # doesn't masquerade as drift (the live churn that ran versions into
+    # the thousands).  Original values still stored for display.
+    is_all_day = bool(fields.get("is_all_day"))
+    hashable["start_instant"] = _canonical_instant(fields.get("start_at"), is_all_day)
+    hashable["end_instant"] = _canonical_instant(fields.get("end_at"), is_all_day)
     canonical = json.dumps(hashable, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
