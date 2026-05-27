@@ -39,6 +39,7 @@ from app.ledger.payload import (
     strip_full_copy_metadata,
 )
 from app.ledger.ingest.client import (
+    _canonical_instant,
     _content_hash,
     _content_hash_from_row,
     _extract_event_fields,
@@ -611,9 +612,21 @@ async def _maybe_apply_main_edit_back(
     rsvp_changed = (
         new_rsvp is not None and new_rsvp != ledger["user_rsvp_status"]
     )
+    # Compare canonical UTC instants, not raw ISO strings: Google rewrites
+    # the offset on ``start.dateTime`` to match the ``timeZone`` we sent
+    # (e.g. "11:35-04:00" submitted with timeZone=America/Los_Angeles
+    # comes back as "08:35-07:00" — same instant, different string).
+    # A raw string compare flagged every re-ingest as drift, bumping
+    # version and looping the planner → write → webhook cycle.
+    new_is_all_day = bool(is_all_day)
+    new_start_inst = _canonical_instant(new_start, new_is_all_day)
+    new_end_inst = _canonical_instant(new_end, new_is_all_day)
+    old_is_all_day = bool(ledger["is_all_day"])
+    old_start_inst = _canonical_instant(ledger["start_at"], old_is_all_day)
+    old_end_inst = _canonical_instant(ledger["end_at"], old_is_all_day)
     time_changed = (
         new_start is not None
-        and (new_start != ledger["start_at"] or new_end != ledger["end_at"])
+        and (new_start_inst != old_start_inst or new_end_inst != old_end_inst)
     )
     detail_changed = _detail_differs(event, canonical)
 

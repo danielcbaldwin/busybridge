@@ -530,13 +530,19 @@ def _stamp_extended_properties(
     ledger_version: Optional[int],
     target_kind: Optional[str],
 ) -> None:
-    if projection_id is None and ledger_version is None and target_kind is None:
+    # ``ledger_version`` is intentionally NOT stamped: it changes every
+    # time the ledger row's version bumps, which makes the rendered body
+    # — and thus ``hash_payload`` — non-idempotent.  A non-idempotent
+    # hash combined with any phantom version bump becomes a perpetual
+    # planner→write→webhook→re-ingest loop (~28K writes/hr to one
+    # calendar before this fix).  ``projection_id`` and ``target_kind``
+    # are both stable per projection, so stamping them is safe.
+    del ledger_version  # explicitly unused; signature kept for callers
+    if projection_id is None and target_kind is None:
         return
     ep = body.setdefault("extendedProperties", {})
     priv = ep.setdefault("private", {})
     if projection_id is not None:
         priv[EP_PROJ_ID] = str(projection_id)
-    if ledger_version is not None:
-        priv[EP_LEDGER_VERSION] = str(ledger_version)
     if target_kind is not None:
         priv[EP_TARGET_KIND] = target_kind
