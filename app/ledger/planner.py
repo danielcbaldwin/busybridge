@@ -201,7 +201,23 @@ def _compute_desired_projections(
         }
 
     if source == "webcal":
+        # Placement (see webcal.md §Planner Rules):
+        #   main      -> full on main, busy/absent on every client
+        #   client    -> full on main AND the placement client,
+        #                busy/absent on every other client
+        #   client+stale (target null/inactive) -> behaves like main
         peer = PRESENT_BUSY if show_as != "free" else ABSENT
+        placement_kind = ledger["placement_kind"] or "main"
+        placement_resolved = ledger["placement_client_resolved_id"]
+        if placement_kind == "client" and placement_resolved is not None:
+            # The placement target gets a real full copy, not a
+            # PRESENT_FULL_RSVP_ONLY writeback — webcal feeds are
+            # read-only sources, so there is no edit to push back.
+            return {
+                "main": PRESENT_FULL,
+                "peer_clients": peer,
+                "origin_client": PRESENT_FULL,
+            }
         return {"main": PRESENT_FULL, "peer_clients": peer, "origin_client": ABSENT}
 
     raise ValueError(f"unknown source_type: {source!r}")
@@ -234,6 +250,23 @@ def _resolve_targets(
         else None
     )
     same_id_space = source_type in ("client",)
+
+    # WebCal placement: the placement client_calendar IS the origin for
+    # routing purposes, *only* when the target row resolved (active and
+    # belongs-to-user, per the planner's JOIN gating).  This is what
+    # promotes the selected client from peer-busy to origin-full.  The
+    # placement_client_calendar_id space is client_calendars.id, so
+    # same_id_space is True for this branch — the existing collision
+    # warning (webcal_subscriptions.id ≠ client_calendars.id) does NOT
+    # apply here because we are using the placement id, not the source
+    # id.
+    if (
+        source_type == "webcal"
+        and ledger["placement_client_resolved_id"] is not None
+    ):
+        origin_cal_id = int(ledger["placement_client_resolved_id"])
+        same_id_space = True
+
     peer_state = desired["peer_clients"]
     origin_state = desired["origin_client"]
 
@@ -373,14 +406,49 @@ async def _get_ledger_row(db: aiosqlite.Connection, ledger_event_id: int):
     # are read at render time so they stay consistent with the diff's
     # send body (which joins the same way) — keeping the payload hash
     # stable.
+    #
+    # For source_type='webcal' the JOIN target is webcal_subscriptions
+    # (its display_prefix becomes the Source: label) plus an optional
+    # second JOIN to client_calendars via placement_client_calendar_id
+    # — that's the "placement target" that drives the color, the
+    # Placement: footer line, and the per-target full-copy fan-out
+    # (see webcal.md §Label, Footer, Color).  cc_placement is gated
+    # on is_active=1 so a stale placement (target disconnected) falls
+    # through to the main-placed render (no color, no Placement
+    # line).
     row = await (await db.execute(
         """SELECT e.*,
-                  cc.color_id AS calendar_color_id,
-                  cc.display_name AS source_label
+                  COALESCE(
+                      cc.display_name,
+                      NULLIF(ws.display_prefix, '')
+                  ) AS source_label,
+                  CASE
+                    WHEN e.source_type IN ('client', 'personal')
+                      THEN cc.color_id
+                    WHEN e.source_type = 'webcal'
+                      AND ws.placement_kind = 'client'
+                      THEN cc_placement.color_id
+                    ELSE NULL
+                  END AS calendar_color_id,
+                  CASE
+                    WHEN e.source_type = 'webcal'
+                      AND ws.placement_kind = 'client'
+                      THEN cc_placement.display_name
+                    ELSE NULL
+                  END AS placement_label,
+                  ws.placement_kind                AS placement_kind,
+                  ws.placement_client_calendar_id  AS placement_client_calendar_id,
+                  cc_placement.id                  AS placement_client_resolved_id
              FROM ledger_events e
              LEFT JOIN client_calendars cc
                     ON cc.id = e.source_calendar_id
                    AND e.source_type IN ('client', 'personal')
+             LEFT JOIN webcal_subscriptions ws
+                    ON ws.id = e.source_calendar_id
+                   AND e.source_type = 'webcal'
+             LEFT JOIN client_calendars cc_placement
+                    ON cc_placement.id = ws.placement_client_calendar_id
+                   AND cc_placement.is_active = 1
             WHERE e.id = ?""",
         (int(ledger_event_id),),
     )).fetchone()

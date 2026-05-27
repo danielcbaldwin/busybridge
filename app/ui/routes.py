@@ -132,13 +132,21 @@ async def dashboard(request: Request, error: Optional[str] = None):
         "status": _integrity["status"],
     }
 
-    # Get webcal subscriptions (event counts merged in from the
-    # ledger).
+    # Get webcal subscriptions with placement-target metadata so the
+    # dashboard can render the "Placement target disconnected" badge
+    # (and so the edit form can pre-select the current target).  LEFT
+    # JOIN client_calendars on the placement_client_calendar_id; rows
+    # whose target is gone or inactive resolve to NULL on the joined
+    # columns and fall into the 'disconnected' status bucket.
     cursor = await db.execute(
-        """SELECT ws.*
-           FROM webcal_subscriptions ws
-           WHERE ws.user_id = ? AND ws.is_active = TRUE
-           ORDER BY ws.created_at DESC""",
+        """SELECT ws.*,
+                  cc.display_name AS placement_client_display_name,
+                  cc.is_active    AS placement_client_is_active
+             FROM webcal_subscriptions ws
+        LEFT JOIN client_calendars cc
+               ON cc.id = ws.placement_client_calendar_id
+            WHERE ws.user_id = ? AND ws.is_active = TRUE
+         ORDER BY ws.created_at DESC""",
         (user.id,)
     )
     webcal_rows = await cursor.fetchall()
@@ -146,11 +154,28 @@ async def dashboard(request: Request, error: Optional[str] = None):
         _merge_webcal_count(row, events_per_webcal) for row in webcal_rows
     ]
 
+    # Active client calendars for the placement dropdown.  The list
+    # excludes disconnected calendars (per webcal.md §User Flow:
+    # "lists only currently active client calendars").  The template
+    # disables the Client radio when this list is empty.
+    cursor = await db.execute(
+        """SELECT id, display_name
+             FROM client_calendars
+            WHERE user_id = ? AND is_active = 1
+         ORDER BY display_name""",
+        (user.id,)
+    )
+    active_client_calendars = [
+        {"id": row["id"], "display_name": row["display_name"] or "(unnamed)"}
+        for row in await cursor.fetchall()
+    ]
+
     return templates.TemplateResponse(request, "dashboard.html", context={
         "user": user,
         "calendars": calendars,
         "personal_calendars": personal_calendars,
         "webcal_subscriptions": webcal_subscriptions,
+        "active_client_calendars": active_client_calendars,
         "status": status_row,
         "event_count": event_count,
         "managed_event_prefix": managed_event_prefix,
@@ -629,4 +654,23 @@ def _merge_webcal_count(row, events_by_sub: dict[int, int]) -> dict:
     d = {k: row[k] for k in row.keys()}
     sid = int(d.get("id") or 0)
     d["event_count"] = events_by_sub.get(sid, 0)
+    # placement_target_status drives the dashboard badge.  Mirrors the
+    # API list response (see app/api/webcal.py:_derive_placement_status)
+    # so the UI and API agree on which subscriptions are "stale".
+    kind = d.get("placement_kind") or "main"
+    target_id = d.get("placement_client_calendar_id")
+    target_active = d.get("placement_client_is_active")
+    if kind != "client":
+        d["placement_target_status"] = "not_applicable"
+    elif target_id is None or not target_active:
+        d["placement_target_status"] = "disconnected"
+    else:
+        d["placement_target_status"] = "active"
+    # Display name with cache fallback so the badge can name the lost
+    # target even after its row goes inactive (or, on hard delete,
+    # disappears entirely).
+    name = d.get("placement_client_display_name")
+    if kind == "client" and not name:
+        name = d.get("placement_client_display_name_cache")
+    d["placement_client_display_name"] = name
     return d

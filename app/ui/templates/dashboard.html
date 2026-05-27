@@ -278,7 +278,8 @@
         </div>
 
         <!-- Add subscription form -->
-        <div class="px-6 py-4 border-b border-gray-200 bg-gray-50" x-data="{ showForm: false, url: '', prefix: '', submitting: false }">
+        <div class="px-6 py-4 border-b border-gray-200 bg-gray-50"
+             x-data="{ showForm: false, url: '', prefix: '', placement_kind: 'main', target_id: null, submitting: false }">
             <button @click="showForm = !showForm" class="text-sm text-indigo-600 hover:text-indigo-500 flex items-center">
                 <i class="fas mr-2" :class="showForm ? 'fa-chevron-down' : 'fa-plus'"></i>
                 <span x-text="showForm ? 'Cancel' : 'Add Subscription'"></span>
@@ -295,19 +296,70 @@
                         class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm py-2 px-3 border">
                     <p class="mt-1 text-xs text-gray-500">Events will appear as: <span class="font-mono">🔐 [Travel] Event Name</span></p>
                 </div>
+                <!-- Placement (see webcal.md §User Flow) -->
+                <fieldset class="border-t border-gray-200 pt-3">
+                    <legend class="text-sm font-medium text-gray-700">Where should this WebCal live?</legend>
+                    <div class="mt-2 space-y-2 text-sm">
+                        <label class="flex items-start">
+                            <input type="radio" name="placement_kind" value="main"
+                                   x-model="placement_kind"
+                                   @change="target_id = null"
+                                   class="mt-0.5 mr-2">
+                            <span>
+                                <span class="font-medium">Main calendar</span>
+                                <span class="block text-xs text-gray-500">
+                                    Events appear on your main calendar.
+                                    Busy blocks are created on all client calendars.
+                                </span>
+                            </span>
+                        </label>
+                        <label class="flex items-start">
+                            <input type="radio" name="placement_kind" value="client"
+                                   x-model="placement_kind"
+                                   {% if not active_client_calendars %}disabled{% endif %}
+                                   class="mt-0.5 mr-2">
+                            <span>
+                                <span class="font-medium">Client calendar:</span>
+                                <select x-model="target_id"
+                                        :disabled="placement_kind !== 'client'"
+                                        class="ml-2 rounded-md border-gray-300 shadow-sm sm:text-sm py-1 px-2 border disabled:bg-gray-100">
+                                    <option :value="null">— select a client —</option>
+                                    {% for cc in active_client_calendars %}
+                                    <option value="{{ cc['id'] }}">{{ cc['display_name'] }}</option>
+                                    {% endfor %}
+                                </select>
+                                <span class="block text-xs text-gray-500">
+                                    Events appear on that client calendar AND your main calendar.
+                                    Busy blocks are created on the other clients.
+                                </span>
+                                {% if not active_client_calendars %}
+                                <span class="block text-xs text-yellow-700 mt-1">
+                                    <i class="fas fa-info-circle mr-1"></i>
+                                    Connect a client calendar first to use this option.
+                                </span>
+                                {% endif %}
+                            </span>
+                        </label>
+                    </div>
+                </fieldset>
                 <button type="button"
                     @click="
                         submitting = true;
                         fetch('/api/webcal-subscriptions', {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({url: url, display_prefix: prefix})
+                            body: JSON.stringify({
+                                url: url,
+                                display_prefix: prefix,
+                                placement_kind: placement_kind,
+                                placement_client_calendar_id: placement_kind === 'client' ? Number(target_id) : null
+                            })
                         }).then(r => {
                             if (r.ok) { window.location.reload(); }
                             else { r.json().then(d => { alert(d.detail || 'Failed'); submitting = false; }); }
                         }).catch(e => { alert('Error: ' + e); submitting = false; });
                     "
-                    :disabled="!url || submitting"
+                    :disabled="!url || submitting || (placement_kind === 'client' && !target_id)"
                     class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50">
                     <span x-show="!submitting">Add &amp; Sync</span>
                     <span x-show="submitting" x-cloak><i class="fas fa-spinner fa-spin mr-1"></i> Validating...</span>
@@ -318,13 +370,40 @@
         {% if webcal_subscriptions %}
         <ul class="divide-y divide-gray-200">
             {% for sub in webcal_subscriptions %}
-            <li class="px-4 sm:px-6 py-4">
+            <li class="px-4 sm:px-6 py-4"
+                x-data="{
+                    editing: false,
+                    {# When placement is stale, pre-fill target_id as null so the
+                       dropdown's '(disconnected — pick a new one)' option is
+                       selected; the stale id is no longer a valid target and
+                       letting the form submit it would just earn a 400. #}
+                    target_id: {% if sub['placement_target_status'] == 'disconnected' %}null{% else %}{{ sub['placement_client_calendar_id'] or 'null' }}{% endif %},
+                    placement_kind: '{{ sub['placement_kind'] or 'main' }}',
+                    submitting: false
+                }">
                 <div class="flex items-start sm:items-center justify-between">
                     <div class="min-w-0 flex-1">
-                        <div class="flex items-center">
+                        <div class="flex items-center flex-wrap gap-2">
                             {% if sub['display_prefix'] %}
-                            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-indigo-100 text-indigo-800 mr-2">
+                            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-indigo-100 text-indigo-800">
                                 {{ sub['display_prefix'] }}
+                            </span>
+                            {% endif %}
+                            {# Placement badge — see webcal.md §User Flow #}
+                            {% if sub['placement_target_status'] == 'active' %}
+                            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-emerald-100 text-emerald-800">
+                                <i class="fas fa-map-pin mr-1"></i>
+                                Placed on {{ sub['placement_client_display_name'] }}
+                            </span>
+                            {% elif sub['placement_target_status'] == 'disconnected' %}
+                            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800"
+                                  title="The client calendar this feed was placed on is disconnected. Pick a new placement.">
+                                <i class="fas fa-exclamation-triangle mr-1"></i>
+                                Placement disconnected{% if sub['placement_client_display_name'] %} ({{ sub['placement_client_display_name'] }}){% endif %}
+                            </span>
+                            {% else %}
+                            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-700">
+                                Main calendar
                             </span>
                             {% endif %}
                             <p class="text-sm font-medium text-gray-900 truncate">{{ sub['url'][:60] }}{% if sub['url']|length > 60 %}...{% endif %}</p>
@@ -346,6 +425,10 @@
                         </div>
                     </div>
                     <div class="ml-4 flex items-center space-x-2">
+                        <button type="button" @click="editing = !editing"
+                            class="inline-flex items-center px-3 py-1.5 border border-gray-300 text-xs font-medium rounded text-gray-700 bg-white hover:bg-gray-50">
+                            <i class="fas fa-map-pin mr-1"></i> Placement
+                        </button>
                         <button type="button"
                             hx-post="/api/webcal-subscriptions/{{ sub['id'] }}/sync"
                             hx-swap="none"
@@ -359,6 +442,61 @@
                             hx-on::after-request="if(event.detail.successful) window.location.reload()"
                             class="text-xs text-red-600 hover:text-red-500">
                             <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                </div>
+                <!-- Inline placement-edit panel -->
+                <div x-show="editing" x-cloak class="mt-3 ml-1 p-3 border border-gray-200 rounded bg-gray-50 text-sm">
+                    <div class="space-y-2">
+                        <label class="flex items-start">
+                            <input type="radio" value="main" x-model="placement_kind"
+                                   @change="target_id = null" class="mt-0.5 mr-2">
+                            <span>Main calendar only</span>
+                        </label>
+                        <label class="flex items-start">
+                            <input type="radio" value="client" x-model="placement_kind"
+                                   {% if not active_client_calendars %}disabled{% endif %}
+                                   class="mt-0.5 mr-2">
+                            <span>
+                                Client calendar:
+                                <select x-model="target_id"
+                                        :disabled="placement_kind !== 'client'"
+                                        class="ml-2 rounded-md border-gray-300 shadow-sm sm:text-xs py-1 px-2 border disabled:bg-gray-100">
+                                    {% if sub['placement_target_status'] == 'disconnected' %}
+                                    <option :value="null">(disconnected — pick a new one)</option>
+                                    {% else %}
+                                    <option :value="null">— select a client —</option>
+                                    {% endif %}
+                                    {% for cc in active_client_calendars %}
+                                    <option value="{{ cc['id'] }}">{{ cc['display_name'] }}</option>
+                                    {% endfor %}
+                                </select>
+                            </span>
+                        </label>
+                    </div>
+                    <div class="mt-3 flex items-center space-x-2">
+                        <button type="button"
+                            @click="
+                                submitting = true;
+                                fetch('/api/webcal-subscriptions/{{ sub['id'] }}', {
+                                    method: 'PATCH',
+                                    headers: {'Content-Type': 'application/json'},
+                                    body: JSON.stringify({
+                                        placement_kind: placement_kind,
+                                        placement_client_calendar_id: placement_kind === 'client' ? Number(target_id) : null
+                                    })
+                                }).then(r => {
+                                    if (r.ok) { window.location.reload(); }
+                                    else { r.json().then(d => { alert(d.detail || 'Failed'); submitting = false; }); }
+                                }).catch(e => { alert('Error: ' + e); submitting = false; });
+                            "
+                            :disabled="submitting || (placement_kind === 'client' && !target_id)"
+                            class="inline-flex items-center px-3 py-1 border border-transparent text-xs font-medium rounded shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50">
+                            <i class="fas fa-save mr-1"></i> Save placement
+                        </button>
+                        <button type="button" @click="editing = false"
+                            class="text-xs text-gray-500 hover:text-gray-700">
+                            Cancel
                         </button>
                     </div>
                 </div>

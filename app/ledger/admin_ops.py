@@ -9,6 +9,7 @@ the planner + outbox carry the truth to Google.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -30,7 +31,13 @@ async def recolor_client_calendar(
 ) -> int:
     """Change a client calendar's color and bump every ledger row
     sourced from it so the next reconcile re-renders the colorId
-    on its projections.  Returns the number of rows touched."""
+    on its projections.  Returns the number of rows touched.
+
+    Also re-enqueues every WebCal subscription PLACED on this client —
+    placed-webcal main and selected-client copies are coloured by the
+    placement client's color_id at render time (see webcal.md §Label,
+    Footer, Color), so a recolor here must replan those rows too.
+    """
     when = datetime.now(UTC).isoformat()
     await db.execute(
         "UPDATE client_calendars SET color_id = ? WHERE id = ?",
@@ -46,16 +53,46 @@ async def recolor_client_calendar(
               AND status = 'active'""",
         (new_color_id, when, client_calendar_id),
     )
+    direct_rows_touched = cursor.rowcount or 0
+
+    # Placed-webcal pass: every webcal subscription where the placement
+    # client is THIS client gets its ledger rows version-bumped so the
+    # next planner pass re-fetches the JOIN (and the new color).  The
+    # ledger row's own color_id is NOT touched — webcal projections
+    # read color from cc_placement at render time, not from the row.
+    await db.execute(
+        """UPDATE ledger_events
+              SET version = version + 1,
+                  updated_at = ?
+            WHERE source_type = 'webcal'
+              AND status = 'active'
+              AND source_calendar_id IN (
+                SELECT id FROM webcal_subscriptions
+                 WHERE placement_client_calendar_id = ?
+                   AND placement_kind = 'client'
+              )""",
+        (when, client_calendar_id),
+    )
+
     # Affected ledger rows: enqueue them for replan.  The source_type
-    # filter matches the UPDATE above — client/personal calendars and
+    # filter matches the UPDATEs above — client/personal calendars and
     # webcal subscriptions are numbered in separate tables, so without
     # it a colliding webcal id would replan unrelated webcal rows.
     affected = await (await db.execute(
         """SELECT id, user_id FROM ledger_events
-            WHERE source_type IN ('client', 'personal')
-              AND source_calendar_id = ?
-              AND status = 'active'""",
-        (client_calendar_id,),
+            WHERE status = 'active'
+              AND (
+                (source_type IN ('client', 'personal')
+                  AND source_calendar_id = ?)
+                OR
+                (source_type = 'webcal'
+                  AND source_calendar_id IN (
+                    SELECT id FROM webcal_subscriptions
+                     WHERE placement_client_calendar_id = ?
+                       AND placement_kind = 'client'
+                  ))
+              )""",
+        (client_calendar_id, client_calendar_id),
     )).fetchall()
     by_user: dict[int, list[int]] = {}
     for row in affected:
@@ -63,7 +100,7 @@ async def recolor_client_calendar(
     for user_id, ids in by_user.items():
         await _append_affected(db, user_id=user_id, ledger_ids=ids)
     await db.commit()
-    return cursor.rowcount or 0
+    return direct_rows_touched
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +232,43 @@ async def disconnect_calendar(
     user_id: int,
     client_calendar_id: int,
 ) -> None:
-    """Cleanup + soft-delete the client_calendars row."""
+    """Cleanup + soft-delete the client_calendars row.
+
+    If this client is the placement target of one or more WebCal
+    subscriptions, additionally:
+
+    * snapshot ``placement_client_display_name_cache`` from the current
+      ``display_name`` so the alert email can name the lost target even
+      after the row is deactivated or later hard-deleted;
+    * enqueue every active webcal ledger row from those subscriptions
+      for replan (so projections fall back to the stale-placement
+      render path on the next reconcile);
+    * raise a ``webcal_placement_disconnected`` alert per affected
+      subscription (deduped per-subscription within 1h);
+    * write one sync_log row per affected subscription describing the
+      stale-placement transition.
+
+    See webcal.md §Placement Target Lifecycle.
+    """
+    # Capture placement-affected subscriptions BEFORE flipping
+    # client_calendars.is_active or running cleanup, so the JOIN to
+    # display_name still resolves and so we can decide whether to
+    # alert before any side effect has fired.
+    placement_affected = await (await db.execute(
+        """SELECT ws.id            AS subscription_id,
+                  ws.url            AS feed_url,
+                  ws.display_prefix AS feed_name,
+                  cc.display_name   AS placement_target_name
+             FROM webcal_subscriptions ws
+             JOIN client_calendars cc
+                  ON cc.id = ws.placement_client_calendar_id
+            WHERE ws.placement_client_calendar_id = ?
+              AND ws.placement_kind = 'client'
+              AND ws.is_active = 1
+              AND ws.user_id = ?""",
+        (client_calendar_id, user_id),
+    )).fetchall()
+
     await cleanup_one_calendar(
         db, user_id=user_id, client_calendar_id=client_calendar_id,
     )
@@ -214,7 +287,94 @@ async def disconnect_calendar(
         "DELETE FROM webhook_channels WHERE client_calendar_id = ?",
         (client_calendar_id,),
     )
-    await db.commit()
+
+    # Per-subscription placement transitions: snapshot the display
+    # name, mark every active webcal ledger row from this sub for
+    # replan, log it.  All-or-nothing across subscriptions — a
+    # partial loop failure must not leave some subs replanned but
+    # others not (each sub's sync_log + affected_ledger_events rows
+    # must be consistent with its placement state).  Uses the
+    # no-commit primitive record_affected_events so the whole loop
+    # participates in one transaction.
+    #
+    # enqueue_periodic is deliberately OUTSIDE the BEGIN: it calls
+    # _upsert_request which COMMITs internally.  The wake-up signal
+    # is best-effort — the periodic reconciler will pick up the
+    # affected_ledger_events rows regardless, so a missed wake-up
+    # is a one-cycle delay, never a state inconsistency.
+    if placement_affected:
+        from app.ledger.triggers import (
+            record_affected_events, enqueue_periodic,
+        )
+        try:
+            await db.execute("BEGIN")
+            for row in placement_affected:
+                sub_id = int(row["subscription_id"])
+                target_name = row["placement_target_name"] or ""
+                await db.execute(
+                    """UPDATE webcal_subscriptions
+                          SET placement_client_display_name_cache = ?,
+                              updated_at = ?
+                        WHERE id = ?""",
+                    (target_name, when, sub_id),
+                )
+                affected_rows = await (await db.execute(
+                    """SELECT id FROM ledger_events
+                        WHERE user_id = ? AND source_type = 'webcal'
+                          AND source_calendar_id = ? AND status = 'active'""",
+                    (user_id, sub_id),
+                )).fetchall()
+                ledger_ids = [int(r["id"]) for r in affected_rows]
+                if ledger_ids:
+                    await record_affected_events(
+                        db, user_id=user_id, ledger_event_ids=ledger_ids,
+                    )
+                # One sync_log row per affected subscription — NOT per
+                # ledger event — matches the spec's alert-fanout rule.
+                await db.execute(
+                    """INSERT INTO sync_log (user_id, action, status, details)
+                       VALUES (?, 'webcal_placement_target_disconnected', 'warning', ?)""",
+                    (
+                        user_id,
+                        json.dumps({
+                            "subscription_id": sub_id,
+                            "client_calendar_id": client_calendar_id,
+                            "placement_client_display_name": target_name,
+                            "feed_url": row["feed_url"],
+                            "feed_name": row["feed_name"] or "",
+                            "affected_ledger_count": len(ledger_ids),
+                        }),
+                    ),
+                )
+            await db.execute("COMMIT")
+        except BaseException:
+            await db.execute("ROLLBACK")
+            raise
+        # Wake the reconciler once for all affected subs.  Best-effort.
+        await enqueue_periodic(db, user_id=user_id)
+    else:
+        await db.commit()
+
+    # Queue alerts after the commit so a transient SMTP/alert-queue
+    # failure cannot roll back the disconnect.  Each affected
+    # subscription gets its own alert (deduped per-subscription
+    # within 1h by queue_placement_disconnected_alert).
+    if placement_affected:
+        from app.alerts.email import queue_placement_disconnected_alert
+        for row in placement_affected:
+            try:
+                await queue_placement_disconnected_alert(
+                    user_id=user_id,
+                    subscription_id=int(row["subscription_id"]),
+                    feed_name=row["feed_name"] or "",
+                    feed_url=row["feed_url"] or "",
+                    placement_target_name=row["placement_target_name"] or "",
+                )
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "failed to queue placement-disconnected alert for sub %s",
+                    row["subscription_id"],
+                )
 
 
 async def full_resync(

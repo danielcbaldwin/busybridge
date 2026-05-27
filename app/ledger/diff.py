@@ -215,13 +215,44 @@ async def _diverged_projections(
                   e.recurrence_instance_original_start,
                   e.source_type, e.source_calendar_id, e.attendees_json,
                   e.conference_data_json, e.source_html_link,
-                  cc.color_id AS calendar_color_id,
-                  cc.display_name AS source_label
+                  -- Source label: client/personal -> client_calendars.display_name,
+                  -- webcal -> webcal_subscriptions.display_prefix.  See
+                  -- webcal.md §Label, Footer, Color.  COALESCE keeps the
+                  -- diff payload byte-identical to the planner hash.
+                  COALESCE(
+                      cc.display_name,
+                      NULLIF(ws.display_prefix, '')
+                  ) AS source_label,
+                  -- Color: client/personal -> source client's color;
+                  -- webcal placed on an active client -> that client's
+                  -- color; otherwise no color.
+                  CASE
+                    WHEN e.source_type IN ('client', 'personal')
+                      THEN cc.color_id
+                    WHEN e.source_type = 'webcal'
+                      AND ws.placement_kind = 'client'
+                      THEN cc_placement.color_id
+                    ELSE NULL
+                  END AS calendar_color_id,
+                  -- Placement label: only the webcal-on-active-client
+                  -- branch produces a "Placement:" footer line.
+                  CASE
+                    WHEN e.source_type = 'webcal'
+                      AND ws.placement_kind = 'client'
+                      THEN cc_placement.display_name
+                    ELSE NULL
+                  END AS placement_label
              FROM ledger_projections p
              JOIN ledger_events e ON e.id = p.ledger_event_id
              LEFT JOIN client_calendars cc
                     ON cc.id = e.source_calendar_id
                    AND e.source_type IN ('client', 'personal')
+             LEFT JOIN webcal_subscriptions ws
+                    ON ws.id = e.source_calendar_id
+                   AND e.source_type = 'webcal'
+             LEFT JOIN client_calendars cc_placement
+                    ON cc_placement.id = ws.placement_client_calendar_id
+                   AND cc_placement.is_active = 1
             WHERE e.user_id = ?
               AND (p.applied_ledger_version IS NULL
                    OR p.applied_ledger_version != p.desired_ledger_version

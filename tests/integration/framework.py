@@ -604,6 +604,11 @@ async def _scenario_setup_db(self: Scenario) -> aiosqlite.Connection:
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             url TEXT NOT NULL,
             display_name TEXT,
+            -- display_prefix is the production-schema name; the planner
+            -- and diff JOIN to ws.display_prefix to populate the
+            -- Source: footer line for webcal-sourced events.  See
+            -- webcal.md §Label, Footer, Color.
+            display_prefix TEXT NOT NULL DEFAULT '',
             color_id TEXT,
             last_etag TEXT,
             last_polled_at TIMESTAMP,
@@ -611,6 +616,14 @@ async def _scenario_setup_db(self: Scenario) -> aiosqlite.Connection:
             consecutive_failures INTEGER DEFAULT 0,
             last_error TEXT,
             is_active BOOLEAN DEFAULT TRUE,
+            -- Placement (see webcal.md §Data Model).  Mirrored here so
+            -- the planner/diff JOIN to ws.placement_* is valid.  Tests
+            -- that don't touch placement leave these at their defaults
+            -- and the JOIN evaluates to NULL for all derived fields.
+            placement_kind TEXT NOT NULL DEFAULT 'main',
+            placement_client_calendar_id INTEGER NULL
+                REFERENCES client_calendars(id) ON DELETE SET NULL,
+            placement_client_display_name_cache TEXT NULL,
             UNIQUE(user_id, url)
         );
         """

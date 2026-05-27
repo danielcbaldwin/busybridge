@@ -388,7 +388,7 @@ _FOOTER_DELIM = "\n\n---\n"
 # A footer section always opens with one of these markers, so the
 # stripper can tell our appended metadata from a user's own "---"
 # rule that happens to sit in their description.
-_FOOTER_MARKERS = ("Attendees (", "Source:", "Original event:")
+_FOOTER_MARKERS = ("Attendees (", "Source:", "Placement:", "Original event:")
 
 
 def _full_copy_metadata(row: dict) -> str:
@@ -412,6 +412,16 @@ def _full_copy_metadata(row: dict) -> str:
         if len(label) > 80:
             label = label[:77] + "..."
         trailer.append(f"Source: {label}")
+    # Placement line: only present for webcal subscriptions placed on
+    # an active client calendar (planner/diff joins return NULL
+    # otherwise — see webcal.md §Label, Footer, Color).  Distinct from
+    # Source because Source names the FEED while Placement names the
+    # work-context client calendar.
+    placement = (row.get("placement_label") or "").strip()
+    if placement:
+        if len(placement) > 80:
+            placement = placement[:77] + "..."
+        trailer.append(f"Placement: {placement}")
     link = (row.get("source_html_link") or "").strip()
     if link:
         trailer.append(f"Original event: {link}")

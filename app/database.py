@@ -189,6 +189,17 @@ CREATE TABLE IF NOT EXISTS webcal_subscriptions (
     last_error TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP,
+    -- Placement: where do this feed's full-detail copies live?
+    --   'main'   → main calendar only; all clients get busy blocks
+    --   'client' → main + the selected client; other clients busy
+    -- See webcal.md for the full spec.
+    placement_kind TEXT NOT NULL DEFAULT 'main',
+    placement_client_calendar_id INTEGER NULL
+        REFERENCES client_calendars(id) ON DELETE SET NULL,
+    -- Snapshot of the placement client's display_name at write time,
+    -- so the disconnect alert can still name the lost target after
+    -- the row is deactivated, renamed, or hard-deleted.
+    placement_client_display_name_cache TEXT NULL,
     UNIQUE(user_id, url)
 );
 """
@@ -242,6 +253,15 @@ async def init_schema(db: aiosqlite.Connection) -> None:
         "ALTER TABLE client_calendars ADD COLUMN calendar_type TEXT NOT NULL DEFAULT 'client'",
         "ALTER TABLE users ADD COLUMN sync_paused BOOLEAN DEFAULT FALSE",
         "ALTER TABLE users ADD COLUMN session_token_version INTEGER NOT NULL DEFAULT 0",
+        # WebCal placement (see webcal.md).  Existing subscriptions
+        # default to placement_kind='main', matching their pre-placement
+        # behavior — no backfill needed.  The FK uses ON DELETE SET NULL
+        # so a hard-deleted client_calendars row (factory-reset path)
+        # leaves the subscription in a recoverable stale state instead
+        # of dangling.
+        "ALTER TABLE webcal_subscriptions ADD COLUMN placement_kind TEXT NOT NULL DEFAULT 'main'",
+        "ALTER TABLE webcal_subscriptions ADD COLUMN placement_client_calendar_id INTEGER NULL REFERENCES client_calendars(id) ON DELETE SET NULL",
+        "ALTER TABLE webcal_subscriptions ADD COLUMN placement_client_display_name_cache TEXT NULL",
     ]
     for stmt in migrations:
         try:
