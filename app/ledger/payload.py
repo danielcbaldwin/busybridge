@@ -145,6 +145,16 @@ def _render_full_copy(
     """Full-detail copy of a client / webcal event onto main."""
     body: dict[str, Any] = {}
     summary = row.get("summary") or "(no title)"
+    # Webcal feeds prepend their display_prefix to the title so the
+    # main calendar shows e.g. "[ISO] Standards Meeting" at a glance —
+    # source_label IS the display_prefix for webcal events (see the
+    # COALESCE in planner.py / diff.py).  Client/personal sources skip
+    # this branch; their source_label is the client calendar name and
+    # belongs only in the Source: footer.
+    if row.get("source_type") == "webcal":
+        prefix = (row.get("source_label") or "").strip()
+        if prefix:
+            summary = f"{prefix} {summary}"
     if not row.get("user_can_edit"):
         summary = LOCK_PREFIX + summary
     body["summary"] = summary

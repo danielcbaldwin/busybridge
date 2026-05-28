@@ -322,7 +322,24 @@ must be recognized by cleanup, clean export, and orphan sweep
 
 ## Label, Footer, Color
 
-For WebCal full-detail copies, footer:
+For WebCal full-detail copies, the title is prepended with the
+subscription's `display_prefix` (legacy v1 behavior — at a glance on
+main, an event reads `[ISO] Standards Meeting`, not just
+`Standards Meeting` with the source buried in the description):
+
+```text
+summary = "{display_prefix} {source_summary}"      (prefix omitted when blank)
+         = "🔒 {display_prefix} {source_summary}"  (when user_can_edit=False,
+                                                    which is always true for
+                                                    webcal — feeds are
+                                                    read-only)
+```
+
+The prefix is the same string used by the Source: footer line below, so
+it appears in both places (title for scanability, footer for
+disambiguation when the prefix is short or generic).
+
+Footer:
 
 ```text
 Source: {display_prefix or feed host fallback}
