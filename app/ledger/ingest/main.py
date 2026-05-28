@@ -562,17 +562,42 @@ async def _maybe_apply_main_edit_back(
     """
     # Join the source calendar (color + label) so the canonical render
     # below matches the body we actually wrote to main — otherwise our
-    # own footer ("Source: …") reads as a user edit and churns.  Scoped
-    # to client/personal because source_calendar_id is a webcal
-    # subscription id for webcal sources.
+    # own footer ("Source: …") reads as a user edit and churns.  The
+    # joins must mirror planner.py / diff.py exactly: client/personal go
+    # to client_calendars; webcal goes to webcal_subscriptions (for the
+    # display_prefix that's prepended to the title AND used as the
+    # Source: label) plus an optional second join to client_calendars
+    # for the placement target (color + Placement: footer line).
     ledger = await (await db.execute(
         """SELECT e.*,
-                  cc.color_id AS calendar_color_id,
-                  cc.display_name AS source_label
+                  COALESCE(
+                      cc.display_name,
+                      NULLIF(ws.display_prefix, '')
+                  ) AS source_label,
+                  CASE
+                    WHEN e.source_type IN ('client', 'personal')
+                      THEN cc.color_id
+                    WHEN e.source_type = 'webcal'
+                      AND ws.placement_kind = 'client'
+                      THEN cc_placement.color_id
+                    ELSE NULL
+                  END AS calendar_color_id,
+                  CASE
+                    WHEN e.source_type = 'webcal'
+                      AND ws.placement_kind = 'client'
+                      THEN cc_placement.display_name
+                    ELSE NULL
+                  END AS placement_label
              FROM ledger_events e
              LEFT JOIN client_calendars cc
                     ON cc.id = e.source_calendar_id
                    AND e.source_type IN ('client', 'personal')
+             LEFT JOIN webcal_subscriptions ws
+                    ON ws.id = e.source_calendar_id
+                   AND e.source_type = 'webcal'
+             LEFT JOIN client_calendars cc_placement
+                    ON cc_placement.id = ws.placement_client_calendar_id
+                   AND cc_placement.is_active = 1
             WHERE e.id = ?""",
         (ledger_event_id,),
     )).fetchone()
