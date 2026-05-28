@@ -284,12 +284,15 @@ async def create_webcal_subscription(
         placement_client_calendar_id=request.placement_client_calendar_id,
     )
 
-    # Check for duplicates
+    # Look up any existing row for this (user, url). The unique
+    # index doesn't filter on is_active, so a soft-deleted row would
+    # crash the INSERT below — treat it as a reactivation instead.
     cursor = await db.execute(
-        "SELECT id FROM webcal_subscriptions WHERE user_id = ? AND url = ? AND is_active = TRUE",
+        "SELECT id, is_active FROM webcal_subscriptions WHERE user_id = ? AND url = ?",
         (user.id, url),
     )
-    if await cursor.fetchone():
+    existing = await cursor.fetchone()
+    if existing and existing["is_active"]:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This URL is already subscribed",
@@ -330,25 +333,53 @@ async def create_webcal_subscription(
             detail="The URL did not return a valid ICS calendar feed.",
         )
 
-    # Insert
-    cursor = await db.execute(
-        """INSERT INTO webcal_subscriptions
-              (user_id, url, display_prefix,
-               placement_kind, placement_client_calendar_id,
-               placement_client_display_name_cache)
-           VALUES (?, ?, ?, ?, ?, ?)
-           RETURNING id""",
-        (
-            user.id,
-            url,
-            request.display_prefix.strip(),
-            request.placement_kind,
-            request.placement_client_calendar_id,
-            cached_display_name,
-        ),
-    )
-    row = await cursor.fetchone()
-    sub_id = row["id"]
+    if existing:
+        # Reactivate the soft-deleted row with the new settings.
+        # Clear poll state so the next reconcile treats this as a
+        # fresh subscription (sync_status='pending' until first ok).
+        sub_id = int(existing["id"])
+        await db.execute(
+            """UPDATE webcal_subscriptions
+                  SET is_active = TRUE,
+                      display_prefix = ?,
+                      placement_kind = ?,
+                      placement_client_calendar_id = ?,
+                      placement_client_display_name_cache = ?,
+                      last_poll_at = NULL,
+                      last_etag = NULL,
+                      last_success_at = NULL,
+                      consecutive_failures = 0,
+                      last_error = NULL,
+                      updated_at = ?
+                WHERE id = ?""",
+            (
+                request.display_prefix.strip(),
+                request.placement_kind,
+                request.placement_client_calendar_id,
+                cached_display_name,
+                datetime.utcnow().isoformat(),
+                sub_id,
+            ),
+        )
+    else:
+        cursor = await db.execute(
+            """INSERT INTO webcal_subscriptions
+                  (user_id, url, display_prefix,
+                   placement_kind, placement_client_calendar_id,
+                   placement_client_display_name_cache)
+               VALUES (?, ?, ?, ?, ?, ?)
+               RETURNING id""",
+            (
+                user.id,
+                url,
+                request.display_prefix.strip(),
+                request.placement_kind,
+                request.placement_client_calendar_id,
+                cached_display_name,
+            ),
+        )
+        row = await cursor.fetchone()
+        sub_id = row["id"]
     await db.commit()
 
     # Log
