@@ -60,7 +60,8 @@ async def ledger_enqueue_periodic() -> None:
     db = await get_database()
     rows = await (await db.execute(
         """SELECT id FROM users
-            WHERE COALESCE(sync_paused, 0) = 0""",
+            WHERE COALESCE(sync_paused, 0) = 0
+              AND main_calendar_id IS NOT NULL""",
     )).fetchall()
     for row in rows:
         try:

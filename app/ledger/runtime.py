@@ -460,7 +460,8 @@ async def drain_all_due_users(*, now: Optional[datetime] = None) -> dict:
     rows = await (await db.execute(
         """SELECT user_id FROM reconcile_requests
             WHERE in_flight = 0
-              AND (scheduled_for IS NULL OR scheduled_for <= ?)""",
+              AND scheduled_for IS NOT NULL
+              AND scheduled_for <= ?""",
         (now.isoformat(),),
     )).fetchall()
 
@@ -475,8 +476,12 @@ async def drain_all_due_users(*, now: Optional[datetime] = None) -> dict:
         except Exception as e:
             logger.exception("reconcile user %s failed: %s", user_id, e)
             out[user_id] = {"error": str(e)}
+            await release_request(db, user_id=user_id, retry_at=now)
+            continue
         finally:
-            await release_request(db, user_id=user_id)
+            result = out.get(user_id)
+            if not (isinstance(result, dict) and "error" in result):
+                await release_request(db, user_id=user_id)
     return out
 
 

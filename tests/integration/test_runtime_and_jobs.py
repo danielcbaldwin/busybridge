@@ -59,6 +59,12 @@ async def test_drain_all_due_users_dispatches_only_due_requests(monkeypatch):
     assert s.user("alice").user_id in out
     # The fake reconciler ran → main now has the event.
     s.assert_event_exists("main", summary="due event")
+
+    # The claimed request was consumed.  With no new webhook/manual
+    # enqueue, the next drain tick should be idle instead of processing
+    # the same past scheduled_for forever.
+    out2 = await runtime.drain_all_due_users(now=s.clock.now())
+    assert out2 == {}
     await s.close()
 
 
@@ -80,6 +86,19 @@ async def test_ledger_enqueue_periodic_skips_paused_users(monkeypatch):
     )
 
     db = await s.setup_db()
+    await db.execute(
+        "UPDATE users SET main_calendar_id = ? WHERE id = ?",
+        (s.cal("main"), s.user("alice").user_id),
+    )
+    await db.execute(
+        "UPDATE users SET main_calendar_id = ? WHERE id = ?",
+        (s.cal("main2"), s.user("bob").user_id),
+    )
+    incomplete = await (await db.execute(
+        "INSERT INTO users (email) VALUES ('incomplete@example.com') "
+        "RETURNING id",
+    )).fetchone()
+    await db.commit()
     # Pause Alice.
     await cleanup_and_pause(db, user_id=s.user("alice").user_id)
 
@@ -94,6 +113,7 @@ async def test_ledger_enqueue_periodic_skips_paused_users(monkeypatch):
     await ledger_jobs.ledger_enqueue_periodic()
     assert s.user("bob").user_id in enqueued_for
     assert s.user("alice").user_id not in enqueued_for
+    assert int(incomplete["id"]) not in enqueued_for
     await s.close()
 
 

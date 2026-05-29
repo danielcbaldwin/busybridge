@@ -151,9 +151,20 @@ async def claim_due_request(
     )).fetchone()
     if row is None:
         return None
+    was_in_flight = bool(row["in_flight"])
+    stale_cutoff = (now - STALE_CLAIM_TIMEOUT).isoformat()
+    stale_claim = (
+        was_in_flight
+        and (row["last_run_at"] is None or row["last_run_at"] < stale_cutoff)
+    )
+
     # Not yet due — a future scheduled_for is a hard pre-condition,
-    # independent of any race.
+    # independent of any race.  A NULL scheduled_for means idle, except
+    # for an abandoned in-flight claim that predates this lifecycle and
+    # needs to be taken over.
     sched = row["scheduled_for"]
+    if sched is None and not stale_claim:
+        return None
     if sched:
         try:
             sched_dt = datetime.fromisoformat(sched)
@@ -164,7 +175,6 @@ async def claim_due_request(
         if sched_dt is not None and sched_dt > now:
             return None
 
-    was_in_flight = bool(row["in_flight"])
     sources = json.loads(row["sources_json"] or "[]") if row["sources_json"] else []
     # Compare-and-claim: the row is claimable when it is not in-flight,
     # or its in-flight claim is older than STALE_CLAIM_TIMEOUT (a
@@ -175,15 +185,18 @@ async def claim_due_request(
     # _append_affected; the reconciler's _consume_affected_ledger_ids
     # is the sole consumer and clears it once the rows are planned.
     # Clearing it at claim time silently dropped scheduled admin work.
-    stale_cutoff = (now - STALE_CLAIM_TIMEOUT).isoformat()
     cursor = await db.execute(
         """UPDATE reconcile_requests
-              SET in_flight = 1, last_run_at = ?
+              SET in_flight = 1,
+                  last_run_at = ?,
+                  scheduled_for = NULL
             WHERE user_id = ?
               AND (in_flight = 0
                    OR last_run_at IS NULL
-                   OR last_run_at < ?)""",
-        (now.isoformat(), user_id, stale_cutoff),
+                   OR last_run_at < ?)
+              AND ((? IS NULL AND scheduled_for IS NULL)
+                   OR scheduled_for = ?)""",
+        (now.isoformat(), user_id, stale_cutoff, sched, sched),
     )
     await db.commit()
     if (cursor.rowcount or 0) == 0:
@@ -200,13 +213,37 @@ async def claim_due_request(
 
 
 async def release_request(
-    db: aiosqlite.Connection, *, user_id: int,
+    db: aiosqlite.Connection,
+    *,
+    user_id: int,
+    retry_at: Optional[datetime] = None,
 ) -> None:
-    """Mark the user's reconcile request as no longer in-flight."""
-    await db.execute(
-        "UPDATE reconcile_requests SET in_flight = 0 WHERE user_id = ?",
-        (user_id,),
-    )
+    """Mark the user's reconcile request as no longer in-flight.
+
+    ``claim_due_request`` consumes the scheduled timestamp by setting it
+    to NULL.  A clean release leaves the row idle unless a webhook or
+    manual sync re-enqueued it while the reconcile was running.  On a
+    failed reconcile, callers pass ``retry_at`` so an otherwise-idle
+    row is retried.
+    """
+    if retry_at is None:
+        await db.execute(
+            "UPDATE reconcile_requests SET in_flight = 0 WHERE user_id = ?",
+            (user_id,),
+        )
+    else:
+        when_iso = retry_at.isoformat()
+        await db.execute(
+            """UPDATE reconcile_requests
+                  SET in_flight = 0,
+                      scheduled_for = COALESCE(scheduled_for, ?),
+                      enqueued_at = CASE
+                          WHEN scheduled_for IS NULL THEN ?
+                          ELSE enqueued_at
+                      END
+                WHERE user_id = ?""",
+            (when_iso, when_iso, user_id),
+        )
     await db.commit()
 
 
@@ -227,10 +264,11 @@ async def reclaim_stale_requests(
     cutoff = (now - STALE_CLAIM_TIMEOUT).isoformat()
     cursor = await db.execute(
         """UPDATE reconcile_requests
-              SET in_flight = 0
+              SET in_flight = 0,
+                  scheduled_for = COALESCE(scheduled_for, ?)
             WHERE in_flight = 1
               AND (last_run_at IS NULL OR last_run_at < ?)""",
-        (cutoff,),
+        (now.isoformat(), cutoff),
     )
     await db.commit()
     n = cursor.rowcount or 0

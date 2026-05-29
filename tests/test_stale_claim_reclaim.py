@@ -17,7 +17,9 @@ import pytest
 from app.ledger.triggers import (
     STALE_CLAIM_TIMEOUT,
     claim_due_request,
+    enqueue_webhook,
     reclaim_stale_requests,
+    release_request,
 )
 from tests.integration.framework import Scenario
 
@@ -49,6 +51,15 @@ async def _in_flight(db, user_id):
     return bool(row["in_flight"])
 
 
+async def _request(db, user_id):
+    row = await (await db.execute(
+        """SELECT in_flight, scheduled_for, last_run_at, enqueued_at
+             FROM reconcile_requests WHERE user_id = ?""",
+        (user_id,),
+    )).fetchone()
+    return dict(row)
+
+
 async def test_stale_in_flight_claim_is_reclaimed():
     s = Scenario()
     s.given_calendar("main")
@@ -65,7 +76,33 @@ async def test_stale_in_flight_claim_is_reclaimed():
 
     reclaimed = await reclaim_stale_requests(db, now=now)
     assert reclaimed == 1
-    assert not await _in_flight(db, user.user_id)
+    req = await _request(db, user.user_id)
+    assert not req["in_flight"]
+    assert req["scheduled_for"] == (
+        now - timedelta(hours=1)
+    ).isoformat()
+    await s.close()
+
+
+async def test_stale_in_flight_claim_without_schedule_is_requeued():
+    s = Scenario()
+    s.given_calendar("main")
+    user = await s.given_user("alice", main="main")
+    db = await s.setup_db()
+    now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+
+    await _put_request(
+        db, user.user_id,
+        in_flight=True,
+        last_run_at=now - STALE_CLAIM_TIMEOUT - timedelta(minutes=5),
+        scheduled_for=None,
+    )
+
+    reclaimed = await reclaim_stale_requests(db, now=now)
+    assert reclaimed == 1
+    req = await _request(db, user.user_id)
+    assert not req["in_flight"]
+    assert req["scheduled_for"] == now.isoformat()
     await s.close()
 
 
@@ -131,6 +168,9 @@ async def test_two_claims_cannot_both_win_a_due_request():
     second = await claim_due_request(db, user_id=user.user_id, now=now)
     assert first is not None, "first claim should have won the request"
     assert second is None, "a second claim double-won the same request"
+    req = await _request(db, user.user_id)
+    assert req["scheduled_for"] is None, \
+        "claim should consume the due timestamp it is processing"
     await s.close()
 
 
@@ -150,4 +190,103 @@ async def test_claim_due_request_respects_a_fresh_claim():
 
     claimed = await claim_due_request(db, user_id=user.user_id, now=now)
     assert claimed is None, "a live in-flight reconcile was double-claimed"
+    await s.close()
+
+
+async def test_idle_request_is_not_due_without_schedule():
+    s = Scenario()
+    s.given_calendar("main")
+    user = await s.given_user("alice", main="main")
+    db = await s.setup_db()
+    now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+
+    await _put_request(
+        db, user.user_id,
+        in_flight=False,
+        last_run_at=now - timedelta(minutes=1),
+        scheduled_for=None,
+    )
+
+    claimed = await claim_due_request(db, user_id=user.user_id, now=now)
+    assert claimed is None, "idle request without scheduled_for was claimed"
+    await s.close()
+
+
+async def test_webhook_during_claim_survives_release():
+    s = Scenario()
+    s.given_calendar("main")
+    user = await s.given_user("alice", main="main")
+    db = await s.setup_db()
+    now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+
+    await _put_request(
+        db, user.user_id,
+        in_flight=False,
+        last_run_at=None,
+        scheduled_for=now - timedelta(minutes=1),
+    )
+
+    claimed = await claim_due_request(db, user_id=user.user_id, now=now)
+    assert claimed is not None
+    assert (await _request(db, user.user_id))["scheduled_for"] is None
+
+    await enqueue_webhook(db, user_id=user.user_id, source_hint="client:1", now=now)
+    await release_request(db, user_id=user.user_id)
+
+    req = await _request(db, user.user_id)
+    assert not req["in_flight"]
+    assert req["scheduled_for"] == (
+        now + timedelta(seconds=5)
+    ).isoformat()
+    await s.close()
+
+
+async def test_failed_claim_is_requeued_for_retry():
+    s = Scenario()
+    s.given_calendar("main")
+    user = await s.given_user("alice", main="main")
+    db = await s.setup_db()
+    now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+
+    await _put_request(
+        db, user.user_id,
+        in_flight=False,
+        last_run_at=None,
+        scheduled_for=now - timedelta(minutes=1),
+    )
+
+    claimed = await claim_due_request(db, user_id=user.user_id, now=now)
+    assert claimed is not None
+    await release_request(db, user_id=user.user_id, retry_at=now)
+
+    req = await _request(db, user.user_id)
+    assert not req["in_flight"]
+    assert req["scheduled_for"] == now.isoformat()
+    await s.close()
+
+
+async def test_failed_claim_preserves_webhook_reenqueue():
+    s = Scenario()
+    s.given_calendar("main")
+    user = await s.given_user("alice", main="main")
+    db = await s.setup_db()
+    now = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+
+    await _put_request(
+        db, user.user_id,
+        in_flight=False,
+        last_run_at=None,
+        scheduled_for=now - timedelta(minutes=1),
+    )
+
+    claimed = await claim_due_request(db, user_id=user.user_id, now=now)
+    assert claimed is not None
+    await enqueue_webhook(db, user_id=user.user_id, source_hint="client:1", now=now)
+    await release_request(db, user_id=user.user_id, retry_at=now)
+
+    req = await _request(db, user.user_id)
+    webhook_time = (now + timedelta(seconds=5)).isoformat()
+    assert not req["in_flight"]
+    assert req["scheduled_for"] == webhook_time
+    assert req["enqueued_at"] == webhook_time
     await s.close()
