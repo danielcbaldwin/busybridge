@@ -73,19 +73,43 @@ async def diff_and_enqueue_for_user(
         # projections are skipped here — they deliberately keep
         # google_event_id NULL (see _is_origin_writeback / _do_patch).
         if proj["parent_canonical_uid"] and not _is_origin_writeback(proj):
-            parent_proj_google_id = await _parent_projection_google_id(
+            parent_proj = await _parent_projection_for_instance(
                 db,
                 user_id=user_id,
                 parent_canonical_uid=proj["parent_canonical_uid"],
                 target_kind=proj["target_kind"],
                 target_calendar_id=proj["target_calendar_id"],
             )
-            if not parent_proj_google_id:
+            if (
+                parent_proj is not None
+                and parent_proj["desired_state"] == ABSENT
+                and proj["desired_state"] == ABSENT
+            ):
+                # Deleting the parent series removes its generated
+                # instances.  Issuing per-instance deletes against a
+                # parent that is already desired-absent is redundant and
+                # can self-cancel a one-occurrence recurring copy.
+                await _snap_applied(
+                    db, proj["id"], int(proj["desired_ledger_version"]),
+                )
+                continue
+            if parent_proj is None or not parent_proj["google_event_id"]:
+                if (
+                    proj["desired_state"] == ABSENT
+                    and proj["current_state"] == ABSENT
+                ):
+                    # Nothing exists to delete and there is no parent
+                    # Google ID left to derive from, so this absent
+                    # instance can converge without an outbox op.
+                    await _snap_applied(
+                        db, proj["id"], int(proj["desired_ledger_version"]),
+                    )
+                    continue
                 # Parent hasn't been written yet; defer this instance
                 # to the next reconcile pass.
                 continue
             derived = derive_instance_google_event_id(
-                parent_proj_google_id,
+                parent_proj["google_event_id"],
                 proj["recurrence_instance_original_start"] or "",
                 bool(proj["is_all_day"]),
             )
@@ -168,18 +192,18 @@ async def diff_and_enqueue_for_user(
     return enqueued
 
 
-async def _parent_projection_google_id(
+async def _parent_projection_for_instance(
     db: aiosqlite.Connection,
     *,
     user_id: int,
     parent_canonical_uid: str,
     target_kind: str,
     target_calendar_id: Optional[int],
-) -> Optional[str]:
+) -> Optional[aiosqlite.Row]:
     """Look up the parent ledger row's projection on the same
-    target, and return its ``google_event_id`` if set."""
+    target."""
     row = await (await db.execute(
-        """SELECT p.google_event_id
+        """SELECT p.google_event_id, p.desired_state
              FROM ledger_projections p
              JOIN ledger_events e ON e.id = p.ledger_event_id
             WHERE e.user_id = ?
@@ -191,7 +215,7 @@ async def _parent_projection_google_id(
     )).fetchone()
     if row is None:
         return None
-    return row["google_event_id"]
+    return row
 
 
 # ---------------------------------------------------------------------------
