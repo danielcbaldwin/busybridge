@@ -1,12 +1,10 @@
 """Periodic sync job — ledger-backed.
 
-The legacy ``run_periodic_sync`` body has been replaced by a thin
-shim that delegates to ``app.jobs.ledger_jobs``: the ledger drain
-job handles the actual work, while this module keeps the legacy
-entry-points (``run_periodic_sync``, ``run_consistency_check_job``,
-``run_orphan_scan_job``, ``refresh_expiring_tokens``) so the
-scheduler's ``IntervalTrigger`` rows keep firing without
-modification.
+The legacy ``run_periodic_sync`` body has been replaced by a
+rollback-compatible shim that delegates to ``app.jobs.ledger_jobs``.
+In normal ledger mode, ``app.jobs.scheduler`` schedules the ledger
+enqueue/drain jobs directly and schedules ``run_sync_health_checks``
+for circuit-breaker and failure-alert checks.
 """
 
 from __future__ import annotations
@@ -44,10 +42,31 @@ async def run_periodic_sync() -> None:
         from app.jobs.ledger_jobs import ledger_drain_due, ledger_enqueue_periodic
         await ledger_enqueue_periodic()
         await ledger_drain_due()
-        await _check_circuit_breaker()
-        await _alert_failing_calendars()
+        await _run_sync_health_checks_unlocked()
     finally:
         await release_job_lock("periodic_sync", lock)
+
+
+async def run_sync_health_checks() -> None:
+    """Run periodic sync health checks without enqueueing reconcile work."""
+    paused = await get_setting("sync_paused")
+    if paused and paused.get("value_plain") == "true":
+        logger.debug("Sync is paused, skipping sync health checks")
+        return
+
+    lock = await acquire_job_lock("sync_health_checks")
+    if not lock:
+        logger.debug("Sync health checks already running, skipping")
+        return
+    try:
+        await _run_sync_health_checks_unlocked()
+    finally:
+        await release_job_lock("sync_health_checks", lock)
+
+
+async def _run_sync_health_checks_unlocked() -> None:
+    await _check_circuit_breaker()
+    await _alert_failing_calendars()
 
 
 async def _alert_failing_calendars() -> None:

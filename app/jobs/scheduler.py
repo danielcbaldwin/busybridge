@@ -19,15 +19,19 @@ def setup_scheduler() -> AsyncIOScheduler:
     settings = get_settings()
 
     _scheduler = AsyncIOScheduler()
+    enable_ledger_jobs = getattr(settings, "enable_ledger_jobs", False)
 
-    # Periodic sync job - every 5 minutes
-    _scheduler.add_job(
-        "app.jobs.sync_job:run_periodic_sync",
-        trigger=IntervalTrigger(minutes=settings.sync_interval_minutes),
-        id="periodic_sync",
-        name="Periodic Calendar Sync",
-        replace_existing=True,
-    )
+    # Legacy/rollback periodic sync shim.  In ledger mode, the
+    # dedicated ledger jobs below own enqueue + drain; scheduling this
+    # shim too would duplicate periodic reconciles.
+    if not enable_ledger_jobs:
+        _scheduler.add_job(
+            "app.jobs.sync_job:run_periodic_sync",
+            trigger=IntervalTrigger(minutes=settings.sync_interval_minutes),
+            id="periodic_sync",
+            name="Periodic Calendar Sync",
+            replace_existing=True,
+        )
 
     # Webhook renewal - every 6 hours (optional)
     if settings.enable_webhooks:
@@ -124,11 +128,12 @@ def setup_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
 
-    # Ledger pipeline jobs (REWRITE_PLAN.md): these run alongside the
-    # legacy sync jobs until cutover.  Drain often (30s) so debounced
-    # webhook requests reach Google quickly; enqueue periodic
-    # reconcile requests at the same cadence as the legacy sync.
-    if getattr(settings, "enable_ledger_jobs", False):
+    # Ledger pipeline jobs (REWRITE_PLAN.md): drain often (30s) so
+    # debounced webhook requests reach Google quickly; enqueue
+    # periodic reconcile requests at the old sync cadence.  The sync
+    # health checks stay scheduled separately because the old periodic
+    # shim also owned circuit-breaker and failure-alert checks.
+    if enable_ledger_jobs:
         _scheduler.add_job(
             "app.jobs.ledger_jobs:ledger_drain_due",
             trigger=IntervalTrigger(seconds=30),
@@ -141,6 +146,13 @@ def setup_scheduler() -> AsyncIOScheduler:
             trigger=IntervalTrigger(minutes=settings.sync_interval_minutes),
             id="ledger_enqueue_periodic",
             name="Ledger Periodic Enqueue",
+            replace_existing=True,
+        )
+        _scheduler.add_job(
+            "app.jobs.sync_job:run_sync_health_checks",
+            trigger=IntervalTrigger(minutes=settings.sync_interval_minutes),
+            id="sync_health_checks",
+            name="Sync Health Checks",
             replace_existing=True,
         )
 
