@@ -290,13 +290,32 @@ async def _diverged_projections(
 
 def _is_origin_writeback(proj) -> bool:
     """True for the phantom projection that writes the user's edits
-    — RSVP, time, and (for client sources) detail — back to the
-    calendar that *sourced* the event (target calendar == origin
-    calendar).  It is rendered as an ``events.patch`` and never
-    creates or deletes the source event."""
+    — RSVP, time, and detail — back to the client calendar that
+    *sourced* the event (target calendar == origin calendar).  It is
+    rendered as an ``events.patch`` and never creates or deletes the
+    source event.  Personal calendars are read-only sources, so they
+    are deliberately excluded."""
     if proj["target_kind"] != "client":
         return False
-    if proj["source_type"] not in ("client", "personal"):
+    if proj["source_type"] != "client":
+        return False
+    sc = proj["source_calendar_id"]
+    tc = proj["target_calendar_id"]
+    return sc is not None and tc is not None and int(sc) == int(tc)
+
+
+def _is_legacy_personal_source_target(proj) -> bool:
+    """True for old personal-origin projection rows.
+
+    Current planning never targets a personal calendar.  Rows created
+    by older builds can still be present in the DB until their source
+    event is replanned, so the diff must converge them without
+    enqueuing create/update/delete work against the read-only personal
+    token.
+    """
+    if proj["target_kind"] != "client":
+        return False
+    if proj["source_type"] != "personal":
         return False
     sc = proj["source_calendar_id"]
     tc = proj["target_calendar_id"]
@@ -324,6 +343,9 @@ def _decide(
                 f"{client_cal_id} but no Google ID mapping was provided"
             )
         target_cal = google_calendar_id_for[client_cal_id]
+
+    if _is_legacy_personal_source_target(proj):
+        return None, None, target_cal
 
     payload = render_payload(
         desired_state=desired,

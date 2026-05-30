@@ -166,9 +166,9 @@ async def reconcile_user(
         int(c["id"]): c["google_calendar_id"]
         for c in (all_known_client_calendars or client_calendars)
     }
-    # Personal calendars are origin writeback targets too — a
-    # personal-sourced event's edits patch back to the personal
-    # source — so the diff must be able to resolve their Google ids.
+    # Personal calendars used to be origin writeback targets.  Keep
+    # their IDs resolvable while legacy projections/outbox rows age
+    # out, but new planning never writes to them.
     for c in (personal_calendars or []):
         google_id_for.setdefault(int(c["id"]), c["google_calendar_id"])
 

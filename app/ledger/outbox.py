@@ -596,9 +596,19 @@ async def _do_delete_source(
     """
     proj = await _get_projection(db, op["projection_id"])
     led = await (await db.execute(
-        "SELECT id, source_event_id FROM ledger_events WHERE id = ?",
+        "SELECT id, source_type, source_event_id FROM ledger_events WHERE id = ?",
         (int(proj["ledger_event_id"]),),
     )).fetchone()
+    if led is not None and led["source_type"] == "personal":
+        # Personal calendars are read-only sources.  Older versions
+        # could enqueue source-delete work for them; drain those rows
+        # as satisfied without calling Google.
+        await db.execute(
+            "UPDATE ledger_events SET source_delete_pending = 0 WHERE id = ?",
+            (int(led["id"]),),
+        )
+        await _record_absent(db, op, now=now)
+        return
     if led is not None and led["source_event_id"]:
         try:
             await google.delete_event(cal_id, led["source_event_id"])
@@ -644,9 +654,14 @@ async def _do_patch(
         raise ValueError(f"patch op {op['id']} has no payload")
     proj = await _get_projection(db, op["projection_id"])
     led = await (await db.execute(
-        "SELECT source_event_id FROM ledger_events WHERE id = ?",
+        "SELECT source_type, source_event_id FROM ledger_events WHERE id = ?",
         (int(proj["ledger_event_id"]),),
     )).fetchone()
+    if led is not None and led["source_type"] == "personal":
+        # Legacy pending personal writebacks must not hit Google: the
+        # personal token intentionally has calendar.readonly scope.
+        await _record_origin_writeback_applied(db, op, now=now)
+        return "succeeded"
     if led is None or not led["source_event_id"]:
         await _record_origin_writeback_applied(db, op, now=now)
         return "succeeded"

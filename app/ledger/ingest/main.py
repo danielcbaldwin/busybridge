@@ -205,9 +205,17 @@ async def _ingest_one_main_event(
         if proj_match is not None and status == "cancelled":
             ledger_id = int(proj_match["ledger_event_id"])
             matched = await (await db.execute(
-                "SELECT parent_canonical_uid FROM ledger_events WHERE id = ?",
+                """SELECT parent_canonical_uid, source_type
+                     FROM ledger_events WHERE id = ?""",
                 (ledger_id,),
             )).fetchone()
+            if matched is not None and matched["source_type"] == "personal":
+                # Personal calendars are authoritative read-only
+                # sources.  Deleting a Busy (personal) copy on main is
+                # drift to revert, not an instruction to suppress or
+                # delete anything from the personal source.
+                await _mark_main_drift_reverted(db, ledger_id)
+                return "main_drift_reverted", ledger_id
             if matched is not None and matched["parent_canonical_uid"]:
                 # The user deleted one occurrence of a managed recurring
                 # copy whose instance was already materialised (e.g. by
@@ -412,9 +420,11 @@ async def _ingest_managed_recurring_instance(
     propagate the change to the source occurrence and every peer copy
     (REWRITE_PLAN.md Option A).
 
-    A move/edit arms an origin-writeback patch; a cancellation arms a
-    destructive delete of that one source occurrence.  Never mints a
-    ``main_native`` row, and never touches the parent series.
+    A move/edit for a writable client source arms an origin-writeback
+    patch; a cancellation arms a destructive delete of that one source
+    occurrence.  Personal sources are read-only and never get those
+    source-write flags.  Never mints a ``main_native`` row, and never
+    touches the parent series.
     """
     status = event.get("status", "confirmed")
 
@@ -450,7 +460,7 @@ async def _ingest_managed_recurring_instance(
     # exception keys to the very same row).
     source_event_id: Optional[str] = None
     src_series_id = parent["source_event_id"]
-    if parent["source_type"] in ("client", "personal") and src_series_id:
+    if parent["source_type"] == "client" and src_series_id:
         original_start, instance_is_all_day = _instance_original_start(event)
         source_event_id = derive_instance_google_event_id(
             src_series_id, original_start, instance_is_all_day,
@@ -519,7 +529,11 @@ async def _ingest_managed_recurring_instance(
     # instance's writeback projection is brand new (NULL applied hash).
     # Only on a real create/update — a no-op re-ingest must not re-arm
     # a writeback that already drained.
-    if ledger_id is not None and outcome in ("created", "updated"):
+    if (
+        ledger_id is not None
+        and outcome in ("created", "updated")
+        and parent["source_type"] == "client"
+    ):
         await db.execute(
             "UPDATE ledger_events SET origin_writeback_pending = 1 "
             "WHERE id = ?",
@@ -542,12 +556,13 @@ async def _maybe_apply_main_edit_back(
 
     Three edit categories, each routed per source type:
 
-    * RSVP — always propagated.  A user may set their own response
-      on any event, editable or not; the planner's origin writeback
-      projection writes it back to the source via an events.patch.
-    * Time (start/end) — propagated for an editable client- or
-      personal-sourced event; reverted otherwise (a webcal feed is
-      read-only; a locked event the user is not allowed to move).
+    * RSVP — propagated for client-sourced events.  A user may set
+      their own response on a client event, editable or not; the
+      planner's origin writeback projection writes it back to the
+      source via an events.patch.
+    * Time (start/end) — propagated for an editable client-sourced
+      event; reverted otherwise (personal calendars and webcal feeds
+      are read-only; a locked event the user is not allowed to move).
     * Detail (summary/description/location) — propagated for an
       editable client-sourced event only.  A personal main copy is
       an opaque "Busy (personal)" placeholder and a webcal copy is
@@ -659,10 +674,11 @@ async def _maybe_apply_main_edit_back(
         return "our_writes_skipped"
 
     # Which categories may be written back to this source type.
-    time_writeback = source_type in ("client", "personal")
+    rsvp_writeback = source_type == "client"
+    time_writeback = source_type == "client"
     detail_writeback = source_type == "client"
 
-    apply_rsvp = rsvp_changed
+    apply_rsvp = rsvp_changed and rsvp_writeback
     apply_time = time_changed and user_can_edit and time_writeback
     apply_detail = detail_changed and user_can_edit and detail_writeback
 
@@ -767,6 +783,19 @@ async def _mark_user_intentionally_deleted(
     )
 
 
+async def _mark_main_drift_reverted(
+    db: aiosqlite.Connection, ledger_event_id: int,
+) -> None:
+    when = datetime.now(UTC).isoformat()
+    await db.execute(
+        """UPDATE ledger_events
+              SET version = version + 1,
+                  updated_at = ?
+            WHERE id = ?""",
+        (when, ledger_event_id),
+    )
+
+
 async def _mark_managed_instance_cancelled(
     db: aiosqlite.Connection, ledger_event_id: int,
 ) -> None:
@@ -775,9 +804,9 @@ async def _mark_managed_instance_cancelled(
 
     Sets ``status='cancelled'`` — NOT ``user_intentionally_deleted``,
     which is a whole-series flag — so only this occurrence is
-    affected.  Arms the destructive source delete when the row has a
-    real source occurrence id (client / personal sources; a webcal
-    feed is read-only and carries none).
+    affected.  Arms the destructive source delete only for client
+    sources with a real source occurrence id.  Personal and webcal
+    sources are read-only.
     """
     when = datetime.now(UTC).isoformat()
     await db.execute(
@@ -786,7 +815,8 @@ async def _mark_managed_instance_cancelled(
                   version = version + 1,
                   cancelled_at = ?, updated_at = ?, last_seen_at = ?,
                   source_delete_pending =
-                      CASE WHEN source_event_id IS NOT NULL THEN 1
+                      CASE WHEN source_type = 'client'
+                              AND source_event_id IS NOT NULL THEN 1
                            ELSE source_delete_pending END
             WHERE id = ?""",
         (when, when, when, ledger_event_id),

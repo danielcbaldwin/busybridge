@@ -332,19 +332,13 @@ def _compute_desired_projections(
         }
 
     if source == "personal":
-        # Personal detail stays opaque on every copy.  The origin
-        # writeback projection carries only the user's RSVP and the
-        # canonical time back to the personal source event — never
-        # detail, and never a create/delete (it is an events.patch).
-        origin = (
-            PRESENT_FULL_RSVP_ONLY
-            if (ledger["user_rsvp_status"] or ledger["user_can_edit"])
-            else ABSENT
-        )
+        # Personal calendars are read-only sources.  They cast opaque
+        # busy blocks onto main and client calendars, but they never
+        # receive a projection or writeback target themselves.
         return {
             "main": PRESENT_PERSONAL_BUSY,
             "peer_clients": PRESENT_PERSONAL_BUSY,
-            "origin_client": origin,
+            "origin_client": ABSENT,
         }
 
     if source == "webcal":
@@ -425,13 +419,6 @@ def _resolve_targets(
             state = peer_state
         out.append((TARGET_CLIENT, cal_id, state))
 
-    # A personal-sourced event also gets an origin writeback target,
-    # on the personal calendar itself.  Personal calendars are
-    # deliberately excluded from active_clients (they are never
-    # busy-block targets), so this target is appended explicitly.
-    # It is rendered as an events.patch and never creates/deletes.
-    if source_type == "personal" and origin_cal_id is not None:
-        out.append((TARGET_CLIENT, origin_cal_id, origin_state))
     return out
 
 

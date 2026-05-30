@@ -139,17 +139,52 @@ async def test_personal_event_creates_busy_block_on_main_and_clients():
         "personal_a",
         summary="Dentist",
         start="2026-02-02T09:00:00Z",
+        location="Private clinic",
+        description="Sensitive appointment notes",
+        attendees=[
+            {"email": "alice@example.com", "self": True,
+             "responseStatus": "accepted"},
+            {"email": "dentist@example.com", "responseStatus": "accepted"},
+        ],
+        conference_data={"entryPoints": [{"uri": "https://meet.example/private"}]},
     )
     await s.run_reconciler("alice")
 
     main_copy = s.assert_event_exists("main", summary="Busy (personal)")
     busy_a = s.find_events("client_a", summary="Busy (personal)")
     assert len(busy_a) == 1
+    for copy in (main_copy, busy_a[0]):
+        assert copy["visibility"] == "private"
+        assert copy["transparency"] == "opaque"
+        assert "location" not in copy
+        assert "attendees" not in copy
+        assert "conferenceData" not in copy
+        desc = copy.get("description") or ""
+        assert "Dentist" not in desc
+        assert "Sensitive appointment notes" not in desc
+        assert "Private clinic" not in desc
     # No event back on personal — origin is read-only.
     detail_on_personal = s.find_events("personal_a", summary="Busy (personal)")
     assert detail_on_personal == []
     # Original event on personal_a still there too.
-    s.assert_event_exists("personal_a", summary="Dentist")
+    source = s.assert_event_exists("personal_a", summary="Dentist")
+    assert source["location"] == "Private clinic"
+    assert source["attendees"]
+    assert source["conferenceData"]
+
+    db = await s.setup_db()
+    personal_id = s.user("alice").personal_calendar_ids["personal_a"]
+    personal_targets = await (await db.execute(
+        """SELECT p.id, p.desired_state
+             FROM ledger_projections p
+             JOIN ledger_events e ON e.id = p.ledger_event_id
+            WHERE e.user_id = ?
+              AND e.source_type = 'personal'
+              AND p.target_kind = 'client'
+              AND p.target_calendar_id = ?""",
+        (s.user("alice").user_id, personal_id),
+    )).fetchall()
+    assert personal_targets == []
     await s.close()
 
 

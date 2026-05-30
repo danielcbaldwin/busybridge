@@ -15,9 +15,9 @@ Five render modes:
 * ``present_personal_busy``— opaque "Busy (personal)" placeholder
   on main or any client calendar.
 * ``present_full_rsvp_only``— events.patch back to the calendar
-  that sourced the event, carrying the user's edits (RSVP, time,
-  and — for client sources — detail).  Used by the edit-on-main
-  → propagate path; never creates or deletes the source.
+  that sourced a client event, carrying the user's edits (RSVP,
+  time, and detail).  Used by the edit-on-main → propagate path;
+  never creates or deletes the source.
 * ``absent``               — no payload; outbox emits a delete.
 
 The lock emoji "🔒 " is prepended to the summary when the user
@@ -253,17 +253,14 @@ def _render_origin_writeback(row: dict) -> dict:
     ``events.patch`` is field-scoped — only the keys present here are
     changed on the source event; every other field is left intact.
 
-    Always carries the canonical ``start``/``end``.  It carries the
-    ``attendees`` array only when the user has an RSVP to write (a
-    solo source event has no attendees, and sending the array would
-    spuriously add the user as one).  For a client-sourced event it
-    also carries the editable detail fields, sent as the ledger's
-    own values — a JSON ``null`` (an absent ledger field) clears the
-    field on the source, which both no-ops a field that was never
-    set and propagates a genuine clear.  A personal source omits
-    detail: its main copy is an opaque "Busy (personal)"
-    placeholder, so an edit there is a placeholder edit, never a
-    real-event edit.
+    Client source writeback carries canonical ``start``/``end`` and
+    the ``attendees`` array only when the user has an RSVP to write
+    (a solo source event has no attendees, and sending the array would
+    spuriously add the user as one).  It also carries the editable
+    detail fields, sent as the ledger's own values — a JSON ``null``
+    (an absent ledger field) clears the field on the source, which
+    both no-ops a field that was never set and propagates a genuine
+    clear.
     """
     body: dict[str, Any] = {
         "start": _start_dict(row),

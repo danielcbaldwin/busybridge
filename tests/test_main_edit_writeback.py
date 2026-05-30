@@ -9,8 +9,10 @@ The propagate/revert matrix exercised here:
 
 * client, editable     — time and detail edits propagate.
 * client, locked       — time and detail edits revert.
-* personal             — time edits propagate; detail edits revert
-                         (the main copy is an opaque placeholder).
+* personal             — main gets only an opaque busy block.  There
+                         are no details and no RSVP surface; any drift
+                         on that block is reverted, and the source
+                         calendar is read-only.
 
 Propagation rides the origin writeback projection — a phantom
 projection on the source calendar, delivered as an ``events.patch``
@@ -43,6 +45,13 @@ def _locked_client_event(s: Scenario, calendar_nick: str, event_id: str) -> dict
              "responseStatus": "accepted"},
         ],
     })
+
+
+def _attendee(event: dict, email: str):
+    for attendee in event.get("attendees") or []:
+        if attendee.get("email") == email:
+            return attendee
+    return None
 
 
 async def test_client_time_edit_on_main_propagates_to_source():
@@ -132,10 +141,10 @@ async def test_locked_client_time_edit_on_main_is_reverted():
     await s.close()
 
 
-async def test_personal_time_edit_on_main_propagates_to_personal_source():
-    """The reviewer's reproduction: dragging a "Busy (personal)"
-    placeholder on main moves the real personal source event, so the
-    personal calendar and the ledger never disagree on the time."""
+async def test_personal_time_edit_on_main_is_reverted():
+    """Dragging a "Busy (personal)" placeholder on main must never
+    patch the real personal source event.  The main copy snaps back to
+    the personal source's canonical time."""
     s = Scenario()
     s.given_calendar("main")
     s.given_calendar("personal_a")
@@ -157,12 +166,90 @@ async def test_personal_time_edit_on_main_propagates_to_personal_source():
     await s.run_reconciler_until_quiescent("alice", max_passes=6)
 
     origin = s.google.get_event(s.cal("personal_a"), "personaltime01")
-    assert origin["start"]["dateTime"] == "2026-02-02T10:00:00Z", (
-        f"time edit not propagated to personal source; "
+    assert origin["start"]["dateTime"] == "2026-02-02T09:00:00Z", (
+        f"personal source was moved by a main placeholder edit; "
         f"start={origin.get('start')}"
     )
-    # The personal detail is untouched — the writeback never carries it.
     assert origin["summary"] == "Dentist"
+
+    reverted = s.assert_event_exists("main", summary="Busy (personal)")
+    assert reverted["start"]["dateTime"] == "2026-02-02T09:00:00Z"
+    await s.close()
+
+
+async def test_personal_busy_block_has_no_rsvp_surface_and_rsvp_drift_reverts():
+    """A personal event with attendees still renders as a plain busy
+    block on main.  There should be no attendee list to RSVP through;
+    if a malformed edit adds one anyway, it is reverted and never
+    written back."""
+    s = Scenario()
+    s.given_calendar("main")
+    s.given_calendar("personal_a")
+    await s.given_user("alice", main="main", personals=["personal_a"])
+    s.given_event(
+        "personal_a", summary="Dinner",
+        start="2026-02-02T09:00:00Z", event_id="personalrsvp01",
+        attendees=[
+            {"email": "alice@example.com", "self": True,
+             "responseStatus": "needsAction"},
+            {"email": "sam@example.com", "responseStatus": "accepted"},
+        ],
+    )
+    await s.run_reconciler_until_quiescent("alice", max_passes=4)
+
+    main_copy = s.assert_event_exists("main", summary="Busy (personal)")
+    assert "attendees" not in main_copy
+    assert "location" not in main_copy
+    assert "conferenceData" not in main_copy
+    assert "Dinner" not in (main_copy.get("description") or "")
+
+    s.update_event(
+        "main", main_copy["id"],
+        attendees=[{"email": "alice@example.com", "self": True,
+                    "responseStatus": "accepted"}],
+    )
+    await s.run_reconciler_until_quiescent("alice", max_passes=6)
+
+    origin = s.google.get_event(s.cal("personal_a"), "personalrsvp01")
+    alice = _attendee(origin, "alice@example.com")
+    assert alice is not None and alice["responseStatus"] == "needsAction", (
+        f"personal source RSVP was changed by a main placeholder edit; "
+        f"attendees={origin.get('attendees')}"
+    )
+    reverted = s.assert_event_exists("main", summary="Busy (personal)")
+    assert reverted.get("attendees") in (None, [])
+    await s.close()
+
+
+async def test_personal_main_copy_delete_is_recreated():
+    """Deleting Busy (personal) on main is drift to heal, not a request
+    to suppress the personal-source busy block."""
+    s = Scenario()
+    s.given_calendar("main")
+    s.given_calendar("personal_a")
+    user = await s.given_user("alice", main="main", personals=["personal_a"])
+    s.given_event(
+        "personal_a", summary="Dentist",
+        start="2026-02-02T09:00:00Z", event_id="personaldeleted01",
+    )
+    await s.run_reconciler_until_quiescent("alice", max_passes=4)
+
+    main_copy = s.assert_event_exists("main", summary="Busy (personal)")
+    s.cancel_event("main", main_copy["id"])
+    await s.run_reconciler_until_quiescent("alice", max_passes=8)
+
+    s.assert_event_exists("main", summary="Busy (personal)")
+    s.assert_event_exists("personal_a", summary="Dentist")
+    db = await s.setup_db()
+    row = await (await db.execute(
+        """SELECT user_intentionally_deleted
+             FROM ledger_events
+            WHERE user_id = ? AND source_type = 'personal'
+              AND source_event_id = ?""",
+        (user.user_id, "personaldeleted01"),
+    )).fetchone()
+    assert row is not None
+    assert not row["user_intentionally_deleted"]
     await s.close()
 
 
