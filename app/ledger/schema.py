@@ -28,6 +28,13 @@ CREATE TABLE IF NOT EXISTS ledger_events (
     source_event_id TEXT,
     source_etag TEXT,
     source_updated_at TIMESTAMP,
+    -- Google's stable cross-calendar event identity (events.iCalUID).
+    -- The SAME meeting shares one iCalUID across every calendar the user
+    -- is on, so this lets the planner recognise when a 'main_native'
+    -- reflection of a meeting is the same event already ingested from a
+    -- client/personal source and suppress the duplicate busy block.
+    -- Stored as identity only; deliberately NOT part of the content hash.
+    ical_uid TEXT,
 
     summary TEXT,
     description TEXT,
@@ -257,6 +264,8 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
         # Link back to the source event, shown in the main copy's
         # description footer ("Original event: …").
         "ALTER TABLE ledger_events ADD COLUMN source_html_link TEXT",
+        # Google's cross-calendar event identity for same-meeting dedup.
+        "ALTER TABLE ledger_events ADD COLUMN ical_uid TEXT",
     ):
         try:
             await db.execute(stmt)
@@ -267,6 +276,15 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
             # not be swallowed.
             if "duplicate column" not in str(e).lower():
                 raise
+
+    # Index for the cross-source dedup sibling lookup.  Created AFTER the
+    # ALTER above so it never references ical_uid before that column
+    # exists on an upgraded database.
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ledger_ical_uid "
+        "ON ledger_events(user_id, ical_uid) WHERE ical_uid IS NOT NULL"
+    )
+    await db.commit()
 
     # affected_ledger_events was first shipped with a
     # (user_id, ledger_event_id) primary key, which made a re-enqueue

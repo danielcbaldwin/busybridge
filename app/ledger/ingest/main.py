@@ -47,6 +47,7 @@ from app.ledger.ingest.client import (
     _instance_original_start,
     _is_recurring_parent,
     _record_affected,
+    _stamp_ical_uid,
     scan_full_sync_recurring_cancellations,
 )
 
@@ -134,6 +135,7 @@ async def ingest_main_calendar(
             counters[outcome] = counters.get(outcome, 0) + 1
             if ledger_id is not None:
                 affected_ledger_ids.append(ledger_id)
+                await _stamp_ical_uid(db, ledger_id, event)
 
         if "nextPageToken" in page:
             page_token = page["nextPageToken"]

@@ -136,6 +136,7 @@ async def ingest_client_calendar(
             counters[outcome] = counters.get(outcome, 0) + 1
             if ledger_id is not None:
                 affected_ledger_ids.append(ledger_id)
+                await _stamp_ical_uid(db, ledger_id, event)
 
         if "nextPageToken" in page:
             page_token = page["nextPageToken"]
@@ -278,7 +279,32 @@ async def scan_full_sync_recurring_cancellations(
             counters[outcome] = counters.get(outcome, 0) + 1
             if ledger_id is not None:
                 affected_ledger_ids.append(ledger_id)
+                await _stamp_ical_uid(db, ledger_id, inst)
     return failed
+
+
+async def _stamp_ical_uid(
+    db: aiosqlite.Connection, ledger_event_id: int, event: dict,
+) -> None:
+    """Record Google's cross-calendar event identity (events.iCalUID) on
+    an ingested ledger row when the event carries one.
+
+    The SAME meeting shares one iCalUID across every calendar the user is
+    on, so the planner uses this to recognise that a 'main_native'
+    reflection of a meeting is the same event already ingested from a
+    client/personal source — and suppress the duplicate busy block.  It is
+    identity only and deliberately kept OUT of the content hash, so it can
+    never trigger a spurious version bump.  Idempotent: the conditional
+    UPDATE is a no-op once the value is already stored.
+    """
+    ical = event.get("iCalUID")
+    if not ical:
+        return
+    await db.execute(
+        "UPDATE ledger_events SET ical_uid = ? "
+        "WHERE id = ? AND COALESCE(ical_uid, '') != ?",
+        (ical, int(ledger_event_id), ical),
+    )
 
 
 # ---------------------------------------------------------------------------

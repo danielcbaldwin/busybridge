@@ -62,10 +62,12 @@ async def plan_for_ledger_event(
     no_live_occurrences = await _recurring_parent_has_no_live_occurrences(
         db, ledger,
     )
+    main_native_redundant = await _main_native_is_redundant(db, ledger)
     desired = _compute_desired_projections(
         ledger,
         parent_inactive=parent_inactive,
         no_live_occurrences=no_live_occurrences,
+        main_native_redundant=main_native_redundant,
     )
 
     active_clients = await _active_client_calendars(db, user_id)
@@ -99,6 +101,37 @@ async def plan_for_ledger_event(
     # cancelled) propagates to every instance.
     written += await _replan_instance_children(db, ledger)
     return written
+
+
+async def _main_native_is_redundant(db: aiosqlite.Connection, ledger) -> bool:
+    """True when this ``main_native`` row is just the main-calendar
+    reflection of a meeting already ingested from a client/personal/webcal
+    source (matched by Google's cross-calendar ``iCalUID``).
+
+    The user attends many client meetings that Google also drops natively
+    onto their main calendar, producing a parallel ``main_native`` ledger
+    lineage for the SAME meeting.  Both lineages then cast busy blocks onto
+    the other client calendars — a visible duplicate.  The source lineage
+    is authoritative, so the redundant ``main_native`` copy must project
+    nothing.  Matching on iCalUID (not time) means this only ever
+    collapses the genuinely-same meeting — never two distinct events that
+    merely share a start time (which must each keep their busy block).
+    """
+    if ledger["source_type"] != "main_native":
+        return False
+    ical = ledger["ical_uid"]
+    if not ical:
+        return False
+    sibling = await (await db.execute(
+        """SELECT 1 FROM ledger_events
+            WHERE user_id = ?
+              AND ical_uid = ?
+              AND source_type != 'main_native'
+              AND status = 'active'
+            LIMIT 1""",
+        (int(ledger["user_id"]), ical),
+    )).fetchone()
+    return sibling is not None
 
 
 async def _parent_is_inactive(db: aiosqlite.Connection, ledger) -> bool:
@@ -286,6 +319,7 @@ def _compute_desired_projections(
     *,
     parent_inactive: bool = False,
     no_live_occurrences: bool = False,
+    main_native_redundant: bool = False,
 ) -> dict[str, str]:
     """Return ``{role: desired_state}`` keys: 'main', 'peer_clients',
     'origin_client'.  The caller resolves 'peer_clients' against
@@ -294,12 +328,18 @@ def _compute_desired_projections(
     ``parent_inactive`` carries the lifecycle of a modified
     instance's parent series — when the series is gone, the
     instance is too.
+
+    ``main_native_redundant`` marks a ``main_native`` row that is the
+    main-calendar reflection of a meeting already mirrored from a
+    client/personal/webcal source (same iCalUID); it projects nothing so
+    the authoritative source owns the busy blocks (no duplicate).
     """
     if (
         bool(ledger["user_intentionally_deleted"])
         or ledger["status"] == "cancelled"
         or parent_inactive
         or no_live_occurrences
+        or main_native_redundant
     ):
         return {"main": ABSENT, "peer_clients": ABSENT, "origin_client": ABSENT}
 
