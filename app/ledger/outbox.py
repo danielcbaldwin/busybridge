@@ -102,11 +102,21 @@ _BACKOFF_SECONDS = (1, 2, 4, 8, 16, 32, 60)
 # a single op is one Google API call.  Past it the op is reclaimed.
 _STALE_OP_TIMEOUT = timedelta(minutes=15)
 
-# Upper bound on how many times _do_create will derive a fresh
-# deterministic id past cancelled tombstones.  Each generation is a
-# distinct hash, so colliding even twice is already astronomically
-# unlikely; this is purely a guard against an unbounded loop.
+# Upper bound on how many fresh deterministic ids _do_create will
+# derive past cancelled tombstones within a SINGLE drain attempt.
 _MAX_ID_GENERATIONS = 8
+
+# Absolute ceiling on a projection's *persisted* google_id_generation.
+# _MAX_ID_GENERATIONS only bounds one drain attempt's inner loop, but the
+# generation is persisted and resumed across attempts.  Without a global
+# cap, a projection whose every derived id collides with a cancelled
+# tombstone burns ids forever — observed climbing into the thousands,
+# re-burning ~hundreds of insert+GET calls per drain while the real event
+# is never mirrored.  Past this cap we stop, mark the op a permanent
+# failure, and alert: a real event that cannot be created needs operator
+# attention, not an unbounded loop.  Recover via the admin retry-failed
+# action once the root cause is addressed.
+_MAX_TOTAL_ID_GENERATIONS = 50
 
 
 class OutboxDrainError(Exception):
@@ -390,6 +400,12 @@ async def _do_create(
     generation = int(proj["google_id_generation"] or 0)
     body = dict(payload)
 
+    # Absolute ceiling: a resumed op whose persisted generation already
+    # reached the cap stops here rather than burning more ids.
+    if generation >= _MAX_TOTAL_ID_GENERATIONS:
+        await _give_up_burned_ids(db, op, generation=generation, now=now)
+        return
+
     for _ in range(_MAX_ID_GENERATIONS):
         google_id = derive_google_event_id(
             int(op["projection_id"]), generation,
@@ -416,8 +432,15 @@ async def _do_create(
                 burned = True
             if burned or existing.get("status") == "cancelled":
                 # The id is burned (cancelled tombstone, or reserved).
-                # Move to a fresh deterministic id and retry.
+                # Move to a fresh deterministic id and retry — unless we
+                # have hit the absolute ceiling, in which case give up and
+                # alert instead of burning ids forever.
                 generation += 1
+                if generation >= _MAX_TOTAL_ID_GENERATIONS:
+                    await _give_up_burned_ids(
+                        db, op, generation=generation, now=now,
+                    )
+                    return
                 await db.execute(
                     """UPDATE ledger_projections
                           SET google_id_generation = ?
@@ -893,6 +916,50 @@ async def _mark_permanent_failure(
         (when, error, when, int(op["projection_id"])),
     )
     await db.commit()
+
+
+async def _give_up_burned_ids(
+    db: aiosqlite.Connection,
+    op: aiosqlite.Row,
+    *,
+    generation: int,
+    now: datetime,
+) -> None:
+    """Stop burning deterministic ids and surface the projection.
+
+    Every derived id for this projection has collided with a cancelled
+    tombstone up to the absolute ceiling.  Persist the generation (so a
+    later admin retry resumes past the burned ids rather than re-colliding
+    from a low generation), mark the op a permanent failure, and alert —
+    a real event that cannot be mirrored needs operator attention, not an
+    unbounded id-burning loop.
+    """
+    await db.execute(
+        "UPDATE ledger_projections SET google_id_generation = ? WHERE id = ?",
+        (int(generation), int(op["projection_id"])),
+    )
+    error = (
+        f"create op {op['id']}: gave up after {generation} burned id "
+        f"generations for projection {op['projection_id']} — every derived "
+        f"id collides with a cancelled tombstone on Google"
+    )
+    logger.error(error)
+    await _mark_permanent_failure(db, op, error=error, http_status=None, now=now)
+    try:  # alerting must never break the drain
+        from app.alerts.email import queue_alert
+        await queue_alert(
+            alert_type="event_unmirrorable",
+            user_id=int(op["user_id"]),
+            details=(
+                "A calendar event could not be mirrored as a busy block after "
+                f"exhausting {generation} id generations (projection "
+                f"{op['projection_id']}). It will not appear as busy until "
+                "resolved; use the admin retry-failed action after "
+                "investigating the underlying recurring event."
+            ),
+        )
+    except Exception as e:
+        logger.warning("could not queue event_unmirrorable alert: %s", e)
 
 
 async def _classify_and_retry(
