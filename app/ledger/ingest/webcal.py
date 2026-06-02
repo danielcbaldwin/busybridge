@@ -75,7 +75,7 @@ async def ingest_webcal_subscription(
     counters = {
         "seen": 0, "created": 0, "updated": 0,
         "stale_cancelled": 0, "skipped": 0, "not_modified": 0,
-        "errors": 0,
+        "errors": 0, "empty_skipped": 0,
     }
     state = await _get_subscription(db, subscription_id=subscription_id)
     if state is None:
@@ -135,6 +135,51 @@ async def ingest_webcal_subscription(
         if ledger_id is not None:
             affected_ledger_ids.append(ledger_id)
             seen_canonical_uids.add(canonical)
+
+    # Empty-feed guard.  A provider reset/outage can serve HTTP 200 with
+    # a parseable but EVENTLESS VCALENDAR.  Letting that drive
+    # stale-detection would cancel every busy block this feed produced —
+    # the user would show FREE for real commitments and get double-booked
+    # (the worst outcome for this tool).  We cannot tell "feed is
+    # genuinely empty now" from "feed is mid-outage" no matter how long it
+    # lasts, so an empty poll NEVER mass-cancels while the subscription
+    # still holds active events.  Individual events dropping out of a
+    # NON-empty feed are still cancelled below.  A consecutive-empty
+    # counter is recorded and logged so a genuinely-dead feed is visible
+    # to the operator (who can remove the subscription); a non-empty poll
+    # resets it.
+    keys = state.keys() if hasattr(state, "keys") else []
+    prior_empty = (
+        int(state["consecutive_empty_polls"])
+        if "consecutive_empty_polls" in keys
+        and state["consecutive_empty_polls"] is not None
+        else 0
+    )
+    if counters["seen"] == 0:
+        active_count = int((await (await db.execute(
+            """SELECT COUNT(*) AS c FROM ledger_events
+                WHERE user_id = ? AND source_type = 'webcal'
+                  AND source_calendar_id = ? AND status = 'active'""",
+            (user_id, subscription_id),
+        )).fetchone())["c"])
+        if active_count > 0:
+            empties = prior_empty + 1
+            await _set_consecutive_empty_polls(db, subscription_id, empties)
+            logger.warning(
+                "webcal sub=%s returned an empty-but-valid feed (%d "
+                "consecutive) while holding %d active event(s); skipping "
+                "stale-cancellation so a feed reset/outage cannot wipe real "
+                "busy blocks. If the feed is genuinely empty, remove the "
+                "subscription to clear them.",
+                subscription_id, empties, active_count,
+            )
+            counters["empty_skipped"] = 1
+            await _record_fetch_success(db, subscription_id, etag=etag, now=now)
+            await db.commit()
+            return counters
+        # No active rows to protect — nothing to cancel; fall through.
+    elif prior_empty:
+        await _set_consecutive_empty_polls(db, subscription_id, 0)
 
     # Stale-detection: anything previously sourced from this
     # subscription but not in this poll's seen set, AND not seen
@@ -660,6 +705,26 @@ async def _get_subscription(
         "SELECT * FROM webcal_subscriptions WHERE id = ?",
         (subscription_id,),
     )).fetchone()
+
+
+async def _set_consecutive_empty_polls(
+    db: aiosqlite.Connection, subscription_id: int, value: int,
+) -> None:
+    """Persist the consecutive-empty-poll counter.
+
+    Tolerant of a schema without the column (older test schemas): if the
+    UPDATE fails the counter stays 0, which only makes the empty-feed
+    guard MORE conservative (it still skips cancellation), so the safe
+    behaviour is preserved either way.
+    """
+    try:
+        await db.execute(
+            "UPDATE webcal_subscriptions SET consecutive_empty_polls = ? "
+            "WHERE id = ?",
+            (int(value), subscription_id),
+        )
+    except Exception:
+        pass
 
 
 async def _record_fetch_success(

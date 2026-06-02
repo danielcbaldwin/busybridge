@@ -262,6 +262,11 @@ async def init_schema(db: aiosqlite.Connection) -> None:
         "ALTER TABLE webcal_subscriptions ADD COLUMN placement_kind TEXT NOT NULL DEFAULT 'main'",
         "ALTER TABLE webcal_subscriptions ADD COLUMN placement_client_calendar_id INTEGER NULL REFERENCES client_calendars(id) ON DELETE SET NULL",
         "ALTER TABLE webcal_subscriptions ADD COLUMN placement_client_display_name_cache TEXT NULL",
+        # Count of consecutive empty-but-valid polls.  Used to keep an
+        # empty feed (provider reset/outage serving HTTP 200 + a valid but
+        # eventless VCALENDAR) from mass-cancelling every busy block it
+        # produced.  Constant DEFAULT → O(1) add, no table rewrite.
+        "ALTER TABLE webcal_subscriptions ADD COLUMN consecutive_empty_polls INTEGER NOT NULL DEFAULT 0",
     ]
     for stmt in migrations:
         try:
