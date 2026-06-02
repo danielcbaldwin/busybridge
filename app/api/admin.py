@@ -296,6 +296,20 @@ async def force_user_reauth(
             detail="User not found"
         )
 
+    # Stop the user's push channels on Google BEFORE wiping local state,
+    # so Google stops POSTing to them.  Best-effort: in a forced reauth
+    # the token is often already bad, in which case the channels simply
+    # expire on their TTL — but a voluntary reauth (valid token) is torn
+    # down cleanly.  Runs outside the transaction below because the helper
+    # commits internally.
+    from app.api.webhooks import stop_channels_for_user
+    try:
+        await stop_channels_for_user(db, user_id=user_id)
+    except Exception:
+        logger.exception(
+            "force_user_reauth: channel teardown failed for user %s", user_id,
+        )
+
     # Wipe the user's sync state in one transaction so a crash mid-way
     # cannot leave some tables cleared and others intact.
     await db.execute("BEGIN IMMEDIATE")
@@ -449,6 +463,19 @@ async def delete_user(
         logger.warning(
             "force-deleting user %s leaves %d orphaned Google event(s)",
             user_id, orphan_count,
+        )
+
+    # Stop any push channels still live on Google — the main calendar's,
+    # plus any the per-calendar disconnect loop above didn't cover —
+    # before the cascade removes their local rows.  Otherwise Google keeps
+    # POSTing to them for the channel TTL (the "Unknown webhook channel"
+    # storm).  Best-effort.
+    from app.api.webhooks import stop_channels_for_user
+    try:
+        await stop_channels_for_user(db, user_id=user_id)
+    except Exception:
+        logger.exception(
+            "delete_user: channel teardown failed for user %s", user_id,
         )
 
     # Delete user (cascades to related records)

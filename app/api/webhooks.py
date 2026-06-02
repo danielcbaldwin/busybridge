@@ -2,6 +2,7 @@
 
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
@@ -334,3 +335,91 @@ async def stop_webhook_channel(channel_id: str, resource_id: str, access_token: 
     except Exception as e:
         logger.exception(f"Error stopping webhook channel: {e}")
         return False
+
+
+async def stop_channels_for_user(
+    db,
+    *,
+    user_id: int,
+    client_calendar_id: Optional[int] = None,
+) -> int:
+    """Tell Google to stop every push channel for this user — or just for
+    one client calendar — then remove the local rows.
+
+    Called from the disconnect / reauth / delete paths.  Without this,
+    deleting the local webhook_channels row leaves the channel live on
+    Google's side, which keeps POSTing to our endpoint for the channel's
+    full ~7-day TTL (the "Unknown webhook channel" storm) and also blocks
+    the retention cleanup's client_calendars delete via the RESTRICT FK.
+
+    Best-effort, mirroring the renewal job's stop pattern: a revoked or
+    expired token, or a channel Google already forgot (404), is logged and
+    the local row removed anyway, so the channel is never left dangling
+    in our DB and the FK is cleared.  Returns the count stopped on Google.
+    """
+    from app.auth.google import get_valid_access_token
+
+    bare_where = "user_id = ?"
+    join_where = "wc.user_id = ?"
+    params: tuple = (user_id,)
+    if client_calendar_id is not None:
+        bare_where += " AND client_calendar_id = ?"
+        join_where += " AND wc.client_calendar_id = ?"
+        params = (user_id, client_calendar_id)
+
+    # Resolve each channel's owning account so we can fetch a token and
+    # stop it on Google.  A minimal/older schema (some tests) may lack the
+    # oauth_tokens/users tables — fall back to a bare query and just remove
+    # the local rows, so a disconnect never errors and never leaves a row
+    # dangling.
+    can_resolve_token = True
+    try:
+        rows = await (await db.execute(
+            f"""SELECT wc.channel_id, wc.resource_id, wc.calendar_type,
+                       u.email AS user_email, ot.google_account_email
+                  FROM webhook_channels wc
+                  JOIN users u ON u.id = wc.user_id
+                  LEFT JOIN client_calendars cc ON cc.id = wc.client_calendar_id
+                  LEFT JOIN oauth_tokens ot ON ot.id = cc.oauth_token_id
+                 WHERE {join_where}""",
+            params,
+        )).fetchall()
+    except Exception:
+        can_resolve_token = False
+        rows = await (await db.execute(
+            f"SELECT channel_id, resource_id, calendar_type "
+            f"FROM webhook_channels WHERE {bare_where}",
+            params,
+        )).fetchall()
+
+    stopped = 0
+    for wc in rows:
+        if can_resolve_token:
+            email = (
+                wc["user_email"] if wc["calendar_type"] == "main"
+                else wc["google_account_email"]
+            )
+            try:
+                if email:
+                    token = await get_valid_access_token(user_id, email)
+                    # stop_webhook_channel stops on Google AND deletes the row.
+                    if await stop_webhook_channel(
+                        wc["channel_id"], wc["resource_id"], token,
+                    ):
+                        stopped += 1
+                        continue
+            except Exception as e:
+                logger.warning(
+                    "could not stop webhook channel %s on Google (%s); "
+                    "removing the local row anyway",
+                    wc["channel_id"], e,
+                )
+        # Couldn't stop on Google (no/expired token, non-OK response, or a
+        # schema without token tables): still drop the local row so it is
+        # not left dangling.
+        await db.execute(
+            "DELETE FROM webhook_channels WHERE channel_id = ?",
+            (wc["channel_id"],),
+        )
+        await db.commit()
+    return stopped

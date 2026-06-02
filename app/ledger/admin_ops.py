@@ -279,13 +279,16 @@ async def disconnect_calendar(
             WHERE id = ?""",
         (when, client_calendar_id),
     )
-    # Drop the calendar's webhook channels: a disconnected calendar is
-    # no longer ingested, so the renewal job must stop renewing its
-    # webhooks (it does not filter on is_active).  The Google-side
-    # channel simply expires.
-    await db.execute(
-        "DELETE FROM webhook_channels WHERE client_calendar_id = ?",
-        (client_calendar_id,),
+    # Tear down the calendar's webhook channels: a disconnected calendar
+    # is no longer ingested, so the renewal job must stop renewing its
+    # webhooks (it does not filter on is_active).  Actively STOP the
+    # channel on Google (best-effort) rather than just dropping the local
+    # row — otherwise Google keeps POSTing to the dead channel for its
+    # ~7-day TTL (the "Unknown webhook channel" storm) and the leftover
+    # row blocks retention's client_calendars delete via the RESTRICT FK.
+    from app.api.webhooks import stop_channels_for_user
+    await stop_channels_for_user(
+        db, user_id=user_id, client_calendar_id=client_calendar_id,
     )
 
     # Per-subscription placement transitions: snapshot the display
