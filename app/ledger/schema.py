@@ -163,6 +163,22 @@ CREATE INDEX IF NOT EXISTS idx_outbox_due
     ON outbox_operations(user_id, next_attempt_at, status)
     WHERE status IN ('pending', 'in_flight');
 
+-- Drain hot path: _claim_next / _reclaim_stale_operations filter by
+-- (user_id, status) equality then a next_attempt_at range, and run every
+-- 30s for every due user.  idx_outbox_due puts the range column
+-- (next_attempt_at) before status, and its IN-list partial predicate is
+-- not matched by the `status = 'pending'` + `next_attempt_at IS NULL OR
+-- <= ?` claim query, so the claim falls back to a full table SCAN (175K
+-- rows when the table is backlogged).  Equality columns first fixes it.
+CREATE INDEX IF NOT EXISTS idx_outbox_claim
+    ON outbox_operations(user_id, status, next_attempt_at);
+
+-- Nightly retention prune (jobs/cleanup.py) deletes settled rows by
+-- (status, completed_at); without this it full-scans the whole table
+-- under the single write lock.
+CREATE INDEX IF NOT EXISTS idx_outbox_settled
+    ON outbox_operations(status, completed_at);
+
 
 CREATE TABLE IF NOT EXISTS reconcile_requests (
     user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
