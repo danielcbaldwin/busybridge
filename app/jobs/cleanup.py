@@ -12,14 +12,27 @@ Retention policy (unchanged at the API contract level):
 * Old ``sync_log`` rows past ``audit_log_retention_days`` → deleted.
 * Disconnected client_calendars past
   ``disconnected_calendar_retention_days`` → deleted.
-* Settled outbox rows (``done`` / ``superseded``) older than 7 days
-  are pruned so the table doesn't grow without bound.
+* Settled outbox rows (``done`` / ``superseded`` / ``permanent_failure``)
+  older than 7 days are pruned so the table doesn't grow without bound.
 
 A ledger_event is never hard-deleted while a projection of it is
 still ``present`` on Google — that would orphan the Google copy
 (REWRITE_PLAN.md §18, enforced by a DB trigger).  Expired active
 events are cancelled and re-planned here; the next reconcile drains
 the deletes, and a subsequent retention pass removes the row.
+
+**Per-bucket isolation.**  Each retention bucket runs inside its own
+``try``/``except`` and commits independently.  A failure in one bucket
+(historically: the ``client_calendars`` delete tripping a RESTRICT FK
+from ``sync_log`` / ``webhook_channels``) must NOT abort the whole pass
+and strand the others — when it did, the ``outbox`` and ``sync_log``
+prunes never ran and those tables grew without bound (the DB ballooned
+from ~34MB to >300MB on the Pi).  Buckets are ordered cheapest-and-
+unbounded-first so the highest-value prunes happen even if a later
+bucket fails, and the ``client_calendars`` delete clears its blocking
+FK references first.  A ``wal_checkpoint(TRUNCATE)`` at the end reclaims
+the write-ahead-log high-water mark (WAL mode never shrinks the -wal
+file on its own).
 """
 
 from __future__ import annotations
@@ -53,14 +66,97 @@ async def run_retention_cleanup() -> dict:
         "old_busy_blocks": 0,
     }
 
-    # 1. Single (non-recurring) events past retention.
-    #
-    #    Active expired events are CANCELLED and re-planned — the
-    #    planner drives every projection to 'absent' and the next
-    #    reconcile's diff drains the Google deletes.  Only rows whose
-    #    projections have all drained ('present' nowhere) are then
-    #    hard-deleted: deleting a row with a live projection would
-    #    orphan its Google copy (REWRITE_PLAN.md §18).
+    # Cheapest, unbounded-growth prunes first (sync_log, outbox), then the
+    # event/series/calendar buckets.  Each is isolated: one failing bucket
+    # logs and the rest still run.  The connection is autocommit, so a
+    # raise mid-bucket cannot roll back an earlier bucket.
+    buckets = (
+        ("old_sync_logs", _prune_old_sync_logs),
+        ("settled_outbox_rows", _prune_settled_outbox),
+        ("expired_single_events", _expire_single_events),
+        ("deleted_recurring_series", _prune_cancelled_recurring),
+        ("disconnected_calendars", _prune_disconnected_calendars),
+    )
+    for name, fn in buckets:
+        try:
+            await fn(db, now, settings, summary)
+            await db.commit()
+        except Exception:
+            logger.exception(
+                "retention cleanup bucket %r failed; continuing with the rest",
+                name,
+            )
+
+    # Reclaim the WAL high-water mark.  WAL mode never shrinks the -wal
+    # file on its own; without this a one-off bloat event (e.g. a write
+    # storm) leaves hundreds of MB of -wal on disk forever.  Best-effort:
+    # a TRUNCATE checkpoint that can't complete (a concurrent reader) just
+    # returns busy without erroring.
+    try:
+        await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception:
+        logger.exception("wal_checkpoint(TRUNCATE) failed; continuing")
+
+    logger.info(f"Retention cleanup completed: {summary}")
+    try:
+        await db.execute(
+            """INSERT INTO sync_log (action, status, details)
+               VALUES ('retention_cleanup', 'success', ?)""",
+            (json.dumps(summary),),
+        )
+        await db.commit()
+    except Exception:
+        logger.exception("retention cleanup: failed to record summary row")
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Individual retention buckets.  Each mutates ``summary`` in place and is
+# called in isolation by run_retention_cleanup so a single failure cannot
+# strand the others.
+# ---------------------------------------------------------------------------
+async def _prune_old_sync_logs(db, now, settings, summary) -> None:
+    """Delete audit-log rows past ``audit_log_retention_days``."""
+    log_cutoff = (
+        now - timedelta(days=settings.audit_log_retention_days)
+    ).isoformat()
+    cursor = await db.execute(
+        "DELETE FROM sync_log WHERE created_at < ? RETURNING id",
+        (log_cutoff,),
+    )
+    summary["old_sync_logs"] = len(await cursor.fetchall())
+
+
+async def _prune_settled_outbox(db, now, settings, summary) -> None:
+    """Delete settled outbox rows older than 7 days.
+
+    This is the fastest-growing table (one settled row per Google
+    write), so it is pruned first — even if a later bucket fails, the
+    outbox does not grow without bound.
+    """
+    outbox_cutoff = (now - timedelta(days=7)).isoformat()
+    cursor = await db.execute(
+        """DELETE FROM outbox_operations
+            WHERE status IN ('done', 'superseded', 'permanent_failure')
+              AND completed_at IS NOT NULL
+              AND completed_at < ?
+            RETURNING id""",
+        (outbox_cutoff,),
+    )
+    summary["settled_outbox_rows"] = len(await cursor.fetchall())
+
+
+async def _expire_single_events(db, now, settings, summary) -> None:
+    """Cancel + re-plan expired single events, then hard-delete the
+    ones whose projections have all drained.
+
+    Active expired events are CANCELLED and re-planned — the planner
+    drives every projection to 'absent' and the next reconcile's diff
+    drains the Google deletes.  Only rows whose projections have all
+    drained ('present' nowhere) are then hard-deleted: deleting a row
+    with a live projection would orphan its Google copy
+    (REWRITE_PLAN.md §18).
+    """
     from app.ledger.planner import plan_for_ledger_event
 
     nowiso = now.isoformat()
@@ -102,8 +198,10 @@ async def run_retention_cleanup() -> dict:
     )
     summary["expired_ledger_events"] = len(await cursor.fetchall())
 
-    # 2. Cancelled recurring series past retention — only once every
-    #    projection has drained (no Google copy left to orphan).
+
+async def _prune_cancelled_recurring(db, now, settings, summary) -> None:
+    """Hard-delete cancelled recurring series past retention — only once
+    every projection has drained (no Google copy left to orphan)."""
     recurring_cutoff = (
         now - timedelta(days=settings.recurring_soft_delete_days)
     ).isoformat()
@@ -122,27 +220,29 @@ async def run_retention_cleanup() -> dict:
     )
     summary["deleted_recurring_series"] = len(await cursor.fetchall())
 
-    # 3. Old sync logs.
-    log_cutoff = (
-        now - timedelta(days=settings.audit_log_retention_days)
-    ).isoformat()
-    cursor = await db.execute(
-        "DELETE FROM sync_log WHERE created_at < ? RETURNING id",
-        (log_cutoff,),
-    )
-    summary["old_sync_logs"] = len(await cursor.fetchall())
 
-    # 4. Disconnected calendars past retention.
+async def _prune_disconnected_calendars(db, now, settings, summary) -> None:
+    """Hard-delete disconnected client_calendars past retention.
+
+    Only purge a calendar once nothing in the ledger still needs its
+    google_calendar_id mapping: a projection still present on Google,
+    permanently failed, or diverged still owes a delete the outbox
+    routes via this calendar.  Purging early would strand that delete.
+
+    The DELETE is blocked by two RESTRICT foreign keys —
+    ``sync_log.calendar_id`` and ``webhook_channels.client_calendar_id``
+    (the ledger's ``ledger_projections.target_calendar_id`` is NOT a
+    foreign key).  This historically aborted the whole nightly pass.
+    Clear those references first: NULL out the audit rows (the column is
+    nullable) and drop the webhook rows — a calendar disconnected past
+    retention has long-expired Google push channels (≤7-day TTL), so the
+    channel rows are dead weight and safe to delete here.
+    """
     calendar_cutoff = (
         now - timedelta(days=settings.disconnected_calendar_retention_days)
     ).isoformat()
-    # Only purge a disconnected calendar once nothing in the ledger
-    # still needs its google_calendar_id mapping: a projection that is
-    # still present on Google, permanently failed, or diverged still
-    # owes a delete that the outbox routes via this calendar.  Purging
-    # early would strand that delete (and may trip an FK).
-    cursor = await db.execute(
-        """DELETE FROM client_calendars
+    eligible = await (await db.execute(
+        """SELECT id FROM client_calendars
             WHERE is_active = FALSE
               AND disconnected_at IS NOT NULL
               AND disconnected_at < ?
@@ -154,37 +254,30 @@ async def run_retention_cleanup() -> dict:
                           OR p.applied_ledger_version IS NULL
                           OR p.applied_ledger_version != p.desired_ledger_version
                           OR p.applied_payload_hash != p.desired_payload_hash)
-              )
-            RETURNING id""",
+              )""",
         (calendar_cutoff,),
+    )).fetchall()
+    ids = [int(r["id"]) for r in eligible]
+    if not ids:
+        summary["disconnected_calendars"] = 0
+        return
+
+    placeholders = ",".join("?" for _ in ids)
+    await db.execute(
+        f"UPDATE sync_log SET calendar_id = NULL "
+        f"WHERE calendar_id IN ({placeholders})",
+        ids,
+    )
+    await db.execute(
+        f"DELETE FROM webhook_channels "
+        f"WHERE client_calendar_id IN ({placeholders})",
+        ids,
+    )
+    cursor = await db.execute(
+        f"DELETE FROM client_calendars WHERE id IN ({placeholders}) RETURNING id",
+        ids,
     )
     summary["disconnected_calendars"] = len(await cursor.fetchall())
-
-    # 5. Settled outbox rows.
-    outbox_cutoff = (now - timedelta(days=7)).isoformat()
-    cursor = await db.execute(
-        """DELETE FROM outbox_operations
-            WHERE status IN ('done', 'superseded', 'permanent_failure')
-              AND completed_at IS NOT NULL
-              AND completed_at < ?
-            RETURNING id""",
-        (outbox_cutoff,),
-    )
-    summary["settled_outbox_rows"] = len(await cursor.fetchall())
-
-    # Legacy event_mappings / busy_blocks tables were dropped at the
-    # Stage-5 cutover; nothing to prune here.  The summary keys stay
-    # at zero for backwards-compatibility with admin UI consumers.
-
-    await db.commit()
-    logger.info(f"Retention cleanup completed: {summary}")
-    await db.execute(
-        """INSERT INTO sync_log (action, status, details)
-           VALUES ('retention_cleanup', 'success', ?)""",
-        (json.dumps(summary),),
-    )
-    await db.commit()
-    return summary
 
 
 async def vacuum_database() -> None:
@@ -195,6 +288,10 @@ async def vacuum_database() -> None:
     held for its duration so the reconciler, webhook, and drain paths
     freeze rather than collide with it, and any reconcile pass already
     in flight is drained out first.
+
+    VACUUM rewrites the main database file but does NOT shrink the WAL
+    in WAL mode, so a ``wal_checkpoint(TRUNCATE)`` follows to reclaim the
+    -wal high-water mark too.
     """
     from app.maintenance import (
         enter_maintenance,
@@ -208,6 +305,10 @@ async def vacuum_database() -> None:
     try:
         await wait_for_reconcile_quiescence()
         await db.execute("VACUUM")
+        try:
+            await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            logger.exception("wal_checkpoint(TRUNCATE) after VACUUM failed")
     finally:
         exit_maintenance()
     logger.info("Database VACUUM completed")
