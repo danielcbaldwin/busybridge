@@ -10,8 +10,15 @@ For each event Google delivers, decide:
 3. Otherwise: upsert the ledger row, bumping ``version`` only if a
    material field changed.
 
-The whole loop runs inside one transaction so the sync token can
-only advance after every event was successfully recorded.
+The connection runs in autocommit (``isolation_level=None``), so each
+event is recorded as it is processed — there is no single enclosing
+transaction.  Per-event failures are isolated: one poison event (e.g.
+a ``canonical_uid`` UNIQUE collision) is logged and skipped rather than
+aborting the pass.  This matters because aborting before the sync-token
+write at the end would freeze the token and silently stop every later
+event from reaching the main calendar.  The token write is the last
+durable write of the pass, so a crash mid-pass simply re-ingests from
+the old token next time (idempotent).
 """
 
 from __future__ import annotations
@@ -60,7 +67,7 @@ async def ingest_client_calendar(
     sync_token: Optional[str] = state["sync_token"]
     counters = {
         "seen": 0, "created": 0, "updated": 0,
-        "rekeyed": 0, "skipped": 0, "cancelled": 0,
+        "rekeyed": 0, "skipped": 0, "cancelled": 0, "failed": 0,
     }
     affected_ledger_ids: list[int] = []
 
@@ -103,14 +110,29 @@ async def ingest_client_calendar(
             counters["seen"] += 1
             if _is_recurring_parent(event):
                 recurring_parent_ids.add(event["id"])
-            outcome, ledger_id = await _ingest_one_event(
-                db,
-                user_id=user_id,
-                client_calendar_id=client_calendar_id,
-                user_email=user_email,
-                owned_emails=owned_emails,
-                event=event,
-            )
+            try:
+                outcome, ledger_id = await _ingest_one_event(
+                    db,
+                    user_id=user_id,
+                    client_calendar_id=client_calendar_id,
+                    user_email=user_email,
+                    owned_emails=owned_emails,
+                    event=event,
+                )
+            except Exception:
+                # Isolate per-event failures.  A single poison event
+                # (e.g. a canonical_uid UNIQUE collision) must NOT
+                # abort the pass — that would strand the sync token and
+                # silently stop every later event from reaching the
+                # main calendar.  Log loudly, skip this one, keep going;
+                # the token still advances so the calendar keeps syncing.
+                logger.exception(
+                    "client ingest: skipping event %s on client_calendar_id=%s "
+                    "after error",
+                    event.get("id"), client_calendar_id,
+                )
+                counters["failed"] = counters.get("failed", 0) + 1
+                continue
             counters[outcome] = counters.get(outcome, 0) + 1
             if ledger_id is not None:
                 affected_ledger_ids.append(ledger_id)
@@ -240,7 +262,19 @@ async def scan_full_sync_recurring_cancellations(
             if not inst.get("recurringEventId"):
                 continue
             counters["seen"] += 1
-            outcome, ledger_id = await ingest_one(inst)
+            try:
+                outcome, ledger_id = await ingest_one(inst)
+            except Exception:
+                # Isolate per-instance failures, same rationale as the
+                # main page loop: one bad cancelled instance must not
+                # abort the whole scan.
+                logger.exception(
+                    "instance scan: skipping cancelled instance %s of %s "
+                    "after error",
+                    inst.get("id"), parent_id,
+                )
+                counters["failed"] = counters.get("failed", 0) + 1
+                continue
             counters[outcome] = counters.get(outcome, 0) + 1
             if ledger_id is not None:
                 affected_ledger_ids.append(ledger_id)

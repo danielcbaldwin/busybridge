@@ -74,7 +74,7 @@ async def ingest_main_calendar(
     counters: dict[str, int] = {
         "seen": 0, "native_created": 0, "native_updated": 0,
         "user_deletes": 0, "our_writes_skipped": 0, "skipped": 0,
-        "cancelled_native": 0,
+        "cancelled_native": 0, "failed": 0,
     }
     affected_ledger_ids: list[int] = []
     page_token: Optional[str] = None
@@ -112,13 +112,25 @@ async def ingest_main_calendar(
             counters["seen"] += 1
             if _is_recurring_parent(event):
                 recurring_parent_ids.add(event["id"])
-            outcome, ledger_id = await _ingest_one_main_event(
-                db,
-                user_id=user_id,
-                user_email=user_email,
-                owned_emails=owned_emails,
-                event=event,
-            )
+            try:
+                outcome, ledger_id = await _ingest_one_main_event(
+                    db,
+                    user_id=user_id,
+                    user_email=user_email,
+                    owned_emails=owned_emails,
+                    event=event,
+                )
+            except Exception:
+                # Isolate per-event failures so a single poison event
+                # cannot abort the pass and strand the main sync token
+                # (which would silently stop ingesting main-side edits
+                # and native events).  Log loudly, skip, keep going.
+                logger.exception(
+                    "main ingest: skipping event %s for user_id=%s after error",
+                    event.get("id"), user_id,
+                )
+                counters["failed"] = counters.get("failed", 0) + 1
+                continue
             counters[outcome] = counters.get(outcome, 0) + 1
             if ledger_id is not None:
                 affected_ledger_ids.append(ledger_id)
