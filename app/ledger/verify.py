@@ -56,6 +56,8 @@ async def verify_user(
         """SELECT p.id, p.target_kind, p.target_calendar_id,
                   p.current_state, p.google_event_id,
                   p.desired_state, p.permanently_failed,
+                  p.applied_ledger_version, p.desired_ledger_version,
+                  p.applied_payload_hash, p.desired_payload_hash,
                   e.summary, e.canonical_uid
              FROM ledger_projections p
              JOIN ledger_events e ON e.id = p.ledger_event_id
@@ -120,6 +122,21 @@ async def verify_user(
                     f"projection {r['id']} ({r['summary']!r}): ledger says "
                     f"present, but {gid} on {target_cal} is CANCELLED"
                 )
+            elif _ledger_behind(r):
+                # The event exists and isn't cancelled, but the ledger
+                # itself has NOT applied its desired version/payload — the
+                # last successful write predates the current desired state.
+                # The Google copy is therefore stale (e.g. a since-failed
+                # time/title update), which existence-only checks miss.
+                divergences.append(
+                    f"projection {r['id']} ({r['summary']!r}): {gid} on "
+                    f"{target_cal} exists but is STALE — applied "
+                    f"v{r['applied_ledger_version']}/"
+                    f"{_short(r['applied_payload_hash'])} != desired "
+                    f"v{r['desired_ledger_version']}/"
+                    f"{_short(r['desired_payload_hash'])} "
+                    f"(the copy may show the wrong time/title)"
+                )
             else:
                 ok += 1
         elif current == "absent" and gid:
@@ -148,6 +165,30 @@ async def verify_user(
         "divergences": divergences,
         "consistent": not divergences,
     }
+
+
+def _ledger_behind(r) -> bool:
+    """True when the ledger itself knows it has not applied the desired
+    state to this projection — the same divergence definition the planner
+    uses (idx_proj_diverged): no successful apply yet, an out-of-date
+    applied version, or an out-of-date applied payload hash.  A 'present'
+    projection that is behind has a stale Google copy even though the
+    event still exists.
+    """
+    if r["applied_ledger_version"] is None:
+        return True
+    if r["applied_ledger_version"] != r["desired_ledger_version"]:
+        return True
+    if r["applied_payload_hash"] != r["desired_payload_hash"]:
+        return True
+    return False
+
+
+def _short(h: Optional[str]) -> str:
+    """Abbreviate a payload hash for the divergence message."""
+    if not h:
+        return "∅"
+    return h[:8]
 
 
 def _resolve(
