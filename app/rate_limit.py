@@ -33,6 +33,26 @@ def _get_real_ip(request: Request) -> str:
     return get_remote_address(request)
 
 
+def webhook_rate_key(request: Request) -> str:
+    """Rate-limit key for the Google Calendar webhook endpoint.
+
+    Google delivers every push notification from a small pool of Google
+    IPs — and behind a reverse proxy they all arrive as a SINGLE source
+    IP.  Keying on IP therefore forces every channel to share one bucket,
+    so a burst (or a stale-channel storm) 429s real notifications and sync
+    silently degrades to the slow scheduler poll.  Key on the push channel
+    id instead: each channel gets its own bucket, so one noisy or stale
+    channel can't starve the others and legitimate notifications are never
+    dropped because a different channel was busy.  Falls back to the
+    connection IP for malformed requests with no channel id (the handler
+    rejects those with 400 anyway).
+    """
+    chan = request.headers.get("X-Goog-Channel-ID")
+    if chan:
+        return f"wh-chan:{chan}"
+    return _get_real_ip(request)
+
+
 _settings = get_settings()
 limiter = Limiter(
     key_func=_get_real_ip,

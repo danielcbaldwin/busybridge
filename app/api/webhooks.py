@@ -8,7 +8,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from app.config import get_settings
 from app.database import get_database
-from app.rate_limit import limiter
+from app.rate_limit import limiter, webhook_rate_key
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
@@ -40,7 +40,7 @@ def _release_webhook_drain(user_id: int) -> None:
 
 
 @router.post("/google-calendar")
-@limiter.limit(_wh_limit)
+@limiter.limit(_wh_limit, key_func=webhook_rate_key)
 async def receive_google_calendar_webhook(
     request: Request,
     x_goog_channel_id: str = Header(None, alias="X-Goog-Channel-ID"),
