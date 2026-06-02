@@ -485,6 +485,45 @@ async def drain_all_due_users(*, now: Optional[datetime] = None) -> dict:
     return out
 
 
+async def reclaim_in_flight_on_startup() -> dict:
+    """Reset work left ``in_flight`` by the previous process instance.
+
+    Single-process model: at startup nothing else can hold a claim, so any
+    ``in_flight`` outbox op or claimed ``reconcile_request`` is abandoned
+    work from the prior instance.  Reset them now — to ``pending`` /
+    unclaimed — instead of waiting out the 15-minute stale sweepers, which
+    otherwise leave a ~15-minute post-restart window where that user does
+    no syncing.  A graceful shutdown already drains in-flight work first
+    (see app.main.lifespan); this also covers UNCLEAN exits (kill -9, OOM,
+    power loss).  A resumed create is idempotent via the deterministic-id
+    409 path, so re-running an op that may have partly applied is safe.
+
+    Returns ``{outbox_ops, reconcile_requests}`` counts reclaimed.
+    """
+    db = await get_database()
+    now = datetime.now(UTC).isoformat()
+    ops = await db.execute(
+        "UPDATE outbox_operations SET status = 'pending' "
+        "WHERE status = 'in_flight'",
+    )
+    reqs = await db.execute(
+        "UPDATE reconcile_requests "
+        "   SET in_flight = 0, scheduled_for = COALESCE(scheduled_for, ?) "
+        " WHERE in_flight = 1",
+        (now,),
+    )
+    await db.commit()
+    n_ops = ops.rowcount or 0
+    n_reqs = reqs.rowcount or 0
+    if n_ops or n_reqs:
+        logger.warning(
+            "startup reclaim: reset %d in-flight outbox op(s) and %d claimed "
+            "reconcile request(s) abandoned by the prior process",
+            n_ops, n_reqs,
+        )
+    return {"outbox_ops": n_ops, "reconcile_requests": n_reqs}
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------

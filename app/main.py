@@ -140,6 +140,17 @@ async def lifespan(app: FastAPI):
         raise SystemExit(1)
     logger.info("Database initialized")
 
+    # Reclaim any work the previous process left in_flight (a crash, an
+    # OOM, or a non-graceful kill).  Single-process, so at boot these are
+    # all abandoned — reset them now rather than waiting out the 15-minute
+    # stale sweepers, which would otherwise leave a post-restart window
+    # where the affected users do no syncing.
+    try:
+        from app.ledger.runtime import reclaim_in_flight_on_startup
+        await reclaim_in_flight_on_startup()
+    except Exception as exc:
+        logger.warning("startup in-flight reclaim failed (non-fatal): %s", exc)
+
     # Initialize encryption manager if key exists
     if os.path.exists(settings.encryption_key_file):
         try:
@@ -290,15 +301,44 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Shutting down...")
 
-    # Stop scheduler
+    # Graceful drain: freeze the sync engine and let any in-flight
+    # reconcile/drain finish BEFORE tearing anything down, so a drain is
+    # never killed mid-write (which would strand an in_flight op + a
+    # claimed reconcile_request and log a 'Cannot operate on a closed
+    # database' traceback, and leave a ~15-min post-restart sync gap).
+    # Reuses the same maintenance + quiescence handshake the DB-restore
+    # and VACUUM paths use.  Entering maintenance makes the next drain
+    # tick (and each per-user reconcile) a no-op; the wait drains the one
+    # pass already running.  Bounded so a hung Google call cannot wedge
+    # shutdown forever.  exit_maintenance() is balanced in the finally so
+    # the in-process flag is left clean (matters when the app lifespan is
+    # entered/exited repeatedly in-process, e.g. tests; harmless in prod
+    # where the process exits next).
+    from app.maintenance import (
+        enter_maintenance,
+        exit_maintenance,
+        wait_for_reconcile_quiescence,
+    )
+    enter_maintenance()
     try:
-        from app.jobs.scheduler import shutdown_scheduler
-        shutdown_scheduler()
-    except Exception as e:
-        logger.error(f"Error stopping scheduler: {e}")
+        try:
+            await wait_for_reconcile_quiescence(timeout=30.0)
+        except TimeoutError as e:
+            logger.warning("shutdown: %s; proceeding with teardown anyway", e)
+        except Exception as e:
+            logger.error(f"Error quiescing sync engine on shutdown: {e}")
 
-    # Close database
-    await close_database()
+        # Stop scheduler (no DB-writing job is in flight now)
+        try:
+            from app.jobs.scheduler import shutdown_scheduler
+            shutdown_scheduler()
+        except Exception as e:
+            logger.error(f"Error stopping scheduler: {e}")
+
+        # Close database
+        await close_database()
+    finally:
+        exit_maintenance()
     logger.info("Shutdown complete")
 
 
