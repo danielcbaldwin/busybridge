@@ -263,25 +263,64 @@ async def create_backup(user_ids: Optional[list[int]] = None) -> dict:
         "snapshot_errors": snapshot_errors,
     }
 
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("metadata.json", json.dumps(metadata, indent=2))
+    backup_dir = get_backup_dir()
 
-        # Consistent DB copy via sqlite3 backup API (WAL-safe)
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-            tmp_path = tmp.name
+    # Free-space guard: refuse rather than produce a silently-truncated
+    # (corrupt) backup if the disk can't hold the DB copy + the zip.  Only
+    # meaningful for a file-backed DB (skip for the in-memory test DB).
+    if os.path.exists(settings.database_path):
+        db_size = os.path.getsize(settings.database_path)
+        st = os.statvfs(backup_dir)
+        free = st.f_bavail * st.f_frsize
+        needed = int(db_size * 1.5)  # DB copy + (compressed) zip headroom
+        if free < needed:
+            raise RuntimeError(
+                f"refusing to back up: only {free} bytes free in {backup_dir}, "
+                f"but ~{needed} are needed to copy a {db_size}-byte database"
+            )
+
+    # Make a consistent DB copy (sqlite3 backup API, WAL-safe) in the
+    # backup dir, then VERIFY it before we ship it — a backup that only
+    # looks complete is worse than none (you find out at restore time).
+    # The copy is then STREAMED into the zip via ZipFile.write (reads in
+    # blocks) instead of being read whole into memory: the live DB can be
+    # hundreds of MB on the Pi, and f.read() spiked RAM by that much.
+    fd, tmp_path = tempfile.mkstemp(suffix=".db", dir=backup_dir)
+    os.close(fd)
+    try:
+        src_conn = sqlite3.connect(settings.database_path)
+        dst_conn = sqlite3.connect(tmp_path)
         try:
-            src_conn = sqlite3.connect(settings.database_path)
-            dst_conn = sqlite3.connect(tmp_path)
             src_conn.backup(dst_conn)
+        finally:
             src_conn.close()
             dst_conn.close()
-            with open(tmp_path, "rb") as f:
-                zf.writestr("database.db", f.read())
-        finally:
-            os.unlink(tmp_path)
 
-        for uid, snap in snapshots.items():
-            zf.writestr(f"snapshots/{uid}.json", json.dumps(snap, indent=2))
+        check = sqlite3.connect(tmp_path)
+        try:
+            result = check.execute("PRAGMA integrity_check").fetchone()
+            if not result or result[0] != "ok":
+                raise RuntimeError(
+                    f"backup DB copy failed integrity_check: {result!r}"
+                )
+        finally:
+            check.close()
+
+        try:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("metadata.json", json.dumps(metadata, indent=2))
+                zf.write(tmp_path, arcname="database.db")
+                for uid, snap in snapshots.items():
+                    zf.writestr(f"snapshots/{uid}.json", json.dumps(snap, indent=2))
+        except BaseException:
+            # Never leave a half-written zip that masquerades as a backup.
+            try:
+                os.unlink(zip_path)
+            except FileNotFoundError:
+                pass
+            raise
+    finally:
+        os.unlink(tmp_path)
 
     file_size = os.path.getsize(zip_path)
     metadata["file_size_bytes"] = file_size
