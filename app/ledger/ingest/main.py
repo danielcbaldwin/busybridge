@@ -495,19 +495,21 @@ async def _ingest_managed_recurring_instance(
             source_calendar_id=parent["source_calendar_id"],
             source_event_id=source_event_id,
         )
-        # Arm the destructive delete only on a genuine new
-        # cancellation ('cancelled'); a re-ingest of an already
-        # cancelled row ('skipped') must not re-arm it.
-        if (
-            ledger_id is not None
-            and outcome == "cancelled"
-            and source_event_id is not None
-        ):
-            await db.execute(
-                "UPDATE ledger_events SET source_delete_pending = 1 "
-                "WHERE id = ?",
-                (ledger_id,),
-            )
+        # CONSERVATIVE SAFETY FIX (data-loss incident, 2026-06-02): do NOT
+        # arm a destructive delete of the real source occurrence here.
+        #
+        # A cancelled instance-exception of our managed recurring copy on
+        # main is indistinguishable, from BusyBridge's current state alone,
+        # between (a) the user genuinely cancelling that occurrence on main
+        # and (b) an artifact of the "_R" this-and-following split that
+        # BusyBridge's own machinery generated for a LIVE occurrence. Case
+        # (b) fired delete_source in a loop and destructively deleted ~170
+        # real MLCommons occurrences. Until the proper _R fix can tell the
+        # two apart (track who created the exception + correct occurrence
+        # ownership), BusyBridge must never reach over and delete the
+        # authoritative source calendar. The mirror copies on main/peers
+        # are still removed (the instance row is cancelled above); only the
+        # destructive source delete is suppressed.
         return outcome, ledger_id
 
     # Move / edit.  The dragged copy is opaque about edit-rights: its
@@ -817,21 +819,22 @@ async def _mark_managed_instance_cancelled(
     main copy the user deleted.
 
     Sets ``status='cancelled'`` — NOT ``user_intentionally_deleted``,
-    which is a whole-series flag — so only this occurrence is
-    affected.  Arms the destructive source delete only for client
-    sources with a real source occurrence id.  Personal and webcal
-    sources are read-only.
+    which is a whole-series flag — so only this occurrence is affected.
+
+    CONSERVATIVE SAFETY FIX (data-loss incident, 2026-06-02): this no
+    longer arms ``source_delete_pending``.  A cancelled managed-copy
+    occurrence on main cannot be reliably distinguished from an "_R"
+    split artifact, and arming a destructive delete here deleted real
+    source occurrences in a loop.  BusyBridge must not destructively
+    delete the authoritative source calendar; only the mirror copies are
+    removed.  The proper _R fix will restore safe propagation.
     """
     when = datetime.now(UTC).isoformat()
     await db.execute(
         """UPDATE ledger_events
               SET status = 'cancelled',
                   version = version + 1,
-                  cancelled_at = ?, updated_at = ?, last_seen_at = ?,
-                  source_delete_pending =
-                      CASE WHEN source_type = 'client'
-                              AND source_event_id IS NOT NULL THEN 1
-                           ELSE source_delete_pending END
+                  cancelled_at = ?, updated_at = ?, last_seen_at = ?
             WHERE id = ?""",
         (when, when, when, ledger_event_id),
     )

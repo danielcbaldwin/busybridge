@@ -56,6 +56,19 @@ async def _mirrored_series(s: Scenario):
     return user, series
 
 
+_CONSERVATIVE_FIX = pytest.mark.xfail(
+    reason=(
+        "Destructive main-side->source occurrence-delete propagation is "
+        "temporarily disabled by the 2026-06-02 conservative data-loss fix "
+        "(it deleted ~170 real source occurrences in an _R loop). The proper "
+        "_R fix will re-enable it for genuine user actions; these tests flip "
+        "back to passing then."
+    ),
+    strict=False,
+)
+
+
+@_CONSERVATIVE_FIX
 async def test_main_side_instance_cancel_deletes_source_and_peer():
     s = Scenario()
     user, series = await _mirrored_series(s)
@@ -113,6 +126,7 @@ async def test_main_side_instance_cancel_deletes_source_and_peer():
     await s.close()
 
 
+@_CONSERVATIVE_FIX
 async def test_main_side_instance_cancel_converges_without_redelete():
     """Re-reconcile after the destructive delete: the source-side
     re-ingest of the now-cancelled occurrence must not churn the row
@@ -149,6 +163,40 @@ async def test_main_side_instance_cancel_converges_without_redelete():
     await s.close()
 
 
+async def test_main_side_cancel_does_not_destructively_delete_source():
+    """CONSERVATIVE data-loss fix (2026-06-02): cancelling one occurrence
+    of a managed recurring copy on main must NOT destructively delete the
+    real source occurrence, and must never arm source_delete_pending. The
+    occurrence remains on the authoritative source calendar; only the
+    mirror copies are affected. (The proper _R fix will restore safe
+    propagation for genuine user actions.)"""
+    s = Scenario()
+    user, series = await _mirrored_series(s)
+
+    inst_id = _instance_id_for(s, "main", "2026-02-16")
+    s.cancel_event("main", inst_id)
+    await s.run_reconciler("alice")
+    await s.run_reconciler("alice")  # re-reconcile: still no source delete
+
+    # The real source occurrence is NOT deleted — BusyBridge must not
+    # reach over and delete the authoritative source calendar.
+    assert "2026-02-16" in _occurrence_starts(s, "client_a"), (
+        "conservative fix: the source occurrence must survive"
+    )
+
+    db = await s.setup_db()
+    rows = await (await db.execute(
+        """SELECT source_delete_pending FROM ledger_events
+            WHERE user_id = ? AND parent_canonical_uid IS NOT NULL""",
+        (user.user_id,),
+    )).fetchall()
+    assert rows, "expected an instance row"
+    assert all(not r["source_delete_pending"] for r in rows), (
+        "no destructive source delete may be armed"
+    )
+    await s.close()
+
+
 async def test_source_side_instance_cancel_does_not_arm_destructive_delete():
     """A cancellation made ON the source calendar removes the peer
     copies but must NOT arm a destructive delete back at the source
@@ -176,6 +224,7 @@ async def test_source_side_instance_cancel_does_not_arm_destructive_delete():
     await s.close()
 
 
+@_CONSERVATIVE_FIX
 async def test_move_then_cancel_one_instance_deletes_source_occurrence():
     """The user moves an occurrence (Phase 1), then later cancels that
     same occurrence — the materialised instance must still drive a
