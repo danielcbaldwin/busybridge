@@ -30,7 +30,11 @@ from app.ledger.ingest import (
     ingest_personal_calendar,
     ingest_webcal_subscription,
 )
-from app.ledger.ingest.client import _ingest_one_event, _record_affected
+from app.ledger.ingest.client import (
+    _ingest_one_event,
+    _record_affected,
+    _stamp_ical_uid,
+)
 from app.ledger.outbox import drain_user
 from app.ledger.planner import plan_for_ledger_event
 
@@ -495,6 +499,12 @@ async def _audit_client_calendar(
                 event=ev,
                 skip_if_older=True,
             )
+            # Backfill the cross-calendar identity on every re-listed event
+            # (even unchanged ones) so this safe, token-stable audit
+            # gradually populates ical_uid on rows that predate the column
+            # — feeding the main_native dedup without a full resync.
+            if ledger_id is not None:
+                await _stamp_ical_uid(db, ledger_id, ev)
             if outcome in ("updated", "created", "rekeyed", "cancelled"):
                 out["reingested"] += 1
                 if ledger_id is not None:
