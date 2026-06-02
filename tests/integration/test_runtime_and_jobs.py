@@ -37,7 +37,13 @@ async def test_drain_all_due_users_dispatches_only_due_requests(monkeypatch):
 
     # User has a due request (webhook landed 10s before "now").
     s.clock.advance(10)
-    await enqueue_webhook(db, user_id=s.user("alice").user_id, source_hint="client:1")
+    # Pass the simulated clock: without now=, enqueue_webhook stamps
+    # scheduled_for with the real wall clock, which drifts past the
+    # simulated drain time and makes this test fail by date.
+    await enqueue_webhook(
+        db, user_id=s.user("alice").user_id, source_hint="client:1",
+        now=s.clock.now(),
+    )
     # Also enqueue a manual request — its scheduled_for is 25s in
     # the future, so it should NOT be picked up by this drain.
     bob_user_id = 9999  # nonexistent: makes the runtime skip-by-error rather than succeed
