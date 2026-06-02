@@ -123,6 +123,24 @@ class OutboxDrainError(Exception):
     """Raised when the drain could not even read the queue."""
 
 
+async def _global_sync_paused(db: aiosqlite.Connection) -> bool:
+    """True when the admin 'pause everything' emergency stop is set.
+
+    Mirrors the GLOBAL branch of reconciler._pause_mode (the ``settings``
+    row keyed ``sync_paused``).  Read directly here so the drain enforces
+    the kill switch on the actual write path; per-user soft pauses are
+    intentionally not consulted (they keep draining).  Tolerant of a
+    minimal test DB without the settings table.
+    """
+    try:
+        row = await (await db.execute(
+            "SELECT value_plain FROM settings WHERE key = 'sync_paused'",
+        )).fetchone()
+    except Exception:
+        return False
+    return bool(row and row["value_plain"] == "true")
+
+
 # ---------------------------------------------------------------------------
 # Enqueue
 # ---------------------------------------------------------------------------
@@ -249,6 +267,22 @@ async def drain_user(
         "failed_permanent": 0,
         "superseded": 0,
     }
+
+    # Kill-switch, defence in depth.  Every current caller already runs
+    # through reconcile_user, which returns early on a GLOBAL pause before
+    # reaching here — but the drain is the one place that actually writes
+    # to Google, so it enforces the global "pause everything" stop itself
+    # too.  No future caller can then bypass the emergency stop, and if
+    # the operator flips the pause to halt a runaway, queued ops stop
+    # flowing at the very next drain rather than draining the backlog out.
+    # Per-USER soft pauses are deliberately NOT consulted here: those keep
+    # draining so staged cleanup converges (see reconciler._pause_mode).
+    if await _global_sync_paused(db):
+        logger.info(
+            "drain_user: skipping user %s — global sync pause is active",
+            user_id,
+        )
+        return counters
 
     # Free any op a crashed drain left stuck in_flight; _claim_next
     # only ever selects pending rows, so without this such an op is
