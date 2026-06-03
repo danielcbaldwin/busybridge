@@ -30,6 +30,7 @@ import aiosqlite
 from app.ledger.async_google import as_async_google
 from app.ledger.google_client import GoogleClient
 from app.ledger.identity import (
+    canonical_uid_for_instance,
     canonical_uid_main_native,
     derive_instance_google_event_id,
     is_managed_google_event_id,
@@ -219,7 +220,7 @@ async def _ingest_one_main_event(
         if proj_match is not None and status == "cancelled":
             ledger_id = int(proj_match["ledger_event_id"])
             matched = await (await db.execute(
-                """SELECT parent_canonical_uid, source_type
+                """SELECT parent_canonical_uid, source_type, status
                      FROM ledger_events WHERE id = ?""",
                 (ledger_id,),
             )).fetchone()
@@ -231,11 +232,25 @@ async def _ingest_one_main_event(
                 await _mark_main_drift_reverted(db, ledger_id)
                 return "main_drift_reverted", ledger_id
             if matched is not None and matched["parent_canonical_uid"]:
-                # The user deleted one occurrence of a managed recurring
-                # copy whose instance was already materialised (e.g. by
-                # a prior move).  This is a destructive single-occurrence
-                # cancellation — cancel just this instance row and arm
-                # the source delete; NEVER flag the whole series.
+                # A cancelled occurrence of a managed recurring copy on
+                # main.  CHURN-BREAKER + _R artifact guard: if the source
+                # instance row is still ACTIVE (client ingest runs first
+                # each pass, so this is the source's current view), the
+                # occurrence is LIVE and this cancelled exception is an
+                # _R-split artifact, not a real cancellation.  Cancelling
+                # it oscillated with client ingest forever (version 344)
+                # and deleted real source occurrences.  Re-assert (drift
+                # revert) instead — the diff re-creates the mirror copies.
+                if (
+                    matched["status"] == "active"
+                    and matched["source_type"] == "client"
+                ):
+                    await _mark_main_drift_reverted(db, ledger_id)
+                    return "main_drift_reverted", ledger_id
+                # Source occurrence not live → a genuine removal.  Cancel
+                # the mirror only.  The conservative fix (2026-06-02)
+                # already suppresses the destructive source delete: never
+                # delete the authoritative source via this path.
                 await _mark_managed_instance_cancelled(db, ledger_id)
                 return "cancelled_instance", ledger_id
             # User deleted our copy on main → flip
@@ -481,9 +496,50 @@ async def _ingest_managed_recurring_instance(
         )
 
     if status == "cancelled":
-        # Destructive single-occurrence cancellation (Option A): the
-        # source occurrence must be deleted on the real source
-        # calendar.  _ingest_instance writes a sticky cancelled row.
+        # CHURN-BREAKER + _R artifact guard.
+        #
+        # A cancelled instance-exception of our managed recurring copy on
+        # main is, from BusyBridge's current state alone, ambiguous between
+        # (a) the user genuinely cancelling that occurrence on main and
+        # (b) an artifact of the "_R" this-and-following split that
+        # BusyBridge's own machinery generates for a LIVE occurrence. Case
+        # (b) looped forever (version 344 on one row) and, before the
+        # conservative fix, destructively deleted ~170 real source
+        # occurrences.
+        #
+        # Client ingest runs BEFORE main ingest in every reconcile pass, so
+        # an ACTIVE source instance row for this occurrence reflects the
+        # source's current view: the occurrence is LIVE.  A cancelled
+        # exception on main for a live source occurrence is therefore an
+        # artifact, not a real cancellation.  Don't cancel it (which would
+        # loop); instead re-assert the mirror — clear applied state on any
+        # non-present projection so the diff re-creates the BB-deleted
+        # copies (status=confirmed revive).  In steady state every
+        # projection is already present, so this is a no-op (no churn).
+        original_start, _iad = _instance_original_start(event)
+        inst_canonical = canonical_uid_for_instance(
+            parent["canonical_uid"], original_start,
+        )
+        live = await (await db.execute(
+            "SELECT id FROM ledger_events "
+            "WHERE user_id = ? AND canonical_uid = ? AND status = 'active' "
+            "LIMIT 1",
+            (user_id, inst_canonical),
+        )).fetchone()
+        if live is not None:
+            # Re-assert (drift revert): bump the source row so the diff
+            # re-creates the BB-deleted mirror copies (status=confirmed
+            # revive), the same mechanism used for any reverted main-side
+            # edit.  Converges in a pass or two; a no-op once present.
+            await _mark_main_drift_reverted(db, int(live["id"]))
+            return "main_drift_reverted", int(live["id"])
+
+        # No live source occurrence — a genuine removal.  Cancel the mirror
+        # (a sticky cancelled instance row).  The CONSERVATIVE SAFETY FIX
+        # (data-loss incident, 2026-06-02) means we still do NOT arm a
+        # destructive delete of the real source occurrence: BusyBridge must
+        # never reach over and delete the authoritative source calendar via
+        # this path.  Only the mirror copies are removed.
         outcome, ledger_id = await _ingest_instance(
             db,
             user_id=user_id,
@@ -495,21 +551,6 @@ async def _ingest_managed_recurring_instance(
             source_calendar_id=parent["source_calendar_id"],
             source_event_id=source_event_id,
         )
-        # CONSERVATIVE SAFETY FIX (data-loss incident, 2026-06-02): do NOT
-        # arm a destructive delete of the real source occurrence here.
-        #
-        # A cancelled instance-exception of our managed recurring copy on
-        # main is indistinguishable, from BusyBridge's current state alone,
-        # between (a) the user genuinely cancelling that occurrence on main
-        # and (b) an artifact of the "_R" this-and-following split that
-        # BusyBridge's own machinery generated for a LIVE occurrence. Case
-        # (b) fired delete_source in a loop and destructively deleted ~170
-        # real MLCommons occurrences. Until the proper _R fix can tell the
-        # two apart (track who created the exception + correct occurrence
-        # ownership), BusyBridge must never reach over and delete the
-        # authoritative source calendar. The mirror copies on main/peers
-        # are still removed (the instance row is cancelled above); only the
-        # destructive source delete is suppressed.
         return outcome, ledger_id
 
     # Move / edit.  The dragged copy is opaque about edit-rights: its

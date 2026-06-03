@@ -197,6 +197,57 @@ async def test_main_side_cancel_does_not_destructively_delete_source():
     await s.close()
 
 
+async def test_main_side_cancel_of_live_modified_instance_is_reverted():
+    """CHURN-BREAKER: a cancelled exception of a managed recurring copy on
+    main, for an occurrence still LIVE on the source (an active
+    modified-instance row), is an _R-split artifact — not a real
+    cancellation. BusyBridge must re-assert the occurrence (keep it
+    mirrored everywhere), not cancel it; cancelling oscillated with client
+    ingest forever (the production loop that hit version 344 and deleted
+    real source occurrences). No under-blocking: the peer busy block stays.
+    """
+    s = Scenario()
+    s.given_calendar("main")
+    s.given_calendar("client_a")
+    s.given_calendar("client_b")
+    user = await s.given_user(
+        "alice", main="main", clients=["client_a", "client_b"],
+    )
+    s.given_recurring_event(
+        "client_a", summary="Team sync",
+        start="2026-02-02T09:00:00Z", rrule="RRULE:FREQ=WEEKLY;COUNT=6",
+    )
+    await s.run_reconciler_until_quiescent("alice", max_passes=6)
+
+    # Make 2026-02-16 a MODIFIED instance — live on the source.
+    occ = _instance_id_for(s, "client_a", "2026-02-16")
+    s.update_event("client_a", occ, start="2026-02-16T14:00:00Z")
+    await s.run_reconciler_until_quiescent("alice", max_passes=6)
+    assert "2026-02-16" in _occurrence_starts(s, "client_b"), (
+        "the modified instance should mirror to the peer"
+    )
+
+    # Simulate the artifact: a cancelled exception of the managed copy on
+    # main while the source occurrence is still live.
+    main_occ = _instance_id_for(s, "main", "2026-02-16")
+    s.cancel_event("main", main_occ)
+    await s.run_reconciler_until_quiescent("alice", max_passes=6)
+
+    db = await s.setup_db()
+    inst = await (await db.execute(
+        """SELECT status FROM ledger_events
+            WHERE user_id = ? AND parent_canonical_uid IS NOT NULL""",
+        (user.user_id,),
+    )).fetchone()
+    assert inst["status"] == "active", (
+        "a live occurrence must not be cancelled by a main-side artifact"
+    )
+    # Re-asserted everywhere — no under-blocking on the peer.
+    assert "2026-02-16" in _occurrence_starts(s, "client_a")
+    assert "2026-02-16" in _occurrence_starts(s, "client_b")
+    await s.close()
+
+
 async def test_source_side_instance_cancel_does_not_arm_destructive_delete():
     """A cancellation made ON the source calendar removes the peer
     copies but must NOT arm a destructive delete back at the source
