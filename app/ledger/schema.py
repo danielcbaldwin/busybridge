@@ -52,6 +52,11 @@ CREATE TABLE IF NOT EXISTS ledger_events (
     user_rsvp_status TEXT,
     attendees_json TEXT,
     conference_data_json TEXT,
+    -- Debounce state for conference-link change detection: the candidate
+    -- new conferenceId awaiting a second confirming read.  Kept OUT of the
+    -- content hash so it never bumps the version.  See client.py
+    -- _resolve_conference.
+    pending_conference_id TEXT,
     source_html_link TEXT,
     attachments_json TEXT,
     recurrence_rule_json TEXT,
@@ -266,6 +271,10 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
         "ALTER TABLE ledger_events ADD COLUMN source_html_link TEXT",
         # Google's cross-calendar event identity for same-meeting dedup.
         "ALTER TABLE ledger_events ADD COLUMN ical_uid TEXT",
+        # Debounce candidate for conference-link change detection (a new
+        # conferenceId awaiting a second confirming read).  See
+        # client.py _resolve_conference.
+        "ALTER TABLE ledger_events ADD COLUMN pending_conference_id TEXT",
     ):
         try:
             await db.execute(stmt)

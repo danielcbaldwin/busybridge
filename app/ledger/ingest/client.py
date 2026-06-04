@@ -675,10 +675,14 @@ async def _ingest_instance(
 
     new_hash = _content_hash(fields)
     old_hash = _content_hash_from_row(existing)
-    if new_hash == old_hash:
+    conf_json, conf_pending, conf_changed = _resolve_conference(existing, fields)
+    if new_hash == old_hash and not conf_changed:
+        # No content change.  Record the conference debounce candidate so
+        # a genuine, settled room swap can confirm on the next read.
         await db.execute(
-            "UPDATE ledger_events SET last_seen_at = ? WHERE id = ?",
-            (when, int(existing["id"])),
+            "UPDATE ledger_events SET last_seen_at = ?, "
+            "pending_conference_id = ? WHERE id = ?",
+            (when, conf_pending, int(existing["id"])),
         )
         return "skipped", int(existing["id"])
     await db.execute(
@@ -692,6 +696,7 @@ async def _ingest_instance(
                   user_rsvp_status = ?,
                   attendees_json = ?,
                   conference_data_json = ?, source_html_link = ?,
+                  pending_conference_id = ?,
                   status = 'active',
                   version = version + 1,
                   updated_at = ?, last_seen_at = ?
@@ -706,7 +711,8 @@ async def _ingest_instance(
             fields["organizer_email"], fields["user_can_edit"],
             fields["user_rsvp_status"],
             fields["attendees_json"],
-            fields["conference_data_json"], fields["source_html_link"],
+            conf_json, fields["source_html_link"],
+            conf_pending,
             when, when, int(existing["id"]),
         ),
     )
@@ -836,12 +842,17 @@ async def _apply_event_to_ledger(
     new_hash = _content_hash(fields)
     old_hash = _content_hash_from_row(existing)
     resurrecting = existing["status"] == "cancelled"
-    changed = (new_hash != old_hash) or resurrecting
+    conf_json, conf_pending, conf_changed = _resolve_conference(existing, fields)
+    changed = (new_hash != old_hash) or resurrecting or conf_changed
 
     if not changed:
+        # No material content change.  Still record the conference
+        # debounce candidate so a genuine, settled room swap can confirm
+        # on the next read (and clear a candidate that went away).
         await db.execute(
-            "UPDATE ledger_events SET last_seen_at = ? WHERE id = ?",
-            (when, ledger_event_id),
+            "UPDATE ledger_events SET last_seen_at = ?, "
+            "pending_conference_id = ? WHERE id = ?",
+            (when, conf_pending, ledger_event_id),
         )
         return False
 
@@ -857,6 +868,7 @@ async def _apply_event_to_ledger(
                   user_rsvp_status = ?,
                   attendees_json = ?, recurrence_rule_json = ?,
                   conference_data_json = ?, source_html_link = ?,
+                  pending_conference_id = ?,
                   is_recurring = ?,
                   status = 'active',
                   version = version + 1,
@@ -873,7 +885,8 @@ async def _apply_event_to_ledger(
             fields["organizer_email"], fields["user_can_edit"],
             fields["user_rsvp_status"],
             fields["attendees_json"], fields["recurrence_rule_json"],
-            fields["conference_data_json"], fields["source_html_link"],
+            conf_json, fields["source_html_link"],
+            conf_pending,
             fields["is_recurring"],
             when, when, ledger_event_id,
         ),
@@ -1046,6 +1059,58 @@ def _conference_signature(conf_json: Optional[str]) -> str:
         (ep.get("uri") or "") for ep in (data.get("entryPoints") or [])
     )
     return (data.get("conferenceId") or "") + "|" + "|".join(uris)
+
+
+def _conference_id(conf_json: Optional[str]) -> Optional[str]:
+    """The stable room identity (``conferenceId``) of a conferenceData
+    blob, or ``None``.  Change-detection keys on this, NOT the whole
+    blob, so entry-point ordering / phone-PIN noise that varies across
+    reads is ignored — only an actual room swap counts."""
+    if not conf_json:
+        return None
+    try:
+        data = json.loads(conf_json)
+    except (TypeError, ValueError):
+        return None
+    return (data or {}).get("conferenceId")
+
+
+def _resolve_conference(existing, fields) -> tuple[Optional[str], Optional[str], bool]:
+    """Debounced conference-link change detection.
+
+    Returns ``(conference_data_json_to_store, pending_conference_id,
+    changed)``.
+
+    ``conference_data_json`` is deliberately excluded from the content
+    hash (``_HASH_EXCLUDE``): a Meet-link swap must NEVER bump the version
+    on its own, because Google returns a modified recurring instance's own
+    link on one API surface and the inherited master link on another, and
+    hashing that flip-flop once churned an instance to version 905.  This
+    helper is the ONLY path that re-syncs a changed room to the mirror
+    copies, and it is churn-proof: a new ``conferenceId`` is accepted only
+    after the SAME value is seen on TWO consecutive ingests, so an
+    alternating read never confirms.  A genuine, settled room change
+    confirms on the next read and then propagates as a normal change.
+    """
+    stored_json = existing["conference_data_json"]
+    new_json = fields.get("conference_data_json")
+    stored_cid = _conference_id(stored_json)
+    new_cid = _conference_id(new_json)
+    pending = (
+        existing["pending_conference_id"]
+        if "pending_conference_id" in existing.keys()
+        else None
+    )
+    if new_cid == stored_cid:
+        # Same room (or both have none): keep the accepted blob and drop
+        # any outstanding candidate.
+        return stored_json, None, False
+    if pending is not None and new_cid == pending:
+        # Confirmed on a second consecutive read: adopt the new room.
+        return new_json, None, True
+    # First sighting of a different room: hold the accepted value and
+    # remember the candidate until the next read confirms it.
+    return stored_json, new_cid, False
 
 
 def _canonical_instant(value: Optional[str], is_all_day: bool) -> Optional[str]:
