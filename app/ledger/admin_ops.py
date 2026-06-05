@@ -1,10 +1,10 @@
 """Administrative operations expressed as ledger mutations.
 
-REWRITE_PLAN.md §9 (color recolor) and §10 (cleanup / disconnect /
-pause / full re-sync).  Every admin button maps to one of these
-functions — no special "two-pass cleanup" path, no
-prefix-sweep-versus-DB-mismatch dance.  The ledger is the truth;
-the planner + outbox carry the truth to Google.
+Covers color recolor and cleanup / disconnect / pause / full
+re-sync.  Every admin button maps to one of these functions — no
+special "two-pass cleanup" path, no prefix-sweep-versus-DB-mismatch
+dance.  The ledger is the truth; the planner + outbox carry the
+truth to Google.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ UTC = timezone.utc
 
 
 # ---------------------------------------------------------------------------
-# Color recolor (§9)
+# Color recolor
 # ---------------------------------------------------------------------------
 async def recolor_client_calendar(
     db: aiosqlite.Connection,
@@ -104,7 +104,7 @@ async def recolor_client_calendar(
 
 
 # ---------------------------------------------------------------------------
-# Cleanup (§10)
+# Cleanup
 # ---------------------------------------------------------------------------
 async def cleanup_one_calendar(
     db: aiosqlite.Connection,

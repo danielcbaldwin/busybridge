@@ -1,4 +1,4 @@
-"""Reconcile-request trigger plumbing (REWRITE_PLAN.md §11).
+"""Reconcile-request trigger plumbing.
 
 All three sync entry points (webhook, periodic timer, manual
 sync) funnel into ``reconcile_requests``.  A single per-user

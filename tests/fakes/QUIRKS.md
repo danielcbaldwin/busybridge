@@ -6,8 +6,7 @@ the test(s) that pin the behaviour down.
 
 The fake is **deliberately faithful to documented and observed
 quirks**, including bugs.  Don't "fix" a quirk here without also
-having a story for the real Google one (cf. REWRITE_PLAN.md §13
-Stage 1).
+having a story for the real Google one.
 
 ---
 

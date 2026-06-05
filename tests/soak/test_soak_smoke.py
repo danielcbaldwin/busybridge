@@ -10,8 +10,8 @@ Verifies:
 * A small persona of 25 random events runs to quiescence and
   produces 0 violations.
 
-The 90/365-day adversarial soaks (REWRITE_PLAN.md Stage 3 release
-gates) are intentionally not run in normal CI — they're available
+The 90/365-day adversarial soaks (the release gates) are
+intentionally not run in normal CI — they're available
 under ``pytest -m soak`` once a runner is large enough.
 """
 

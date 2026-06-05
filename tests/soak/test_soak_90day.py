@@ -1,6 +1,6 @@
-"""90-simulated-day soak test (REWRITE_PLAN.md §13 Stage 3 / §14).
+"""90-simulated-day soak test.
 
-The Stage-3 release gate: 90 simulated days on three random seeds
+The release gate: 90 simulated days on three random seeds
 **with full failure injection enabled** — network errors, rate
 limits, 5xx, sync-token expiry, and mid-write crashes — and every
 invariant (1-11) green throughout.
@@ -166,6 +166,6 @@ async def test_90_sim_days_seed_42_with_failure_injection():
 
 
 async def test_90_sim_days_seed_7_with_failure_injection():
-    """Three seeds with full failure injection = the §14 Stage-3
+    """Three seeds with full failure injection = the
     release-gate requirement."""
     await _assert_soak(seed=7)

@@ -4,7 +4,7 @@ Rates are independent per failure mode and are evaluated in
 deterministic order; with the same ``seed`` the same sequence of
 operations yields the same sequence of failures.
 
-Failure modes (REWRITE_PLAN.md §13 Stage 1):
+Failure modes:
 
 * **network_error_rate** — raise :class:`NetworkError` (transport
   layer; the API call never reached Google).

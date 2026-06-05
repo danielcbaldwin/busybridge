@@ -2,7 +2,7 @@
 
 The headline bug the rewrite kills is "an instance cancelled on a
 source calendar during a sync-token gap is silently lost, leaving a
-ghost busy block on the targets" (REWRITE_PLAN.md §8).
+ghost busy block on the targets".
 
 ``tests/soak/test_soak_recurring_365.py`` proves this is fixed for
 *client* calendars.  These two tests prove the same for the other

@@ -1,8 +1,8 @@
 """Live verification: ledger projections vs. actual Google state.
 
-This is the Stage-4 confidence tool (REWRITE_PLAN.md §13).  It
-answers "is the new system's model of the world consistent with
-what's actually on Google right now?" without writing anything.
+This is a confidence tool that answers "is the new system's model
+of the world consistent with what's actually on Google right now?"
+without writing anything.
 
 Two checks:
 

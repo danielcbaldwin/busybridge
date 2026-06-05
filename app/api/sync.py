@@ -1,10 +1,9 @@
 """Sync status and control API endpoints (ledger-backed).
 
 Every endpoint here used to drive ``app/sync/engine.py``; under
-the ledger architecture (REWRITE_PLAN.md) they drive
-``app.ledger.triggers`` / ``app.ledger.admin_ops`` / the facade
-instead.  Behaviour is preserved at the API contract; internals
-are the new pipeline.
+the ledger architecture they drive ``app.ledger.triggers`` /
+``app.ledger.admin_ops`` / the facade instead.  Behaviour is
+preserved at the API contract; internals are the new pipeline.
 """
 
 from __future__ import annotations
@@ -139,8 +138,7 @@ async def get_sync_log(
     status_filter: Optional[str] = None,
 ):
     """Paginated sync activity log.  The ``sync_log`` table is still
-    populated (now by the ledger reconciler + admin ops) — see
-    REWRITE_PLAN.md §12."""
+    populated (now by the ledger reconciler + admin ops)."""
     # Clamp pagination so a hostile query can't request a giant page
     # or drive a negative OFFSET.
     page = max(1, page)

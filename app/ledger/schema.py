@@ -1,8 +1,7 @@
 """Schema for the canonical-ledger architecture.
 
 These tables are additive — they sit alongside the legacy
-``event_mappings`` / ``busy_blocks`` until the Stage 5 cutover.
-The DDL below is the full definition from REWRITE_PLAN.md §4.
+``event_mappings`` / ``busy_blocks`` until the cutover.
 
 Use :func:`init_ledger_schema` against any aiosqlite-compatible
 connection.  Safe to call repeatedly (all CREATEs are
@@ -219,7 +218,7 @@ CREATE INDEX IF NOT EXISTS idx_affected_user
     ON affected_ledger_events(user_id);
 
 
--- Orphan guard (REWRITE_PLAN.md §18).  Hard-deleting a ledger_event
+-- Orphan guard.  Hard-deleting a ledger_event
 -- whose projection is still 'present' on Google cascades the
 -- projection away without deleting the Google event, leaving an
 -- orphan.  The correct path is status='cancelled' — the planner

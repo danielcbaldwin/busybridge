@@ -21,7 +21,7 @@ Five render modes:
 * ``absent``               — no payload; outbox emits a delete.
 
 The lock emoji "🔒 " is prepended to the summary when the user
-cannot edit the source event, per REWRITE_PLAN.md §9.
+cannot edit the source event.
 """
 
 from __future__ import annotations
@@ -190,9 +190,9 @@ def _render_full_copy(
         except (TypeError, ValueError):
             pass
     # On the main copy, carry the user as an attendee with their
-    # stored RSVP (REWRITE_PLAN.md §9) so they can see and change
-    # their response there.  An RSVP set on the main copy is
-    # detected at main-ingest and written back to the source event.
+    # stored RSVP so they can see and change their response there.
+    # An RSVP set on the main copy is detected at main-ingest and
+    # written back to the source event.
     #
     # The attendee MUST carry an explicit email.  ``events.insert``
     # rejects a bare ``{"self": True}`` with "400 Missing attendee
@@ -505,7 +505,7 @@ def _start_dict(row: dict) -> dict:
     # Carry the source's IANA timezone so a recurring mirror expands
     # its RRULE on the source's wall-clock grid (correct across DST)
     # instead of a fixed UTC grid.  Falls back to UTC only when the
-    # source supplied no zone — see REWRITE_PLAN.md timezone notes.
+    # source supplied no zone.
     return {
         "dateTime": row["start_at"],
         "timeZone": _row_get(row, "start_timezone") or "UTC",

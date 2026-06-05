@@ -71,7 +71,7 @@ async def _run_sync_health_checks_unlocked() -> None:
 
 async def _alert_failing_calendars() -> None:
     """Email an alert for any calendar stuck at 5+ consecutive sync
-    failures (REWRITE_PLAN.md §12).
+    failures.
 
     Distinct from the circuit breaker, which fires only when EVERY
     calendar is failing.  ``queue_alert`` dedups per alert-type per

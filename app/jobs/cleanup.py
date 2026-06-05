@@ -17,7 +17,7 @@ Retention policy (unchanged at the API contract level):
 
 A ledger_event is never hard-deleted while a projection of it is
 still ``present`` on Google — that would orphan the Google copy
-(REWRITE_PLAN.md §18, enforced by a DB trigger).  Expired active
+(enforced by a DB trigger).  Expired active
 events are cancelled and re-planned here; the next reconcile drains
 the deletes, and a subsequent retention pass removes the row.
 
@@ -154,8 +154,7 @@ async def _expire_single_events(db, now, settings, summary) -> None:
     drives every projection to 'absent' and the next reconcile's diff
     drains the Google deletes.  Only rows whose projections have all
     drained ('present' nowhere) are then hard-deleted: deleting a row
-    with a live projection would orphan its Google copy
-    (REWRITE_PLAN.md §18).
+    with a live projection would orphan its Google copy.
     """
     from app.ledger.planner import plan_for_ledger_event
 

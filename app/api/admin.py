@@ -645,8 +645,8 @@ async def trigger_consistency_check(
 ):
     """Run (or preview) the consistency check.
 
-    Under the ledger architecture (REWRITE_PLAN.md §3) consistency
-    is structurally enforced by the planner + outbox: divergences
+    Under the ledger architecture consistency is structurally
+    enforced by the planner + outbox: divergences
     between desired and applied projection state ARE the
     inconsistencies, and they're reconciled automatically every
     drain tick.  This endpoint therefore reports — but does not
@@ -902,7 +902,7 @@ async def export_database(admin: User = Depends(require_admin)):
     )
 
 
-# NOTE: service-account endpoints were removed per REWRITE_PLAN.md §1
-# and §9.  The 🔒 emoji + uniform revert-on-drift mechanism in the
-# ledger pipeline (app/ledger/payload.py + app/ledger/outbox.py)
-# replaces SA mode entirely.
+# NOTE: service-account endpoints were removed at the cutover.  The
+# 🔒 emoji + uniform revert-on-drift mechanism in the ledger pipeline
+# (app/ledger/payload.py + app/ledger/outbox.py) replaces SA mode
+# entirely.

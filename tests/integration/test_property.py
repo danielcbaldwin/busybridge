@@ -1,4 +1,4 @@
-"""Hypothesis-based property tests (REWRITE_PLAN.md §14 Layer 2).
+"""Hypothesis-based property tests.
 
 These check invariants that should hold over large random
 inputs.  Properties exercised:
@@ -224,8 +224,8 @@ def test_busy_block_hash_excludes_user_can_edit(row):
 def test_present_full_payload_round_trips_through_ingest(row):
     """Render a client event as a full-detail main copy, then
     re-extract it the way main-ingest would: the user-visible
-    fields must survive the round trip unchanged (REWRITE_PLAN.md
-    §14 Layer 2 — render → ingest → same ledger row)."""
+    fields must survive the round trip unchanged (render → ingest →
+    same ledger row)."""
     # user_can_edit=True so no 🔒 prefix is added to the summary.
     row = dict(row, user_can_edit=True)
     body = render_payload(
@@ -325,8 +325,8 @@ def test_fake_replay_produces_same_final_state(ops):
 @settings(suppress_health_check=[HealthCheck.function_scoped_fixture], max_examples=20)
 def test_rrule_count_expands_to_exactly_n_instances(count):
     """A weekly series with ``COUNT=n`` expands to exactly ``n``
-    confirmed instances (REWRITE_PLAN.md §14 — the expanded
-    instance set matches the expected count)."""
+    confirmed instances (the expanded instance set matches the
+    expected count)."""
     from tests.fakes.google_calendar import FakeGoogleCalendar
 
     g = FakeGoogleCalendar()

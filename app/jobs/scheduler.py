@@ -128,7 +128,7 @@ def setup_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
 
-    # Ledger pipeline jobs (REWRITE_PLAN.md): drain often (30s) so
+    # Ledger pipeline jobs: drain often (30s) so
     # debounced webhook requests reach Google quickly; enqueue
     # periodic reconcile requests at the old sync cadence.  The sync
     # health checks stay scheduled separately because the old periodic

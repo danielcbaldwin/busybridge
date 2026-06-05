@@ -6,7 +6,7 @@ What remains under ``app/sync/``:
   the backup / ICS-export subsystem.  Kept; not used by the new
   ledger pipeline (the ledger has its own
   ``app/ledger/real_google_client.py``).
-* ``backup`` — SQLite dump + restore.  Kept (REWRITE_PLAN.md §13).
+* ``backup`` — SQLite dump + restore.  Kept.
 * ``ics_export`` — ICS file export.  Kept.
 
 The orchestrator (``engine.py``), per-event rules (``rules.py``),

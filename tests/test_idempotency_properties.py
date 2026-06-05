@@ -1,4 +1,4 @@
-"""Idempotency properties (REWRITE_PLAN.md §14 Layer 2).
+"""Idempotency properties.
 
 Ingesting the same source state twice — or reconciling an already
 quiescent system again — must not duplicate ledger rows, bump

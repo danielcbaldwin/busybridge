@@ -1,6 +1,6 @@
 """Invariant checker for the soak harness.
 
-Implements the 11 invariants from REWRITE_PLAN.md §14 Layer 5.
+Implements the 11 soak invariants.
 Each invariant is a method named ``check_<n>_*`` that returns a
 list of violation strings (empty list = pass).  The dispatcher
 runs them all and aggregates.

@@ -1,4 +1,4 @@
-"""Layer 4 chaos / concurrency tests (REWRITE_PLAN.md §14).
+"""Chaos / concurrency tests.
 
 The ledger architecture is designed so concurrent webhooks, mid-
 write crashes, sync-token expiry races, etc. cannot produce

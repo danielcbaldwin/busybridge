@@ -127,8 +127,8 @@ async def reconcile_user_by_id(
     single exception — the restore's own re-converge pass passes it so
     it can run *while* it holds maintenance mode.
 
-    Enforces REWRITE_PLAN.md §3's "one author at a time per user":
-    no matter how many triggers fire concurrently — a webhook's
+    Enforces "one author at a time per user": no matter how many
+    triggers fire concurrently — a webhook's
     delayed drain, the periodic scheduler, a manual sync — only one
     reconcile runs for a given user at a time.  Other callers wait
     on the lock rather than interleaving (which would mean two

@@ -1,4 +1,4 @@
-"""Webcal/ICS ingest (REWRITE_PLAN.md §5.4).
+"""Webcal/ICS ingest.
 
 ICS feeds give us a list of events on each poll.  Three quirks
 matter:

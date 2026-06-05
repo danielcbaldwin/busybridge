@@ -1,4 +1,4 @@
-"""Per-calendar sync-failure alerting (REWRITE_PLAN.md §12).
+"""Per-calendar sync-failure alerting.
 
 Distinct from the circuit breaker (which pauses sync only when
 EVERY calendar fails): when a single calendar is stuck at 5+

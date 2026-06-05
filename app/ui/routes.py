@@ -45,7 +45,7 @@ async def dashboard(request: Request, error: Optional[str] = None):
     db = await get_database()
 
     # Per-calendar event + busy-block counts are sourced from the
-    # ledger (REWRITE_PLAN.md §4) — the source-of-truth post-rewrite.
+    # ledger — the source-of-truth post-rewrite.
     from app.ledger.facade import (
         count_active_events_per_source_calendar,
         count_active_events_per_webcal_subscription,

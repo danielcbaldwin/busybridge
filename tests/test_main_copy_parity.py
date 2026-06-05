@@ -1,4 +1,4 @@
-"""Main-copy feature parity with v1 (REWRITE_PLAN.md §9).
+"""Main-copy feature parity with v1.
 
 A full copy of a client event on the main calendar must:
 
@@ -55,7 +55,7 @@ async def test_content_hash_ignores_conference_data_and_html_link():
 
 async def test_main_copy_carries_conference_data_and_original_link():
     """Meet/Zoom data and a link back to the source event are copied
-    onto the main copy (REWRITE_PLAN.md §9 / v1 parity)."""
+    onto the main copy (v1 parity)."""
     conf = {
         "conferenceId": "abc-defg-hij",
         "entryPoints": [

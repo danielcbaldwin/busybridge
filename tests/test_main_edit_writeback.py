@@ -1,4 +1,4 @@
-"""Edit-on-main write-back to the source event (REWRITE_PLAN.md §9).
+"""Edit-on-main write-back to the source event.
 
 When the user edits one of our managed copies on the main calendar,
 :func:`app.ledger.ingest.main._maybe_apply_main_edit_back` classifies

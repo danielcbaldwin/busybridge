@@ -1,6 +1,6 @@
 """Ingest paths: source-of-truth → ledger upserts.
 
-One module per source kind (REWRITE_PLAN.md §5).  Each runs
+One module per source kind.  Each runs
 inside a single DB transaction that includes the sync-token
 update — partial failures cannot lose events.
 """

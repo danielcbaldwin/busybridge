@@ -2,7 +2,7 @@
 
 When the user drags or edits a single occurrence of one of our
 managed recurring main copies, the change must be mapped back to the
-SOURCE series and propagated everywhere (REWRITE_PLAN.md Option A):
+SOURCE series and propagated everywhere:
 the source occurrence moves, every peer busy block moves, and no
 phantom ``main_native`` row is minted.
 """

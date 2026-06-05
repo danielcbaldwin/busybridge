@@ -1,4 +1,4 @@
-"""scan-orphans dry_run=true must be a true preview (REWRITE_PLAN.md §5.5).
+"""scan-orphans dry_run=true must be a true preview.
 
 A dry-run orphan scan classifies and counts orphans but persists
 nothing: no synthetic ledger / projection tombstone, and no outbox

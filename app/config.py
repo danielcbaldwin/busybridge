@@ -43,9 +43,9 @@ class Settings(BaseSettings):
     # ingests from Google and computes the full plan + outbox, but
     # the outbox is NEVER drained — nothing is written back to
     # Google.  Pending outbox rows are the preview of what WOULD
-    # be written.  Used for the Stage-4 staging-validation window
-    # (REWRITE_PLAN.md §13): point at real Google, watch what the
-    # new system would do, without touching anything.
+    # be written.  Used for the staging-validation window: point at
+    # real Google, watch what the new system would do, without
+    # touching anything.
     ledger_dry_run: bool = False
 
     # Test mode controls
@@ -93,10 +93,9 @@ class Settings(BaseSettings):
     disconnected_calendar_retention_days: int = 30
 
     # Service account
-    # service_account_key_file removed at the Stage-5 cutover
-    # (REWRITE_PLAN.md §1 / §9).  Kept as a no-op field on
-    # Settings only if the env var is set, since pydantic-settings
-    # rejects unknown env vars at parse time.
+    # service_account_key_file was removed at the cutover.  Kept as a
+    # no-op field on Settings only if the env var is set, since
+    # pydantic-settings rejects unknown env vars at parse time.
     service_account_key_file: Optional[str] = None  # unused; retained for env-var back-compat
 
     # Google Calendar

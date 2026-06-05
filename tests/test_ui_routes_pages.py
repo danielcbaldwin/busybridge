@@ -125,7 +125,7 @@ async def test_index_dashboard_and_login_page_paths(test_db, monkeypatch):
         "INSERT INTO calendar_sync_state (client_calendar_id, consecutive_failures) VALUES (?, ?)",
         (cal_id, 0),
     )
-    # Ledger row that the dashboard reads from (REWRITE_PLAN.md §4).
+    # Ledger row that the dashboard reads from.
     await db.execute(
         """INSERT INTO ledger_events
               (user_id, canonical_uid, source_type, source_calendar_id,

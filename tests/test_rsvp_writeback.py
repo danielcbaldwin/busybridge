@@ -1,4 +1,4 @@
-"""Edit-on-main RSVP write-back to the origin calendar (REWRITE_PLAN.md §9).
+"""Edit-on-main RSVP write-back to the origin calendar.
 
 When the user changes their RSVP on the main-calendar copy of a
 client-sourced event, that response is written back to the event on

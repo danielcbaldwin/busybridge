@@ -1,4 +1,4 @@
-"""Client OAuth ingest (REWRITE_PLAN.md §5.1).
+"""Client OAuth ingest.
 
 For each event Google delivers, decide:
 
@@ -232,7 +232,7 @@ async def scan_full_sync_recurring_cancellations(
     ``events.instances(showDeleted=True)`` IS reliable: this scans
     every recurring parent seen this pass and routes the cancelled
     instances through ``ingest_one``.  Closes the
-    recurring-cancellation-amnesia bug (REWRITE_PLAN.md §8) for
+    recurring-cancellation-amnesia bug for
     every source type — client, personal, and native main.
 
     Returns the number of parents whose instance scan FAILED.  A
@@ -335,7 +335,7 @@ async def _ingest_one_event(
     # skipping, check whether one of our busy blocks has drifted —
     # the user moved or edited it on the client calendar — and if so
     # re-assert our canonical payload (revert-on-drift, now uniform
-    # on client targets too; REWRITE_PLAN.md §9).
+    # on client targets too).
     proj_match = await (await db.execute(
         """SELECT id, google_etag FROM ledger_projections
             WHERE google_event_id = ?
@@ -430,7 +430,7 @@ async def _maybe_revert_client_drift(
     ``applied_ledger_version`` so the diff re-asserts our canonical
     payload, and refresh ``google_etag`` so the corrective
     ``events.update`` is not rejected by ``If-Match``
-    (REWRITE_PLAN.md §9; uniform with the main-copy revert).
+    (uniform with the main-copy revert).
 
     A user-deleted busy block (status=cancelled) resets the projection
     so the diff re-CREATEs it: a missing busy block is a real

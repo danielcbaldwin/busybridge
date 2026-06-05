@@ -63,7 +63,7 @@ class Oracle:
         self.events.pop(key, None)
 
     # ------------------------------------------------------------------
-    # Derived views (the projection rules from REWRITE_PLAN.md §6.1)
+    # Derived views (the projection rules)
     # ------------------------------------------------------------------
     def expected_on(self, calendar: str) -> list[OracleEvent]:
         """Return the events that should be present on ``calendar``

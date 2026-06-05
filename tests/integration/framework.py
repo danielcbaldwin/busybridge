@@ -2,8 +2,7 @@
 
 A :class:`Scenario` is one composed test instance — clock + fake
 Google + failure injector — with a high-level "given / when / then"
-API designed for the integration tests called out in
-``REWRITE_PLAN.md`` §14 Layer 3.
+API designed for the integration tests.
 
 Usage sketch::
 
@@ -506,7 +505,7 @@ def _coerce_iso(value: datetime | str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Ledger integration (REWRITE_PLAN.md Stage 2)
+# Ledger integration
 # ---------------------------------------------------------------------------
 @dataclass
 class _LedgerUser:

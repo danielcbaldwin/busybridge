@@ -545,8 +545,7 @@ async def setup_step_6(request: Request):
     else:
         await set_setting("alerts_enabled", "false")
 
-    # Service-account activation block was removed at the
-    # Stage-5 cutover (REWRITE_PLAN.md §1).
+    # Service-account activation block was removed at the cutover.
 
     # Clear OOBE data
     _oobe_data.clear()

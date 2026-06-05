@@ -10,8 +10,6 @@ Two ID schemes live here:
   return 409 Conflict instead of duplicating.  Derived from
   ``ledger_projections.id``.
 
-Both schemes are described in REWRITE_PLAN.md §3 and §7.
-
 Google's ID alphabet for client-supplied IDs is base32hex
 (lowercase ``a-v`` plus ``0-9``), 5–1024 chars.  The encoder
 below produces conforming IDs by base-32-hex-encoding the
@@ -70,8 +68,8 @@ def canonical_uid_webcal_unstable(
     The hash deliberately omits the summary, so an upstream rename
     of an event whose start/end stay the same does NOT generate a
     new canonical_uid (and therefore not a duplicate ledger row).
-    This is the fix for today's "Eventbrite renames event → BB
-    creates duplicate" bug — REWRITE_PLAN.md §5.4.
+    This is the fix for the "Eventbrite renames event → BB
+    creates duplicate" bug.
 
     ``ordinal`` disambiguates DISTINCT events that share the same
     start/end (which would otherwise collide on the same hash and

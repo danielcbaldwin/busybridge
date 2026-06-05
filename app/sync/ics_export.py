@@ -450,7 +450,7 @@ def _is_busybridge_event(event: dict) -> bool:
 
     Recognises three signals:
     * Deterministic ledger ID (``bb`` + 13 base32hex chars; the
-      primary post-cutover signal — REWRITE_PLAN.md §7).
+      primary post-cutover signal).
     * ``extendedProperties.private.bb_proj_id`` (defence-in-depth
       stamp the ledger payload renderer applies; see
       ``app.ledger.payload.EP_PROJ_ID``).

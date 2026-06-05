@@ -6,7 +6,7 @@ control to scheduled callbacks.  No relationship to wall-clock time
 unless you wire one up via ``run_in_realtime()``.
 
 Default rate (when ``run_in_realtime()`` is used) is 1 simulated day
-per real second, matching the soak-harness target in §13 Stage 1.
+per real second, matching the soak-harness target.
 
 Threading note: the clock is not thread-safe.  Tests must drive it
 from a single coroutine or from a single thread.

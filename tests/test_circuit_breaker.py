@@ -1,4 +1,4 @@
-"""Circuit breaker (REWRITE_PLAN.md §12).
+"""Circuit breaker.
 
 When EVERY active calendar for a user has failed 3+ times in a row,
 the breaker auto-pauses THAT USER's sync (the per-user

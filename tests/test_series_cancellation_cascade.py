@@ -1,4 +1,4 @@
-"""Series cancellation cascades to modified-instance rows (REWRITE_PLAN.md §6).
+"""Series cancellation cascades to modified-instance rows.
 
 A modified instance of a recurring series is a separate ledger row
 (``parent_canonical_uid`` set) with its own ``status``.  When the

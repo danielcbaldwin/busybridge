@@ -1,6 +1,6 @@
 """Retention-cleanup tests covering the ledger-backed paths.
 
-Mirrors REWRITE_PLAN.md §10 retention semantics:
+Covers the retention semantics:
 
 * Past single events fall out after ``event_retention_days``.
 * Cancelled recurring series fall out after
@@ -169,7 +169,7 @@ async def test_disconnected_calendars_age_out(test_db):
 
 
 # ---------------------------------------------------------------------------
-# Orphan-safe retention (REWRITE_PLAN.md §18)
+# Orphan-safe retention
 # ---------------------------------------------------------------------------
 async def test_active_expired_event_with_live_projection_is_cancelled_not_deleted(
     test_db,

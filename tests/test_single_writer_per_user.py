@@ -1,4 +1,4 @@
-"""Single writer per user (REWRITE_PLAN.md §3).
+"""Single writer per user.
 
 Every sync trigger — a webhook's delayed drain, the periodic
 scheduler, a manual sync — funnels through ``reconcile_user_by_id``.

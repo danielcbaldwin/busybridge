@@ -2,7 +2,7 @@
 
 Drives the setup wizard from a completely empty database through
 to a working post-cutover deployment.  This is the test that
-proves the step-5-removed wizard (REWRITE_PLAN.md §1) actually
+proves the step-5-removed wizard actually
 boots cold — the rewrite changed the wizard's step numbering and
 removed the service-account step, so the whole flow needs an
 end-to-end check, not just per-step unit tests.

@@ -1,4 +1,4 @@
-"""Revert-on-drift for busy blocks on client calendars (REWRITE_PLAN.md §9).
+"""Revert-on-drift for busy blocks on client calendars.
 
 If the user moves or edits a "Busy" block that BusyBridge wrote onto
 a client calendar, the next ingest sees the etag no longer matches

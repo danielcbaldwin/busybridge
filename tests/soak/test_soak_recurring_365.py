@@ -1,7 +1,6 @@
 """Targeted recurring-cancellation soak — 365 simulated days.
 
-This is the specific soak REWRITE_PLAN.md §14 calls for as the
-Stage-4 release gate:
+This is the specific soak called for as the release gate:
 
   "Generate [many] weekly recurring meetings.  Schedule
    cancellations at varied positions: some on the next instance,

@@ -1,4 +1,4 @@
-"""Discovery / orphan scan (REWRITE_PLAN.md §5.5).
+"""Discovery / orphan scan.
 
 Periodically (every 6 hours in production) walks every calendar
 the user owns and asks Google: "show me events that look like

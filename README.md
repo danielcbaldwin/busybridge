@@ -1,299 +1,515 @@
 # BusyBridge
 
-A self-hosted calendar synchronization service for consulting organizations. Connect multiple client calendars to a single main calendar, keeping availability in sync without exposing details across clients.
+A self-hosted calendar synchronization service for consulting organizations.
+Connect multiple **client calendars** to a single **main calendar** so your
+availability stays in sync everywhere — without leaking event details across
+clients.
 
-> **Note:** the sync engine was rewritten in May 2026 per
-> [`REWRITE_PLAN.md`](./REWRITE_PLAN.md).  The new architecture
-> is a single canonical ledger + projection + idempotent outbox
-> drain instead of three-concurrent-paths-with-locks.  See
-> [`CUTOVER.md`](./CUTOVER.md) for the migration runbook if you're
-> upgrading an existing deployment.
+Your main calendar is the single source of truth. Client-calendar events are
+mirrored to your main calendar in full detail; everything on your main calendar
+is reflected back to each client as an opaque **"Busy"** block. Other clients
+never see what a given client meeting actually is.
+
+---
 
 ## Features
 
-- **Bidirectional Sync**: Client calendar events appear on your main calendar with full details; your main calendar events appear as "Busy" blocks on client calendars
-- **Personal Calendar Sync**: Connect personal Gmail/Workspace calendars as read-only sources that create privacy-preserving "Busy (Personal)" blocks across all calendars
-- **Webcal/ICS Subscriptions**: Subscribe to external ICS feeds (e.g. conference schedules, travel itineraries) that sync to your main calendar with busy blocks on clients
-- **Recurring Events**: Full fidelity for recurring events including single-instance modifications and cancellations.  Cancellations are sticky — they survive sync-token expiry (the "recurring-cancellation amnesia" bug from the legacy engine is fixed structurally).
-- **Smart Busy Blocks**: Only creates blocks for events that actually block time (respects Free/Busy status)
-- **RSVP Propagation**: Accept/decline on main calendar propagates back to the client calendar
-- **Calendar Color Coding**: Assign Google Calendar colors to each client calendar; events are color-coded on your main calendar
-- **Webhook Integration**: Real-time sync via Google Calendar push notifications (5-second debounce; immediate drain scheduled on receipt)
-- **Drift Revert**: Non-editable events that get dragged on the main calendar are automatically reverted to their canonical position
-- **Idempotent Writes**: Every Google API call uses a deterministic event ID + etag precondition so retries never duplicate
-- **Rate Limiting**: Token-bucket rate limiter (5 req/s) with exponential backoff prevents Google API quota exhaustion
-- **ICS Calendar Export**: Full calendar export to ICS format with a "clean" variant that strips BusyBridge-managed events (for migration or external backup)
-- **Email Alerts**: Notifications for sync failures, token revocations, integrity issues, and poison-pill events
-- **Automated Backups**: Daily database + ICS backups with 7-daily/2-weekly/6-monthly retention
-- **Self-Healing**: Structural consistency via the ledger architecture; 6-hourly orphan scans for events on Google that escaped tracking; circuit breaker auto-pauses sync when all calendars fail consecutively
-- **Sync Control**: Full re-sync, per-calendar cleanup & re-sync, global cleanup & pause, live progress tracking
-- **Admin Dashboard**: User management, system health, sync activity feed, log viewer, factory reset, permanent-failure surface
+- **Bidirectional sync** — client events appear on your main calendar with full
+  detail; main-calendar events appear as opaque "Busy" blocks on every client
+  calendar.
+- **Personal calendar sync** — connect personal Gmail/Workspace calendars as
+  **read-only** sources that cast privacy-preserving "Busy (personal)" blocks on
+  your main and all client calendars. No details are shared.
+- **Webcal/ICS subscriptions** — subscribe to external ICS feeds (conferences,
+  travel) that mirror to your main calendar (and optionally one chosen client),
+  with busy blocks elsewhere. Unstable-UID feeds are handled by content hashing.
+- **Recurring events** — RRULEs are copied verbatim (with the source timezone,
+  so DST stays correct). Single-instance edits and cancellations sync
+  individually; cancellations are **sticky** and survive sync-token expiry.
+- **Free/Busy aware** — events marked Free don't create busy blocks (personal
+  sources always block).
+- **RSVP propagation** — accepting/declining a client meeting on your main
+  calendar is written back to the originating client event.
+- **Conference links** — Google Meet/Zoom links are carried onto the main copy
+  (no new conference is minted), with churn-safe re-sync when a room changes.
+- **Color coding** — main-calendar copies are colored by their source client
+  calendar.
+- **Drift revert** — non-editable managed events that get moved or deleted on
+  any calendar are re-asserted to their canonical state on the next sync.
+- **Idempotent writes** — every Google write uses a deterministic event ID plus
+  an etag precondition, so retries never duplicate.
+- **Google API rate limiting** — a process-wide token-bucket limiter (5 req/s by
+  default) with exponential backoff prevents quota exhaustion.
+- **Real-time sync** — Google push notifications trigger a debounced reconcile
+  (~5 s); a 30-second drain loop pushes pending writes promptly.
+- **Self-healing** — a 6-hourly orphan scan reclaims events that escaped
+  tracking, a 10-minute content audit catches source edits that incremental sync
+  missed, and a per-user circuit breaker auto-pauses a user whose every calendar
+  is failing.
+- **ICS export** — full-calendar ICS export, plus a "clean" variant that strips
+  BusyBridge-managed events (for migration or external backup).
+- **Email alerts** — notifications for token revocation, unmirrorable events,
+  failing calendars, webhook-registration failures, and circuit-breaker trips.
+- **Automated backups** — daily database + ICS backups with 7-daily / 2-weekly /
+  6-monthly retention, and a drop-in restore flow.
+- **Admin dashboard** — user management, system health, sync activity, log
+  viewer, factory reset, and a permanent-failure surface.
+
+---
+
+## How It Works
+
+Your **main calendar is the source of truth.** Client, personal, and webcal
+calendars are managed automatically.
+
+### Creating appointments
+
+**On your main calendar** — for personal blocks, internal meetings, or anything
+you own. BusyBridge casts a "Busy" block onto every connected client calendar:
+
+```
+Event on Main Calendar
+        │
+        └─► "Busy" blocks on Client A, B, C
+```
+
+**On a client calendar** — when the invite should come from that client's
+domain. BusyBridge copies it to your main calendar (full detail) and casts
+"Busy" blocks on the *other* clients:
+
+```
+Event on Client A
+        │
+        ├─► Full-detail copy on Main Calendar
+        └─► "Busy" blocks on Client B, C  (not A — it owns the real event)
+```
+
+### Personal calendars (read-only)
+
+Personal calendars never receive writes. Their events cast privacy-preserving
+blocks titled **"Busy (personal)"** on your main calendar and all client
+calendars — no titles, no details.
+
+### Webcal/ICS subscriptions
+
+Subscribe to external feeds (conference schedules, travel itineraries). By
+default a feed mirrors to your main calendar with busy blocks on clients. A feed
+can also be **placed on one chosen client calendar**, in which case it appears in
+full detail on both your main calendar and that client, with busy blocks
+everywhere else. Feed copies are prefixed with the subscription's display label
+(e.g. `[ISO] Standards Call`).
+
+### When clients schedule you
+
+Client-created events sync to your main calendar with full detail automatically.
+Other clients only ever see "Busy" — no cross-client information is shared.
+
+| Action | Where |
+|--------|-------|
+| A personal/internal appointment | Your **main calendar** |
+| A meeting inside a client's domain | That **client's calendar** |
+| Block personal time everywhere | Connect a **personal calendar** |
+| Subscribe to a schedule | Add a **webcal subscription** |
+| Accept/decline a client meeting | Your **main calendar** (RSVP propagates back) |
+| See your full schedule | Your **main calendar** |
+
+### Event markers
+
+- **Lock icon** (🔒) is prepended to the title of any managed copy you cannot
+  edit at its source (and to every webcal copy, since feeds are read-only).
+- The configurable tag `[BusyBridge]` (`MANAGED_EVENT_PREFIX`) is appended on its
+  own line at the bottom of the **description** — events read normally but stay
+  searchable. Set it empty to disable tagging.
+- Full copies also carry a footer with the source label, the placement label
+  (for client-placed webcal feeds), the original-event link, and a guest list.
+- **Edit protection** — if you move or edit a non-editable managed event, it is
+  reverted to its canonical state within one sync cycle.
+
+---
+
+## Architecture
+
+A single Docker container runs:
+
+- **FastAPI** — HTTP, OAuth, webhooks, and the web UI.
+- **APScheduler** — background jobs (the sync drain, audits, maintenance).
+- **SQLite** (`aiosqlite`, WAL mode) — all configuration and sync state.
+- A **rate-limited Google Calendar client** — token-bucket, 5 req/s.
+
+### The ledger pipeline
+
+BusyBridge (v2) is a **canonical ledger + projection + idempotent outbox**. All
+live sync logic is in `app/ledger/`. Each user is reconciled by a single writer
+in one pass:
+
+```
+                 ┌──────────── reconcile_user (one writer per user) ───────────┐
+sources ──► ingest ──► ledger_events ──► planner ──► ledger_projections ──► diff ──► outbox ──► Google
+(client/main/                (canonical    (desired      (desired vs        (one op   (drain,
+ personal/webcal)             truth)        state)        applied)           each)     idempotent)
+```
+
+1. **Ingest** (`ingest/{client,main,personal,webcal}.py`, `discovery.py`) reads
+   each source and upserts canonical rows into `ledger_events`.
+2. **Planner** (`planner.py`) is a pure function: for each changed ledger row it
+   computes the desired set of projections (what each target calendar *should*
+   show).
+3. **Diff** (`diff.py`) turns each projection whose desired state differs from
+   its applied state into exactly one **outbox** operation.
+4. **Outbox drain** (`outbox.py`) executes operations against Google oldest-first
+   with idempotent retry.
+
+Key tables (`schema.py`):
+
+| Table | Role |
+|-------|------|
+| `ledger_events` | Canonical store — one row per logical event per user. |
+| `ledger_projections` | Desired-vs-applied state per (event, target calendar). |
+| `outbox_operations` | The write queue (create / update / delete / patch / delete_source). |
+| `reconcile_requests` | One debounced trigger row per user. |
+| `affected_ledger_events` | Append-only replan queue (race-safe). |
+
+A `BEFORE DELETE` trigger on `ledger_events` refuses to hard-delete a row that
+still has a live projection, forcing the safe *cancel → drain deletes → delete*
+path.
+
+### Single writer, idempotent writes
+
+- **One writer per user.** `reconcile_user` runs under a per-user lock; across
+  processes, atomic compare-and-claim updates on `reconcile_requests` and
+  `outbox_operations` serialize work.
+- **Deterministic IDs.** Inserts send a client-supplied Google event ID derived
+  from the projection (`bb` + base32hex, ~15 chars). A retry collides on the
+  per-calendar uniqueness constraint and is treated as success after a confirming
+  GET — so retries never duplicate.
+- **Etag preconditions.** Updates send `If-Match`; a `412` marks the operation
+  superseded and replans from a fresh GET. Deletes are unconditional.
+- **Rate limiting & backoff.** Outbound calls pass through a shared token bucket
+  (`GOOGLE_API_RATE_LIMIT_PER_SECOND`, default 5/s). Retries back off
+  exponentially to 60 s; quota responses (`429`, `403` quota) are retried
+  forever, never poison-pilled.
+
+### Loop prevention
+
+BusyBridge recognizes its own writes structurally — by the deterministic `bb…`
+event ID and an exact `ledger_projections.google_event_id` lookup — and skips
+them on ingest. Rendered events also carry `extendedProperties.private.bb_proj_id`
+and `bb_target_kind` as defence-in-depth. (The ledger version is deliberately
+*not* stamped onto the body, since that would change the payload hash on every
+bump and cause a write loop.)
+
+### Triggers & cadence
+
+Reconciles are triggered three ways, all debounced through `reconcile_requests`:
+
+- **Webhook** — Google push notifications schedule a reconcile after a ~5 s
+  debounce.
+- **Periodic** — a job enqueues every active user every 5 minutes; a separate
+  drain job runs **every 30 seconds**.
+- **Manual** — dashboard actions enqueue immediately (with a settling delay).
+
+### Key directories
+
+```
+app/
+  ledger/        v2 sync engine: reconciler, ingest/, planner, diff, outbox,
+                 payload, identity, recurrence, async_google, runtime, schema
+  api/           REST API endpoints (mounted under /api)
+  auth/          Google OAuth, sessions (JWT)
+  ui/            web UI routes + Jinja2 templates, setup wizard
+  jobs/          APScheduler job definitions
+  alerts/        email alerting
+  sync/          legacy v1 helpers still in use: ics_export, backup,
+                 google_calendar (API adapter). The v1 engine was retired.
+```
+
+---
 
 ## Quick Start
 
 ### Prerequisites
 
-1. Docker and Docker Compose
-2. A Google Cloud project with Calendar API enabled and OAuth 2.0 credentials
-3. A domain with HTTPS (for webhooks and OAuth callbacks)
+1. Docker and Docker Compose.
+2. A Google Cloud project with the Calendar API enabled and OAuth 2.0
+   credentials.
+3. A domain with HTTPS (for webhooks and OAuth callbacks).
 
-### Installation
+### Install
 
 ```bash
 git clone <repository-url>
 cd busybridge
 mkdir -p data secrets
-```
-
-Create a `.env` file:
-
-```bash
-PUBLIC_URL=https://your-domain.com
-MANAGED_EVENT_PREFIX=[BusyBridge]
-ENABLE_WEBHOOKS=true
-```
-
-Start the service:
-
-```bash
 docker compose up -d
 ```
 
-Access the setup wizard at `https://your-domain.com`. The wizard walks through 6 steps:
+The shipped `docker-compose.yml` publishes the app on host port **8033**
+(container port 3000) and sets `TZ=America/New_York`. Adjust `PUBLIC_URL` and the
+published port to taste.
 
-1. **Welcome** -- overview and prerequisites
-2. **Google Cloud Credentials** -- guided walkthrough to create OAuth credentials
-3. **Admin Authentication** -- sign in with Google, establishes home org domain
-4. **Email Alerts** -- optional SMTP configuration for sync failure notifications
-5. **Encryption Key** -- generates master key (save it!), initializes database
-6. **Complete** -- next steps and link to dashboard
+Then open the setup wizard at your `PUBLIC_URL`. It walks through six pages:
 
-> **Secure the first run.** Until the wizard is complete the instance is
-> unconfigured and the `/setup` pages are unauthenticated. Run first-run
-> setup over `localhost`, a VPN, or behind a firewall, complete it in a
-> single browser session, and only expose the service publicly once
-> setup has finished. Setup state lives in memory for the duration of
-> the wizard -- if the container restarts mid-setup, just restart it and
-> rerun the wizard (no reinstall needed).
+1. **Welcome** — overview and prerequisites.
+2. **Google Cloud credentials** — paste your OAuth client ID/secret.
+3. **Admin authentication** — sign in with Google; this captures your home-org
+   domain.
+4. **Email alerts** — optional SMTP configuration (skippable).
+5. **Encryption key** — a master key is generated; **save it** — it decrypts all
+   stored OAuth tokens.
+6. **Complete** — link to the dashboard.
 
-### Google Cloud Setup
+> **Secure the first run.** Until the wizard finishes, the instance is
+> unconfigured and `/setup` is unauthenticated. Run setup over `localhost`, a
+> VPN, or behind a firewall, complete it in a single browser session, and only
+> expose the service publicly once setup is done. The wizard binds to one browser
+> via a cookie; if the container restarts mid-setup, just rerun it.
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a project and enable the **Google Calendar API**
-3. Configure the OAuth consent screen:
-   - Scopes: `calendar`, `calendar.readonly`, `email`, `profile`, `openid`
-4. Create OAuth 2.0 credentials (Web application) with redirect URIs:
+Google OAuth credentials and SMTP settings are stored encrypted in the database
+after setup, not in environment variables.
+
+### Google Cloud setup
+
+1. In the [Google Cloud Console](https://console.cloud.google.com/), create a
+   project and enable the **Google Calendar API**.
+2. Configure the OAuth consent screen with scopes `calendar`,
+   `calendar.readonly`, `email`, `profile`, `openid`.
+3. Create **Web application** OAuth 2.0 credentials with these redirect URIs
+   (replace the host with your `PUBLIC_URL`):
    - `https://your-domain/auth/callback`
    - `https://your-domain/auth/connect-client/callback`
    - `https://your-domain/auth/connect-personal/callback`
    - `https://your-domain/setup/step/3/callback`
 
-## How It Works
+> Keep the OAuth app in **In production** (not Testing) status — Testing-mode
+> refresh tokens expire after ~7 days and force reconnects.
 
-Your **main calendar is your single source of truth**. Client calendars are managed automatically.
-
-### Creating Appointments
-
-**Create on your main calendar** for personal blocks, internal meetings, or any appointment you own. BusyBridge creates "Busy" blocks on every connected client calendar:
-
-```
-You create event on Main Calendar
-         |
-BusyBridge creates "Busy" blocks on Client A, B, C
-```
-
-**Create on a client calendar** when the invite should come from that client's domain. BusyBridge copies it to your main calendar and creates "Busy" blocks on other clients:
-
-```
-You create event on Client A
-         |
-Full-detail copy on Main Calendar
-"Busy" blocks on Client B, C (not A -- it has the real event)
-```
-
-### Personal Calendar Events
-
-Personal calendars are **read-only**. Events create privacy-preserving blocks:
-
-```
-Personal calendar event ("Doctor Appointment")
-         |
-"Busy (Personal)" block on Main Calendar
-"Busy (Personal)" blocks on Client A, B, C
-```
-
-No event details are shared.
-
-### Webcal/ICS Subscriptions
-
-Subscribe to external calendar feeds (conference schedules, travel itineraries). Events sync to your main calendar and create busy blocks on client calendars. Feeds with unstable UIDs (e.g. ISO) are handled via content-based hashing.
-
-### Recurring Events
-
-Recurring events sync as recurring events -- BusyBridge copies the RRULE directly. Single-instance modifications and cancellations sync individually without affecting the series.
-
-### RSVP Propagation
-
-When you accept or decline an event on your main calendar that originated from a client calendar, BusyBridge propagates the RSVP status back to the client calendar.
-
-### Event Markers
-
-BusyBridge-managed events are visually marked:
-
-- **Lock icon** (🔒) in the title indicates a non-editable managed event
-- **Color coding** distinguishes events from different client calendars
-- **"Managed by [BusyBridge]"** appears in the description footer
-- **Edit protection**: if you move a non-editable event on your main calendar, BusyBridge reverts it to the original time within one sync cycle
-
-### When Clients Schedule You
-
-Client-created events sync automatically to your main calendar with full details. Other clients only see "Busy" blocks -- no cross-client information is ever shared.
-
-| Action | Where |
-|--------|-------|
-| Create a personal/internal appointment | Your **main calendar** |
-| Organize a meeting within a client's domain | That **client's calendar** |
-| Block personal time across all calendars | Connect a **personal calendar** |
-| Subscribe to a conference schedule | Add a **webcal subscription** |
-| View your full schedule | Your **main calendar** |
-| Accept/decline a client meeting | Your **main calendar** (RSVP propagates back) |
-
-## Dashboard
-
-The main dashboard (`/app`) shows:
-
-- **Status grid**: connected calendars, total events synced, healthy count, issues
-- **Integrity checker**: live consistency status with auto-fix tracking
-- **Main calendar**: current selection with quick-change link
-- **Client calendars**: each with status icon, color dot picker, last sync time, event/busy block counts, per-calendar sync button with live progress bar, and actions (cleanup & re-sync, disconnect)
-- **Personal calendars**: status, last sync, busy block counts, sync/disconnect
-- **Webcal subscriptions**: add new feeds (URL + display prefix), status, sync/delete
-- **Sync activity feed**: real-time log of sync events
-
-### Sync Control
-
-The sync control page (`/app/settings/sync`) provides:
-
-- **Full Re-sync**: Clear all sync tokens and re-process every event from scratch
-- **Cleanup & Re-sync**: Delete ALL BusyBridge-managed events, then recreate from scratch
-- **Cleanup & Pause**: Remove all managed events and stop syncing (for troubleshooting)
-- **Connection Health Check**: Test all OAuth tokens and show which accounts need reconnection
-- **Live progress tracking** with step labels and event counts during cleanup operations
-
-Per-calendar cleanup is also available from the dashboard (cleanup & re-sync a single calendar without affecting others).
-
-### Calendar Exports
-
-The exports page (`/app/settings/exports`) manages ICS calendar backups:
-
-- **Full export**: ZIP containing one `.ics` file per calendar with complete event data (attendees, Meet links, recurrence, etc.)
-- **Clean export**: Same but with BusyBridge-managed events filtered out -- useful for migrating away or importing into another calendar tool
-- Automatic daily exports alongside database backups
-- Same retention policy: 7 daily, 2 weekly, 6 monthly
-
-## Architecture
-
-Single Docker container running:
-
-- **FastAPI** web server (HTTP, OAuth, webhooks, UI)
-- **APScheduler** background jobs (sync, cleanup, maintenance)
-- **SQLite** database (all configuration and sync state)
-- **Rate-limited Google Calendar API client** (token-bucket, 5 req/s)
-
-### Sync Flow
-
-```
-Client Calendar Event --> Main Calendar (full details)
-                      --> Busy blocks on other Client Calendars
-
-Main Calendar Event   --> Busy blocks on ALL Client Calendars
-
-Personal Calendar     --> "Busy (Personal)" on Main + all Clients
-
-Webcal/ICS Feed       --> Events on Main Calendar
-                      --> Busy blocks on all Client Calendars
-```
-
-### Loop Prevention
-
-All BusyBridge-created events are tagged with `extendedProperties.private.calendarSyncEngine = "true"`. The sync engine skips any event with this tag, preventing feedback loops.
-
-### Key Directories
-
-```
-app/
-  auth/         OAuth, sessions
-  api/          REST API endpoints
-  sync/         Core sync engine, rules, Google API wrapper
-  jobs/         Background job definitions
-  alerts/       Email alerting
-  ui/           Web interface and Jinja2 templates
-```
+---
 
 ## Configuration
 
-### Environment Variables
+### Environment variables
+
+All settings have safe defaults; override via `.env` or the environment. Google
+credentials and SMTP live in the database, not here.
+
+**Core**
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PUBLIC_URL` | Public base URL of the deployment (sets cookie security and OAuth/webhook URLs) | `http://localhost:3000` |
-| `DATABASE_PATH` | Path to SQLite database | `/data/calendar-sync.db` |
-| `ENCRYPTION_KEY_FILE` | Path to encryption key file | `/secrets/encryption.key` |
+| `PUBLIC_URL` | Public base URL (drives cookie security, CORS, HSTS, OAuth/webhook URLs) | `http://localhost:3000` |
+| `DATABASE_PATH` | SQLite database path | `/data/calendar-sync.db` |
+| `ENCRYPTION_KEY_FILE` | AES key file (decrypts stored tokens) | `/secrets/encryption.key` |
+| `SESSION_SECRET_KEY` | JWT signing secret (auto-generated + persisted if unset) | _(generated)_ |
+| `SESSION_EXPIRE_DAYS` | Session/JWT lifetime | `7` |
 | `LOG_LEVEL` | Logging level | `info` |
-| `TZ` | Timezone for scheduled jobs | `UTC` |
-| `ENABLE_WEBHOOKS` | Enable Google Calendar push notifications | `true` |
-| `MANAGED_EVENT_PREFIX` | Prefix on BusyBridge-created events | `[BusyBridge]` |
-| `TEST_MODE` | Enable Gmail-safe testing mode | `false` |
-| `TEST_MODE_ALLOWED_HOME_EMAILS` | Email allowlist for home login in test mode | _(none)_ |
-| `TEST_MODE_ALLOWED_CLIENT_EMAILS` | Email allowlist for client connections in test mode | _(none)_ |
+| `LOG_DIR` | Rotating log directory | `/data/logs` |
+| `BACKUP_PATH` | Backup directory | `/data/backups` |
+| `ENABLE_WEBHOOKS` | Google push notifications | `true` |
+| `ENABLE_LEDGER_JOBS` | Use the v2 ledger jobs (off = legacy rollback path) | `true` |
+| `LEDGER_DRY_RUN` | Plan + fill outbox but never write to Google | `false` |
+| `TRUST_PROXY_HEADERS` | Trust `X-Forwarded-For`/`X-Real-IP` for rate-limit IP | `false` |
 
-Google OAuth credentials and SMTP settings are stored in the database after the setup wizard, not in environment variables.
+**Sync cadence**
 
-### Scheduled Jobs
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SYNC_INTERVAL_MINUTES` | Periodic enqueue + health-check interval | `5` |
+| `CONTENT_AUDIT_MINUTES` | Source content re-audit interval | `10` |
+| `TOKEN_REFRESH_MINUTES` | OAuth token refresh interval | `30` |
+| `WEBHOOK_RENEWAL_HOURS` | Push-channel renewal interval | `6` |
+| `ALERT_PROCESS_MINUTES` | Email-alert queue tick | `1` |
 
-| Job | Frequency | Description |
-|-----|-----------|-------------|
-| Periodic Sync | Every 5 min | Poll all calendars + webcal subscriptions |
-| Webhook Renewal | Every 6 hours | Renew expiring push notification channels |
-| Consistency Check | Every hour | Verify database matches Google Calendar reality |
-| Orphan Scan | Every 6 hours | Find and remove orphaned events on Google |
-| Token Refresh | Every 30 min | Proactively refresh expiring OAuth tokens |
-| Alert Processing | Every 1 min | Send queued email alerts |
-| Retention Cleanup | Daily 3 AM | Delete old records per retention policy |
-| Stale Alert Cleanup | Daily 4 AM | Remove old sent/failed alert records |
-| Daily Backup | Daily 11 PM | Create backup, enforce retention policy |
+**Rate limits**
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `RATE_LIMIT_PER_MINUTE` | Per-IP limit on general endpoints | `60` |
+| `WEBHOOK_RATE_LIMIT_PER_MINUTE` | Per-channel limit on the webhook endpoint | `30` |
+| `AUTH_RATE_LIMIT_PER_MINUTE` | Limit on auth endpoints | `10` |
+| `GOOGLE_API_RATE_LIMIT_PER_SECOND` | Outbound Google call cap (≤0 disables) | `5.0` |
+
+**Retention**
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `EVENT_RETENTION_DAYS` | Prune single-occurrence events past their end | `30` |
+| `RECURRING_SOFT_DELETE_DAYS` | Hard-delete cancelled series after | `30` |
+| `AUDIT_LOG_RETENTION_DAYS` | Keep `sync_log` rows | `90` |
+| `DISCONNECTED_CALENDAR_RETENTION_DAYS` | Purge disconnected calendars after | `30` |
+
+**Markers, titles & test mode**
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MANAGED_EVENT_PREFIX` | Tag appended to managed event descriptions (empty disables) | `[BusyBridge]` |
+| `BUSY_BLOCK_TITLE` | Title of client busy blocks | `Busy` |
+| `TEST_MODE` | Gmail-safe testing mode (see below) | `false` |
+| `TEST_MODE_ALLOWED_HOME_EMAILS` | Home-login email allowlist | _(none)_ |
+| `TEST_MODE_ALLOWED_CLIENT_EMAILS` | Client-connect email allowlist | _(none)_ |
+
+> `TZ` is an OS/container variable (not a setting); `docker-compose.yml` sets it
+> to `America/New_York`, so the daily cron jobs run in US Eastern by default.
+
+### Scheduled jobs
+
+In the default ledger mode (`ENABLE_LEDGER_JOBS=true`):
+
+| Job | Schedule | Purpose |
+|-----|----------|---------|
+| Ledger drain | every 30 s | Push pending outbox writes to Google |
+| Ledger periodic enqueue | every 5 min | Queue a reconcile for each active user |
+| Sync health checks | every 5 min | Circuit breaker + failing-calendar alerts |
+| Content audit | every 10 min | Re-verify source content vs the ledger (catches missed edits) |
+| Token refresh | every 30 min | Refresh OAuth tokens expiring within an hour |
+| Alert processing | every 1 min | Send queued email alerts |
+| Orphan scan | every 6 h | Reclaim Google events that escaped tracking |
+| Webhook renewal | every 6 h | Renew channels expiring within 24 h |
+| Webhook registration | on startup | Register push channels for all users |
+| Retention cleanup | daily 3:00 AM | Prune expired records (fault-isolated per bucket) |
+| Stale alert cleanup | daily 4:00 AM | Remove old sent/failed alerts |
+| Database VACUUM | weekly Sun 4:30 AM | Reclaim space after deletes |
+| Daily backup | daily 11:00 PM | DB + ICS backup, then enforce retention |
+
+(With `ENABLE_LEDGER_JOBS=false`, a single legacy `periodic_sync` job replaces
+the drain/enqueue pair — a rollback switch only.)
+
+---
+
+## Dashboard
+
+The dashboard (`/app`) shows:
+
+- **Status grid** — connected calendars, total tracked events, health, issues.
+- **Integrity panel** — live consistency status.
+- **Client calendars** — each with a status icon, color picker, last-sync time,
+  event/busy-block counts, a per-calendar sync button with live progress, and
+  actions (cleanup & re-sync, disconnect).
+- **Personal calendars** — status, counts, sync/disconnect.
+- **Webcal subscriptions** — add feeds (URL + display prefix + placement), with
+  status and sync/delete.
+- **Sync activity feed** — recent sync events.
+
+### Sync control (`/app/settings/sync`)
+
+- **Full re-sync** — clear sync tokens and reprocess everything.
+- **Cleanup & re-sync** — delete all managed events, then recreate.
+- **Cleanup & pause** — remove managed events and stop (for troubleshooting).
+- **Connection health check** — test all OAuth tokens.
+- Live progress with step labels and counts.
+
+Per-user pause (`POST /api/sync/my/pause` / `/my/resume`) is distinct from the
+admin-wide global pause. Per-calendar cleanup is available from the dashboard.
+
+### Calendar exports (`/app/settings/exports`)
+
+- **Full export** — a ZIP with one `.ics` per calendar (attendees, Meet links,
+  recurrence, etc.).
+- **Clean export** — the same with BusyBridge-managed events filtered out (for
+  migrating away).
+- Daily automatic exports follow the 7/2/6 retention policy. Download/create/
+  delete go through admin-only `/api/admin/backup/ics` endpoints.
+
+### Admin (`/admin`)
+
+User management, system health (active calendars, recent errors, alert queue),
+log viewer, SMTP/alert settings, factory reset, and the permanent-failure
+surface. Admins grant admin to others from `/admin/users` (the last admin can't
+be demoted).
+
+---
+
+## Sync Behavior (details)
+
+- **Full copy vs busy block.** A client/webcal source becomes a full-detail copy
+  on your main calendar and opaque "Busy" blocks on the other clients; the origin
+  client keeps its real event. Main-only events cast busy blocks on all clients.
+- **Free/Busy.** Events marked Free (`transparency=transparent`) cast no busy
+  block. Personal sources always block.
+- **RSVP propagation** is one-directional — main → originating client — and is
+  gated on an intent flag so a source-side RSVP is never clobbered. Personal and
+  webcal sources never receive write-back.
+- **Recurring events.** RRULEs are copied verbatim with the source IANA timezone
+  (DST-correct). Modified/cancelled instances become their own sticky rows;
+  cancellations are recovered during full sync via `events.instances(showDeleted)`.
+  A "change all events from here forward" split is treated **additively** (each
+  segment is its own series), never by re-keying the base.
+- **Conference links.** Meet/Zoom data is carried onto the main copy (existing
+  entry points preserved, no new conference minted) and excluded from the change
+  hash; room changes are adopted only after the new value is seen twice
+  (debounced), and removals settle the same way.
+- **Same-meeting dedup.** When a meeting lands on your main calendar through more
+  than one path, the redundant copy is suppressed by Google's `iCalUID` (matched
+  by identity, never by time — distinct same-time meetings each keep a block).
+- **Drift revert** applies to both your main calendar and client calendars: a
+  moved/edited/deleted managed copy is re-asserted to its canonical state. A
+  deleted webcal/personal block on your main calendar is re-created, never
+  propagated back.
+- **Color coding.** Full copies take the source client calendar's color, read at
+  render time; busy blocks are uncolored.
+
+---
 
 ## Backup & Recovery
 
-BusyBridge creates daily automated backups at 11 PM with a retention policy of 7 daily, 2 weekly, and 6 monthly backups. Backups are stored in `/data/backups/`.
+Daily backups run at 11 PM with a retention policy of **7 daily / 2 weekly /
+6 monthly**, for both the database and the ICS exports, under `BACKUP_PATH`
+(default `/data/backups`).
 
-### What to Back Up
+**What to back up**
 
-- `/data/calendar-sync.db` -- all application data
-- `/secrets/encryption.key` -- required to decrypt OAuth tokens
+- `/data/calendar-sync.db` — all application data.
+- `/secrets/encryption.key` — required to decrypt OAuth tokens.
 
-### Manual Backup
-
-Create and download backups from the web UI at `/app/settings`, or via the API:
+**Manual backup** (admin-authenticated):
 
 ```bash
-curl -X POST https://your-domain/api/admin/backup
+curl -X POST https://your-domain/api/admin/backup \
+  -H "Cookie: session=<admin-session-jwt>"
 ```
 
-### Recovery
+Or use the web UI (ICS exports at `/app/settings/exports`).
 
-1. Stop the container
-2. Place backup as `/data/restore-pending.zip`
-3. Start the container -- it auto-detects and restores
-4. Verify via admin dashboard
+**Recovery**
+
+1. Stop the container.
+2. Place the backup as `<data-dir>/restore-pending.zip` (default
+   `/data/restore-pending.zip`).
+3. Start the container — it detects the file, restores the ledger database, and
+   resets projections so the idempotent outbox re-converges Google. The file is
+   renamed to `restore-pending-done-<timestamp>.zip` so it isn't re-applied.
+4. Verify from the admin dashboard.
+
+---
+
+## Security
+
+- **Encryption at rest** — OAuth tokens and secrets are encrypted with
+  AES-256-GCM (random per-message nonce); the 32-byte key lives in
+  `ENCRYPTION_KEY_FILE`, separate from the database. Startup fails closed if the
+  key is missing or can't decrypt stored credentials.
+- **Sessions** — JWTs (HS256) in an httpOnly, SameSite=Lax cookie (Secure when
+  `PUBLIC_URL` is HTTPS), default 7-day expiry. A per-user token-version field
+  lets admins force re-authentication and invalidates old cookies.
+- **Home-org restriction** — home login is restricted to your Google Workspace
+  domain at the OAuth callback (in `TEST_MODE`, an explicit email allowlist
+  replaces the domain check).
+- **Rate limiting** — 60/min on general endpoints, 30/min per channel on
+  webhooks, 10/min on auth.
+- **CSRF + headers** — same-origin enforcement on state-changing requests; CSP,
+  `X-Frame-Options: DENY`, `X-Content-Type-Options`, `Referrer-Policy`, and HSTS
+  (over HTTPS). CORS is restricted to `PUBLIC_URL`.
+- **Non-root** — runs as `appuser` (uid 1000). Designed to sit behind a
+  TLS-terminating reverse proxy.
+
+---
 
 ## Development
 
-### Local Setup
+### Local setup
 
 ```bash
-python -m venv venv
-source venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
 
 export DATABASE_PATH=./data/calendar-sync.db
@@ -303,132 +519,139 @@ export PUBLIC_URL=http://localhost:3000
 python -m uvicorn app.main:app --host 0.0.0.0 --port 3000 --reload
 ```
 
-### Running Tests
+### Tests
 
 ```bash
-pytest
+pytest                      # ~748 tests (the 5 slow soak tests are excluded)
+pytest -m slow              # run only the soak tests
+pytest -m ""                # run everything (~753)
 pytest --cov=app --cov-report=html
 ```
 
-### End-to-End Tests
+Tests run entirely against an in-memory fake Google Calendar
+(`tests/fakes/`) that faithfully reproduces real API quirks — see
+`tests/fakes/QUIRKS.md`. Layers: unit, Hypothesis property tests
+(`tests/integration/test_property.py`), integration (`tests/integration/`),
+chaos/concurrency, and soak (`tests/soak/`).
 
-See `e2e/README.md` for Playwright-based tests against a running instance.
+### End-to-end tests
 
-### Test Sidecar
-
-A test sidecar container runs automated sync scenarios against the live instance:
+`e2e/` runs Playwright + the real Calendar API against a live instance:
 
 ```bash
-docker compose --profile test up -d
+./e2e/run.sh            # all
+./e2e/run.sh api        # API-only
+./e2e/run.sh browser    # browser flows
 ```
 
-Dashboard at port 8100.
+See `e2e/README.md` for OAuth/session bootstrap.
 
-### Gmail Test Mode
-
-For testing with Gmail accounts (no Workspace), see `GMAIL_TESTING.md`.
-
-## Upgrading
-
-Pull new code and rebuild:
+### Upgrading
 
 ```bash
 git pull
 docker compose up -d --build calendar-sync
 ```
 
-Database migrations run automatically on startup (inline `ALTER TABLE` statements that are safe to re-run). No manual migration steps needed.
+Schema migrations run automatically on startup (idempotent inline `ALTER TABLE`
+statements); no manual steps.
 
-## Adding Users
+---
 
-Any user with an email address in the home org domain can log in at `/app/login`. They:
+## Test Mode (Gmail-only testing)
 
-1. Sign in with Google (home org account)
-2. Select their main calendar
-3. Connect client calendars from the dashboard
+`TEST_MODE=true` lets you run a production-like instance against throwaway Gmail
+accounts without paying for Workspace seats. When enabled:
 
-The first user (setup wizard admin) can grant admin privileges to other users from `/admin/users`.
+1. Home login is restricted to an exact email allowlist
+   (`TEST_MODE_ALLOWED_HOME_EMAILS`) instead of a domain.
+2. Client connections are restricted to `TEST_MODE_ALLOWED_CLIENT_EMAILS`.
+3. If either allowlist is empty, that auth path fails closed.
+
+Example `.env`:
+
+```env
+PUBLIC_URL=https://busybridge-test.example.com
+TEST_MODE=true
+TEST_MODE_ALLOWED_HOME_EMAILS=bb-home-admin@gmail.com
+TEST_MODE_ALLOWED_CLIENT_EMAILS=bb-client-1@gmail.com,bb-client-2@gmail.com
+MANAGED_EVENT_PREFIX=[BusyBridge]
+# Optional: poll-only, no push notifications
+ENABLE_WEBHOOKS=false
+```
+
+Setup: create dedicated Gmail accounts (never reuse real ones); a dedicated
+Google Cloud project with the Calendar API and the four redirect URIs above; move
+the OAuth app to **In production** to avoid ~7-day refresh-token expiry. Then run
+the setup wizard, sign in as a home-allowlisted account, connect each client
+Gmail, and select a writable calendar for each.
+
+Common `TEST_MODE` errors: `test_mode_no_home_allowlist` /
+`test_mode_no_client_allowlist` (allowlist empty), `email_not_allowed` /
+`client_email_not_allowed` (account not allowlisted), `no_refresh_token`
+(reconnect with full consent).
+
+---
 
 ## Troubleshooting
 
-### Checking Logs
+### Logs
 
 ```bash
-# Today's errors (excluding noise)
+# Today's errors/warnings (excluding known noise)
 docker exec calendar-sync sh -c 'cat /data/logs/busybridge.log | grep " - ERROR - \| - WARNING - " | grep -v "file_cache\|discovery_cache\|Unknown webhook channel"'
 
-# Previous days
+# Available log files (14-day retention, daily rotation)
 docker exec calendar-sync ls /data/logs/
 ```
 
-### Common Issues
+### Common issues
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| "credentials do not contain" errors | OAuth token lost its refresh_token | Re-authorize the account (disconnect + reconnect from dashboard) |
-| Rate limit errors (403 rateLimitExceeded) | Too many API calls | Rate limiter handles this automatically; check if a calendar has excessive events |
-| "Service accounts cannot invite attendees" | SA lacks Domain-Wide Delegation | Expected if DWD not configured; the retry-without-attendees path handles it |
-| Backup permission denied | `/data/backups` owned by root | `docker exec -u root calendar-sync chown appuser:appuser /data/backups` |
-| Sync not running | Global pause is on | Check admin dashboard or `POST /api/sync/resume` |
-| Duplicate events | Webcal feed with unstable UIDs | Should be handled automatically; run orphan scan from sync control |
-| "Unknown webhook channel" warnings | Stale channels after restart | Harmless, self-resolving when channels expire |
+| "credentials do not contain" | OAuth lost its refresh token | Disconnect + reconnect the account |
+| `403 rateLimitExceeded` | API burst | Handled automatically by the limiter; check for a calendar with excessive events |
+| "Service accounts cannot invite attendees" | No Domain-Wide Delegation | Expected; the retry-without-attendees path handles it |
+| Backup "permission denied" | `/data/backups` owned by root | `docker exec -u root calendar-sync chown appuser:appuser /data/backups` |
+| Sync not running | Global pause is on | Admin dashboard, or `POST /api/sync/resume` (admin) |
+| "Unknown webhook channel" warnings | Stale channels after restart | Harmless; self-resolves as channels expire |
 
-### Maintenance Scripts
-
-One-time scripts for fixing historical data issues:
-
-```bash
-# Backfill origin metadata onto events created before metadata embedding
-docker compose exec calendar-sync python /app/scripts/backfill_metadata.py --dry-run
-
-# Clean up duplicate busy blocks from a prior bug
-docker compose exec calendar-sync python /app/scripts/cleanup_duplicate_blocks.py --dry-run
-```
-
-Remove `--dry-run` to apply changes.
+---
 
 ## API
 
-When running, interactive API documentation is available at:
+Interactive API docs when running:
 
 - Swagger UI: `https://your-domain/docs`
 - ReDoc: `https://your-domain/redoc`
 
-## Security
+Notable routes: `/auth/*` (OAuth + sessions), `/api/*` (REST — calendars, sync,
+webcal subscriptions, admin, the ledger admin surface under `/api/admin/ledger`),
+`POST /api/webhooks/google-calendar` (Google push receiver), and `/health`
+(readiness probe).
 
-- OAuth tokens encrypted at rest with AES-256-GCM (key stored separately from database)
-- Home org domain restriction enforced at OAuth callback
-- Session tokens are JWTs with 7-day expiration
-- Rate limiting on all endpoints (60/min general, 120/min webhooks)
-- Runs as non-root user (`appuser`) in container
-- Designed to run behind a reverse proxy with TLS termination
-
-## Logs
-
-Logs are written to stdout and to rotating files at `/data/logs/busybridge.log` (14-day retention, daily rotation). Inside the container:
-
-```bash
-# Today's log
-docker exec calendar-sync cat /data/logs/busybridge.log
-
-# Previous days
-docker exec calendar-sync ls /data/logs/
-```
+---
 
 ## Technology Stack
 
 | Component | Technology |
 |-----------|------------|
 | Language | Python 3.12 |
-| Web Framework | FastAPI |
-| Database | SQLite (aiosqlite, WAL mode) |
-| Google API | google-api-python-client |
+| Web framework | FastAPI (Uvicorn) |
+| Database | SQLite (`aiosqlite`, WAL) |
+| Google API | `google-api-python-client` |
 | Scheduling | APScheduler |
-| Encryption | AES-256-GCM (cryptography) |
-| Email | aiosmtplib |
-| Frontend | Jinja2 + htmx + Alpine.js + Tailwind CSS |
-| ICS Parsing | icalendar + recurring-ical-events |
+| Encryption | AES-256-GCM (`cryptography`) |
+| Sessions | `python-jose` (JWT) |
+| Email | `aiosmtplib` |
+| ICS | `icalendar` + `recurring-ical-events` |
+| Rate limiting | SlowAPI (HTTP) + a custom token bucket (Google) |
+| Frontend | Jinja2 + htmx + Alpine.js + Tailwind (vendored, no CDN) |
+
+Exact pins are in `requirements.txt` / `requirements.lock`.
+
+---
 
 ## License
 
-MIT License
+MIT License — see [`LICENSE`](./LICENSE).

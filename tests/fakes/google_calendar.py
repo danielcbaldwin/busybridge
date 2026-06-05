@@ -1,7 +1,6 @@
 """In-memory fake of the Google Calendar v3 API.
 
-This fake is faithful to the documented quirks listed in
-``REWRITE_PLAN.md`` §13 Stage 1:
+This fake is faithful to the documented quirks of the real API:
 
 * In-memory event store keyed by calendar.
 * Client-supplied ``id`` on insert with 409 conflict semantics.
@@ -728,8 +727,8 @@ class FakeGoogleCalendar:
           unless ``show_deleted=True``; in particular, **cancelled
           instance exceptions of recurring series are omitted from
           full sync** when ``show_deleted=False``.  This is the
-          documented quirk that the rewrite plan calls out as the
-          source of recurring-cancellation amnesia (§13 Stage 1).
+          documented quirk that is the source of
+          recurring-cancellation amnesia.
         * **Incremental sync** (``sync_token`` set): returns every
           event whose change cursor is strictly greater than the
           token's recorded cursor, regardless of status — cancelled
@@ -823,8 +822,7 @@ class FakeGoogleCalendar:
                 # instance exceptions of recurring series are *not*
                 # returned by full sync.  Real Google has the same
                 # behaviour and it is the source of the
-                # recurring-cancellation amnesia documented in
-                # REWRITE_PLAN.md §13 Stage 1.  To retrieve cancelled
+                # recurring-cancellation amnesia.  To retrieve cancelled
                 # instances reliably, callers must use
                 # ``events.instances(showDeleted=True)`` or pull them
                 # via incremental sync.
@@ -1076,8 +1074,7 @@ class FakeGoogleCalendar:
            after ``from_dt`` on the original series (their dates
            now belong to the new series).
 
-        This is documented in REWRITE_PLAN.md §13 Stage 1 as one of
-        the must-reproduce quirks.
+        This is one of the must-reproduce quirks of the real API.
 
         Returns the new (``_R``-suffixed) event's API dict.
         """

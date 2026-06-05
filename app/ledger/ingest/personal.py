@@ -1,4 +1,4 @@
-"""Personal calendar ingest (REWRITE_PLAN.md §5.3).
+"""Personal calendar ingest.
 
 Personal calendars are OAuth-connected like clients, but the
 ledger marks their rows ``source_type='personal'``.  The planner

@@ -1,4 +1,4 @@
-"""Webcal recurring-event handling (REWRITE_PLAN.md §5.4 / §8).
+"""Webcal recurring-event handling.
 
 Two ICS recurrence features that were previously dropped:
 

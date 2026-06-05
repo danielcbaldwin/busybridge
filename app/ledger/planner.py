@@ -1,7 +1,7 @@
 """Planner: ledger row → desired projections per target calendar.
 
-Implements REWRITE_PLAN.md §6.1: for each ledger event, compute
-which calendars should hold a copy and in what shape.
+For each ledger event, compute which calendars should hold a copy
+and in what shape.
 
 The planner is *pure* given ledger state + active client list.
 It writes desired_state, desired_payload_hash, and
@@ -61,8 +61,8 @@ async def plan_for_ledger_event(
 
     # A modified-instance row's desired state also depends on its
     # parent series: if the whole series was cancelled or the user
-    # deleted it, the instance must go absent too (REWRITE_PLAN.md
-    # §6) — otherwise it lingers as a ghost.
+    # deleted it, the instance must go absent too — otherwise it
+    # lingers as a ghost.
     parent_inactive = await _parent_is_inactive(db, ledger)
     no_live_occurrences = await _recurring_parent_has_no_live_occurrences(
         db, ledger,
@@ -299,9 +299,9 @@ def _compute_desired_projections(
         peer = PRESENT_BUSY if show_as != "free" else ABSENT
         # The origin client calendar holds the event natively, so it
         # gets no busy block.  It gets a "phantom" writeback
-        # projection (REWRITE_PLAN.md §9) whenever there is something
-        # to push back to the source: the user's RSVP, or — for an
-        # editable event — a time/detail edit made on the main copy.
+        # projection whenever there is something to push back to the
+        # source: the user's RSVP, or — for an editable event — a
+        # time/detail edit made on the main copy.
         # Rendered as an events.patch; it never creates or deletes
         # the source event.
         origin = (
@@ -579,8 +579,8 @@ async def _active_client_calendars(
     db: aiosqlite.Connection, user_id: int,
 ) -> list[aiosqlite.Row]:
     """Active CLIENT calendars — personal calendars are deliberately
-    excluded, per REWRITE_PLAN.md §6.1: personal calendars are
-    read-only origin sources, never busy-block targets."""
+    excluded: personal calendars are read-only origin sources, never
+    busy-block targets."""
     cursor = await db.execute(
         """SELECT id FROM client_calendars
             WHERE user_id = ?

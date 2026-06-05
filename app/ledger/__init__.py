@@ -1,4 +1,4 @@
-"""Canonical-ledger architecture for BusyBridge sync (REWRITE_PLAN.md §3).
+"""Canonical-ledger architecture for BusyBridge sync.
 
 This package owns the new sync pipeline:
 
@@ -17,6 +17,5 @@ This package owns the new sync pipeline:
 * Reconciler (``reconciler.py``) — orchestrates the above.
 
 The old code under ``app/sync/`` continues to run in parallel
-during Stage 2; cutover (Stage 5) is the single coordinated
-swap-over described in REWRITE_PLAN.md §13.
+during the migration; cutover is a single coordinated swap-over.
 """

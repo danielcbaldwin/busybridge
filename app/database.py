@@ -286,7 +286,7 @@ async def init_schema(db: aiosqlite.Connection) -> None:
         await db.execute(f"DROP TABLE IF EXISTS {legacy_table}")
         await db.commit()
 
-    # Ledger tables (REWRITE_PLAN.md §4).  A failure here leaves the
+    # Ledger tables.  A failure here leaves the
     # ledger half-built; the app must not boot on it, so the error is
     # allowed to propagate out of get_database() and abort startup.
     from app.ledger.schema import init_ledger_schema

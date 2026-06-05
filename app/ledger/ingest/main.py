@@ -1,4 +1,4 @@
-"""Main calendar ingest (REWRITE_PLAN.md §5.2).
+"""Main calendar ingest.
 
 Same shape as the client ingest, with three differences:
 
@@ -11,7 +11,7 @@ Same shape as the client ingest, with three differences:
    ``user_intentionally_deleted`` flag, so the planner suppresses
    re-creation on every target.
 
-Edit-back-propagation (REWRITE_PLAN.md §9): a user edit to one of
+Edit-back-propagation: a user edit to one of
 our managed copies on the main calendar is classified by
 :func:`_maybe_apply_main_edit_back` and either propagated to the
 source event or reverted as drift.
@@ -272,7 +272,7 @@ async def _ingest_one_main_event(
             await _mark_user_intentionally_deleted(db, ledger_id)
             return "user_deletes", ledger_id
         # Edit-on-main detection: the user has changed our copy.
-        # Two outcomes per REWRITE_PLAN.md §9:
+        # Two outcomes:
         # * Editable event (client source, user_can_edit): propagate
         #   RSVP and/or time back to the source by bumping the
         #   ledger row.
@@ -474,8 +474,7 @@ async def _ingest_managed_recurring_instance(
     recurring event we mirror onto the main calendar.  Map it back to
     the SOURCE series' ledger row and upsert a canonical
     source-parented instance row, so the existing planner / diff
-    propagate the change to the source occurrence and every peer copy
-    (REWRITE_PLAN.md Option A).
+    propagate the change to the source occurrence and every peer copy.
 
     A move/edit for a writable client source arms an origin-writeback
     patch; a cancellation arms a destructive delete of that one source
@@ -637,7 +636,7 @@ async def _maybe_apply_main_edit_back(
 ) -> Optional[str]:
     """The user edited our copy of an event on the main calendar.
     Classify the edit and either propagate it to the source event or
-    revert it (REWRITE_PLAN.md §9).
+    revert it.
 
     Three edit categories, each routed per source type:
 

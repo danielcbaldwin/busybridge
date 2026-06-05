@@ -1,9 +1,9 @@
 """Shared failure-injection helpers for the soak tests.
 
-REWRITE_PLAN.md §14 makes the Stage-3 release gate "90 simulated
-days ... with full failure injection enabled".  These helpers turn
-the five injection modes on/off and drive the recovery phase that
-invariant 11 (recovery-within-N-cycles) measures.
+The release gate requires "90 simulated days ... with full failure
+injection enabled".  These helpers turn the five injection modes
+on/off and drive the recovery phase that invariant 11
+(recovery-within-N-cycles) measures.
 """
 
 from __future__ import annotations

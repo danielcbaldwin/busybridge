@@ -41,7 +41,7 @@ async def test_schema_tables_exist(test_db):
         "sync_log",
         "alert_queue",
         "job_locks",
-        # Ledger tables (REWRITE_PLAN.md §4)
+        # Ledger tables
         "ledger_events",
         "ledger_projections",
         "outbox_operations",

@@ -312,8 +312,8 @@ def test_full_sync_omits_cancelled_instance_overrides_with_show_deleted(fake):
 
 def test_incremental_sync_does_surface_cancelled_instance(fake):
     """The flip-side: incremental sync sees the cancellation, so
-    a sync-token-based ingest path can still notice it (the
-    rewrite plan calls this out as one of the reliable paths)."""
+    a sync-token-based ingest path can still notice it (one of the
+    reliable paths for catching recurring cancellations)."""
     body = _weekly_body(count=4)
     body["id"] = "bbparent000001"
     fake.insert_event("primary", body)
