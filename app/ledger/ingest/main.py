@@ -35,6 +35,14 @@ from app.ledger.identity import (
     derive_instance_google_event_id,
     is_managed_google_event_id,
 )
+from app.ledger.recurrence import (
+    looks_finite_recurrence,
+    occurrence_in_series,
+    parse_instant,
+    parse_recurrence_lines,
+    series_dtstart,
+    strip_r_suffix,
+)
 from app.ledger.payload import (
     render_payload,
     strip_full_copy_metadata,
@@ -224,11 +232,17 @@ async def _ingest_one_main_event(
                      FROM ledger_events WHERE id = ?""",
                 (ledger_id,),
             )).fetchone()
-            if matched is not None and matched["source_type"] == "personal":
-                # Personal calendars are authoritative read-only
-                # sources.  Deleting a Busy (personal) copy on main is
-                # drift to revert, not an instruction to suppress or
-                # delete anything from the personal source.
+            if matched is not None and matched["source_type"] in (
+                "personal", "webcal",
+            ):
+                # Personal calendars and webcal feeds are authoritative
+                # read-only sources.  Deleting a Busy copy on main (whether a
+                # whole series or a single modified occurrence) is drift to
+                # revert, not an instruction to suppress or delete anything
+                # from the source — there is nothing to propagate back, so a
+                # still-live occurrence must be re-asserted.  (Without this,
+                # a live modified webcal occurrence deleted on main was
+                # wrongly cancelled, silently dropping its busy block.)
                 await _mark_main_drift_reverted(db, ledger_id)
                 return "main_drift_reverted", ledger_id
             if matched is not None and matched["parent_canonical_uid"]:
@@ -268,14 +282,28 @@ async def _ingest_one_main_event(
         #   bumping the ledger row's version produces a fresh
         #   desired_payload_hash that re-asserts the canonical state.
         if proj_match is not None and status != "cancelled":
+            matched_id = int(proj_match["ledger_event_id"])
+            if await _managed_instance_orphaned_by_split(
+                db, user_id=user_id, ledger_event_id=matched_id,
+            ):
+                # "_R" this-and-following split race: the user edited an
+                # occurrence on the base bb-series during the window before BB
+                # truncated its own mirror, so BB adopted a base-parented copy
+                # for a date the now-truncated base no longer covers.  The
+                # covering _R segment already mirrors that date, so this base
+                # copy is a stale duplicate — revert it (cancel → the diff
+                # deletes the stray copy), leaving the segment's regular
+                # occurrence as the single correct mirror.
+                await _mark_managed_instance_cancelled(db, matched_id)
+                return "main_drift_reverted", matched_id
             outcome = await _maybe_apply_main_edit_back(
                 db, user_email=user_email,
                 owned_emails=owned_emails,
-                ledger_event_id=int(proj_match["ledger_event_id"]),
+                ledger_event_id=matched_id,
                 event=event,
             )
             if outcome is not None:
-                return outcome, int(proj_match["ledger_event_id"])
+                return outcome, matched_id
         return "our_writes_skipped", None
 
     # A recurring-event INSTANCE (carries recurringEventId).
@@ -879,6 +907,126 @@ async def _mark_managed_instance_cancelled(
             WHERE id = ?""",
         (when, when, when, ledger_event_id),
     )
+
+
+def _series_covers(parent_row, *, original_start: str, is_all_day: bool):
+    """Tri-state: does ``parent_row``'s live RRULE cover ``original_start``?"""
+    return occurrence_in_series(
+        parse_recurrence_lines(parent_row["recurrence_rule_json"]),
+        series_dtstart(
+            parent_row["start_at"], parent_row["start_timezone"],
+            is_all_day=is_all_day,
+        ),
+        parse_instant(original_start, is_all_day=is_all_day),
+        is_all_day=is_all_day,
+    )
+
+
+async def _managed_instance_orphaned_by_split(
+    db: aiosqlite.Connection, *, user_id: int, ledger_event_id: int,
+) -> bool:
+    """True when a managed recurring INSTANCE row is a stale duplicate left by
+    an "_R" this-and-following split race, and is safe to revert.
+
+    The race: a main-side edit landed on the base bb-series before BB truncated
+    it, so BB minted a base-parented instance for a date the (now
+    ``UNTIL``-truncated) base no longer contains.  The covering ``_R`` segment
+    mirrors that date independently, so the base copy is a stale duplicate.
+
+    Reverting cancels a mirror copy, so we demand POSITIVE proof, not merely
+    "the parent stopped covering it":
+
+      1. the parent series' live RRULE definitively does NOT cover the
+         occurrence's original start, AND
+      2. a DIFFERENT live segment of the SAME ``_R`` family (same base id after
+         stripping ``_R<stamp>`` suffixes) definitively DOES cover it.
+
+    Requiring (2) makes the check robust to a coverage-probe that wrongly reads
+    a covered occurrence as uncovered (e.g. a timezone/offset edge): the same
+    misread would also make the sibling look uncovered, so no revert fires —
+    we only ever cancel a copy whose date another live segment provably owns.
+    The parent's recurrence must also be structurally FINITE (carry an
+    ``UNTIL``/``COUNT``/``RDATE`` — a real this-and-following truncation), so an
+    infinite series can never be judged "stopped covering" by a probe miss.
+    Any ambiguity (indeterminate coverage, parent gone/inactive/infinite, no
+    covering sibling) yields False.  Scoped to ``client`` sources.
+
+    LIMITATIONS (all deliberately conservative — a leftover busy block, never a
+    wrongly-deleted live mirror or any source change):
+      * If the split ALSO moved the time-of-day, the covering segment occupies a
+        different instant than the orphan's original start, so (2) finds no
+        positive proof and the stale base copy is left in place.
+      * If the date is owned only by a modified-instance override (its segment
+        master gone), (2) — which scans segment masters — won't match.
+      * A genuinely user-modified occurrence re-split out from under its segment
+        is cancelled here, but that matches Google's own semantics (a
+        this-and-following split cancels post-boundary overrides), so the
+        source already dropped the edit.
+    """
+    inst = await (await db.execute(
+        """SELECT parent_canonical_uid, source_type, is_all_day,
+                  recurrence_instance_original_start
+             FROM ledger_events WHERE id = ?""",
+        (ledger_event_id,),
+    )).fetchone()
+    if (
+        inst is None
+        or inst["source_type"] != "client"
+        or not inst["parent_canonical_uid"]
+        or not inst["recurrence_instance_original_start"]
+    ):
+        return False
+    original_start = inst["recurrence_instance_original_start"]
+
+    parent = await (await db.execute(
+        """SELECT id, source_event_id, recurrence_rule_json,
+                  start_at, start_timezone, is_recurring, status
+             FROM ledger_events
+            WHERE user_id = ? AND canonical_uid = ?""",
+        (user_id, inst["parent_canonical_uid"]),
+    )).fetchone()
+    if (
+        parent is None
+        or not parent["is_recurring"]
+        or parent["status"] != "active"
+        or not parent["source_event_id"]
+    ):
+        return False
+
+    # (1) The parent must be a FINITE (truncated) series that DEFINITIVELY does
+    #     not cover the occurrence.  Requiring finiteness means "stopped
+    #     covering" is structural (a this-and-following UNTIL/COUNT boundary),
+    #     never an infinite series misjudged by a bounded probe.
+    parent_lines = parse_recurrence_lines(parent["recurrence_rule_json"])
+    if parent_lines is None or not looks_finite_recurrence(parent_lines):
+        return False
+    if _series_covers(
+        parent, original_start=original_start, is_all_day=bool(inst["is_all_day"]),
+    ) is not False:
+        return False
+
+    # (2) A different live segment of the same _R family must DEFINITIVELY
+    #     cover it — positive proof that the occurrence belongs elsewhere.
+    base_id = strip_r_suffix(parent["source_event_id"])
+    siblings = await (await db.execute(
+        """SELECT id, source_event_id, recurrence_rule_json,
+                  start_at, start_timezone, is_all_day
+             FROM ledger_events
+            WHERE user_id = ? AND source_type = 'client'
+              AND is_recurring = 1 AND parent_canonical_uid IS NULL
+              AND status = 'active' AND id != ?""",
+        (user_id, int(parent["id"])),
+    )).fetchall()
+    for sib in siblings:
+        if not sib["source_event_id"]:
+            continue
+        if strip_r_suffix(sib["source_event_id"]) != base_id:
+            continue
+        if _series_covers(
+            sib, original_start=original_start, is_all_day=bool(sib["is_all_day"]),
+        ) is True:
+            return True
+    return False
 
 
 async def _mark_native_cancelled(

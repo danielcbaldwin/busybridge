@@ -15,15 +15,20 @@ respects them uniformly.
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone
-from itertools import islice
 from typing import Optional
 
 import aiosqlite
-from dateutil.rrule import rrulestr
 
+from app.ledger.recurrence import (
+    expand_occurrences,
+    looks_finite_recurrence,
+    occurrence_key,
+    occurrence_key_from_datetime,
+    parse_recurrence_lines,
+    series_dtstart,
+)
 from app.ledger.payload import (
     ABSENT,
     PRESENT_BUSY,
@@ -197,34 +202,28 @@ async def _recurring_parent_has_no_live_occurrences(
     if not ledger["recurrence_rule_json"] or not ledger["start_at"]:
         return False
 
-    recurrence = _parse_recurrence_lines(ledger["recurrence_rule_json"])
+    recurrence = parse_recurrence_lines(ledger["recurrence_rule_json"])
     if recurrence is None:
         return False
-    if not _looks_finite_recurrence(recurrence):
+    if not looks_finite_recurrence(recurrence):
         return False
 
-    start = _parse_datetime_for_recurrence(
-        ledger["start_at"], is_all_day=bool(ledger["is_all_day"]),
+    is_all_day = bool(ledger["is_all_day"])
+    # Anchor the dtstart in the series' IANA timezone so a DST-crossing series
+    # expands on the correct wall-clock grid; expanding on the fixed start
+    # offset alone shifts every post-DST occurrence by an hour, so its keys
+    # never match the (correctly-keyed) cancelled-child rows and the parent is
+    # wrongly judged still-live (the cancel-all "ghost recurring mirror" bug).
+    start = series_dtstart(
+        ledger["start_at"], ledger["start_timezone"], is_all_day=is_all_day,
     )
     if start is None:
         return False
 
-    try:
-        rule = rrulestr("\n".join(recurrence), dtstart=start, forceset=True)
-        occurrences = list(islice(rule, 1001))
-    except Exception as e:
-        logger.warning(
-            "could not expand recurrence for ledger event %s: %s",
-            ledger["id"], e,
-        )
-        return False
-
-    if len(occurrences) > 1000:
-        logger.warning(
-            "recurrence for ledger event %s expanded to %s occurrences; "
-            "leaving parent live",
-            ledger["id"], len(occurrences),
-        )
+    occurrences = expand_occurrences(recurrence, start, cap=1000)
+    if occurrences is None:
+        # Unparseable, infinite, or very large (>cap): treat conservatively as
+        # still-live so we never prune a parent we cannot fully account for.
         return False
 
     child_rows = await (await db.execute(
@@ -237,9 +236,9 @@ async def _recurring_parent_has_no_live_occurrences(
     )).fetchall()
     inactive_by_key: dict[str, bool] = {}
     for child in child_rows:
-        key = _occurrence_key(
+        key = occurrence_key(
             child["recurrence_instance_original_start"],
-            is_all_day=bool(ledger["is_all_day"]),
+            is_all_day=is_all_day,
         )
         if key is None:
             continue
@@ -250,65 +249,10 @@ async def _recurring_parent_has_no_live_occurrences(
         inactive_by_key[key] = inactive_by_key.get(key, True) and inactive
 
     for occurrence in occurrences:
-        key = _occurrence_key_from_datetime(
-            occurrence,
-            is_all_day=bool(ledger["is_all_day"]),
-        )
+        key = occurrence_key_from_datetime(occurrence, is_all_day=is_all_day)
         if not inactive_by_key.get(key, False):
             return False
     return True
-
-
-def _parse_recurrence_lines(value: str) -> Optional[list[str]]:
-    try:
-        parsed = json.loads(value)
-    except Exception:
-        return None
-    if not isinstance(parsed, list):
-        return None
-    lines = [str(item) for item in parsed if item]
-    return lines or None
-
-
-def _looks_finite_recurrence(lines: list[str]) -> bool:
-    for line in lines:
-        upper = line.upper()
-        if upper.startswith("RRULE:") and (
-            "COUNT=" in upper or "UNTIL=" in upper
-        ):
-            return True
-        if upper.startswith("RDATE"):
-            return True
-    return False
-
-
-def _parse_datetime_for_recurrence(
-    value: str, *, is_all_day: bool,
-) -> Optional[datetime]:
-    try:
-        if is_all_day:
-            return datetime.fromisoformat(value[:10])
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
-
-
-def _occurrence_key(value: str | None, *, is_all_day: bool) -> Optional[str]:
-    if not value:
-        return None
-    dt = _parse_datetime_for_recurrence(value, is_all_day=is_all_day)
-    if dt is None:
-        return None
-    return _occurrence_key_from_datetime(dt, is_all_day=is_all_day)
-
-
-def _occurrence_key_from_datetime(dt: datetime, *, is_all_day: bool) -> str:
-    if is_all_day:
-        return dt.date().isoformat()
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC).replace(microsecond=0).isoformat()
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,82 @@
 
 ---
 
+## RESOLUTION (2026-06-05) — branch `fix/r-this-and-following-mirror`
+
+A deep adversarial session executed this brief. **Key finding:** forward `_R`
+steady-state mirror correctness was **already achieved** by the prior commits
+(no-re-key `3b1c638`, conservative `1e41a1c`, churn-breaker). Every common
+case — clean split, time-change split, pre/post boundary, source- and
+main-side moved instances, segment modify, churn-delete + re-create, and
+**multi-split chains** — already converges with **zero churn** (proven by 8
+black-box invariant tests that pass against *base* `v2`). The brief's
+"core defect" (the coverage-checkless derivation) is **latent**: Google
+cancels post-boundary base overrides on split, so a base-derived post-boundary
+id only ever addresses a cancelled tombstone that converges. The large
+`owning_source_series` resolver + migration the brief proposed was therefore
+**not built** — changing currently-correct delicate code with no failing test.
+
+Instead, a 6-agent adversarial "break-it" sweep found **5 genuine bugs**, each
+now fixed repro-first (every test below was confirmed RED on base `v2`):
+
+1. **`_R` split→reconcile RACE (the brief's real core defect).** A main-side
+   edit landing on the base bb-series *before* BB truncates its own mirror
+   minted a base-parented post-boundary orphan → a permanent duplicate main
+   copy (stable, churn=0). Fixed in `ingest/main.py`: the proj_match-present
+   branch reverts a managed recurring instance whose occurrence date its
+   parent's live RRULE no longer covers (`_managed_instance_orphaned_by_split`,
+   using the shared coverage probe). `tests/test_r_split_main_drag_race.py`.
+2. **DST-crossing cancel-all ghost** (pre-existing, not `_R`-specific).
+   `_recurring_parent_has_no_live_occurrences` expanded on the fixed start
+   offset, ignoring IANA `start_timezone`, so a DST series was never pruned.
+   Fixed by anchoring expansion in the IANA zone (`series_dtstart`).
+   `tests/test_recurring_dst_cancel_all.py`.
+3. **Webcal/personal churn-breaker gap.** The drift-revert was gated on
+   `source_type=='client'`, silently cancelling a live modified webcal
+   occurrence deleted on main. Extended the read-only revert branch to webcal.
+   `tests/test_webcal_live_instance_main_delete_reverts.py`.
+4. **Conference-link removal never propagated** (debounce only handled swaps;
+   a `None` candidate was indistinguishable from "no candidate"). Fixed with a
+   `""` "pending removal" sentinel. `tests/test_conference_removal_propagates.py`.
+5. **All-day `_R` boundary double-cover** — a fake-fidelity bug
+   (`_add_until_to_rrule` mis-read a naive all-day boundary off-UTC). Fixed in
+   the fake; covered by the all-day invariant.
+
+**New shared module `app/ledger/recurrence.py`** lifts the recurrence helpers
+out of `planner.py` (the §5.1 refactor), adds DST-aware `series_dtstart` and
+the tri-state coverage probe `occurrence_in_series` (conservative: never
+deletes a mirror on an indeterminate answer). **`tests/test_r_split_mirror_invariants.py`**
+locks the I1–I5 matrix (7 cases) so forward correctness can never silently
+regress. Full suite: **737 passed, 3 xfailed** (the 3 destructive-propagation
+xfails and 3 conservative-fix safety tests are unchanged). `OP_DELETE_SOURCE`
+stays unreachable; `source_delete_pending` stays un-armed; no re-key.
+
+**Review hardening (high-effort multi-agent code review, same session):** the
+review caught a destructive bug in the first cut — `series_dtstart` read a
+*naive wall-time + separate IANA `timeZone`* start as UTC then re-zoned,
+shifting the RRULE grid so a covered occurrence looked uncovered and the orphan
+check would have cancelled a live mirror. Fixed (anchor naive wall-time in the
+zone) AND defence-in-depth: `_managed_instance_orphaned_by_split` now reverts
+ONLY when the base definitively does not cover the date AND a live sibling `_R`
+segment definitively does (positive proof, via `strip_r_suffix` family
+grouping) — so any coverage misread can at worst miss a revert (transient
+duplicate), never wrongly delete a mirror. Also: all-day `UNTIL` is normalised
+so coverage is determinate for all-day splits (not silently `None`).
+`tests/test_recurrence_module.py` locks the probe's contract. A focused second
+review pass over the rewritten logic confirmed it SOUND (no wrong deletions, no
+oscillation, DST/fold/half-hour-zone all correct, #3 still converges); it added
+a finite-parent gate (only an `UNTIL`/`COUNT`-truncated parent can be "stopped
+covering", never an infinite series misjudged by a probe) and documented the
+deliberately-conservative leftover-busy-block limitations (time-of-day-moved
+splits, override-only siblings). Full suite **745 passed / 3 xfailed**.
+
+Still open / out of scope: the destructive main→source footnote below; a
+same-`conferenceId` URI-rotation never re-syncs (intentionally debounced out);
+webcal main-copy deletes are non-suppressible (spec-correct per `webcal.md`);
+historical recovery of the 166 occurrences.
+
+---
+
 ## 1. Problem statement
 
 "Change all events from here forward" (Google's **"this and following"**) is one of the most common edits a user makes to a recurring meeting. On a **source (client) calendar**, this edit causes Google to perform an **additive split**: it truncates the base series RRULE with an `UNTIL` just before the boundary, creates a brand-new independent series `<base>_R<YYYYMMDDTHHMMSSZ>` (with `recurringEventId=None`) covering post-boundary dates, and cancels any modified-instance overrides on the base that fell on/after the boundary (verified: `tests/fakes/google_calendar.py:1058-1161`; truncation at `:1093`, override cancel at `:1105-1121`, new segment with `recurring_event_id=None` at `:1152`). The user's mental model is "one series, changed from date X forward"; Google's storage is "two (or more) coexisting series over disjoint date ranges."

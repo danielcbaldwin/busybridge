@@ -1091,6 +1091,13 @@ def _resolve_conference(existing, fields) -> tuple[Optional[str], Optional[str],
     after the SAME value is seen on TWO consecutive ingests, so an
     alternating read never confirms.  A genuine, settled room change
     confirms on the next read and then propagates as a normal change.
+
+    A REMOVAL (the source drops its conferenceData entirely) is debounced the
+    same way: the candidate is the empty-string sentinel ``""`` — distinct from
+    ``None`` ("no candidate") — so a settled removal confirms on the second
+    read and clears the stale link.  Without the sentinel a removal's
+    ``None`` candidate was indistinguishable from "no candidate" and never
+    confirmed, leaving a dead Meet link on the mirror copy forever.
     """
     stored_json = existing["conference_data_json"]
     new_json = fields.get("conference_data_json")
@@ -1105,12 +1112,17 @@ def _resolve_conference(existing, fields) -> tuple[Optional[str], Optional[str],
         # Same room (or both have none): keep the accepted blob and drop
         # any outstanding candidate.
         return stored_json, None, False
-    if pending is not None and new_cid == pending:
-        # Confirmed on a second consecutive read: adopt the new room.
+    # A different room, or a removal (new_cid is None while a room was
+    # stored).  Encode the candidate so a removal is distinguishable from
+    # "no candidate": a real conferenceId, or "" meaning "pending removal".
+    candidate = new_cid if new_cid is not None else ""
+    if pending is not None and candidate == pending:
+        # Confirmed on a second consecutive read: adopt the new state
+        # (the new room, or — for a removal — drop the link entirely).
         return new_json, None, True
-    # First sighting of a different room: hold the accepted value and
-    # remember the candidate until the next read confirms it.
-    return stored_json, new_cid, False
+    # First sighting of the change: hold the accepted value and remember
+    # the candidate until the next read confirms it.
+    return stored_json, candidate, False
 
 
 def _canonical_instant(value: Optional[str], is_all_day: bool) -> Optional[str]:

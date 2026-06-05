@@ -1088,9 +1088,12 @@ class FakeGoogleCalendar:
                 f"event {parent_event_id} is not a recurring series"
             )
         boundary = _coerce_datetime(from_dt)
+        is_all_day = "date" in (parent.start or {})
 
         # 1. Truncate the original series.
-        new_rrule = _add_until_to_rrule(parent.recurrence, boundary)
+        new_rrule = _add_until_to_rrule(
+            parent.recurrence, boundary, is_all_day=is_all_day,
+        )
         cal.change_counter += 1
         parent.recurrence = new_rrule
         parent.updated = _to_iso_utc(self._clock.now())
@@ -1594,14 +1597,29 @@ def _shift_date(ymd: str, days: int) -> str:
 def _add_until_to_rrule(
     recurrence: list[str],
     boundary: datetime,
+    *,
+    is_all_day: bool = False,
 ) -> list[str]:
     """Return ``recurrence`` with the RRULE truncated by ``UNTIL``.
 
-    Used by the ``_R`` "this and following" reschedule simulator.
-    The UNTIL value is set to one second before ``boundary`` so the
-    instance at ``boundary`` is excluded from the original series.
+    Used by the ``_R`` "this and following" reschedule simulator so the
+    boundary occurrence belongs solely to the new ``_R`` segment.
+
+    * Timed series: ``UNTIL`` is one second before ``boundary`` (Zulu).
+    * All-day series: ``UNTIL`` is the end of the day BEFORE the boundary, in
+      UTC, computed directly from the boundary DATE (not via
+      ``boundary.astimezone(UTC)``, which mis-reads a naive all-day datetime
+      as host-local and, off-UTC, lands an hour into the boundary day —
+      double-covering the boundary occurrence).  Expanding an all-day series
+      uses a UTC-midnight dtstart, so the Zulu UNTIL stays awareness-consistent.
     """
-    until_dt = (boundary.astimezone(UTC) - timedelta(seconds=1))
+    if is_all_day:
+        boundary_midnight_utc = datetime(
+            boundary.year, boundary.month, boundary.day, tzinfo=UTC,
+        )
+        until_dt = boundary_midnight_utc - timedelta(seconds=1)
+    else:
+        until_dt = boundary.astimezone(UTC) - timedelta(seconds=1)
     until_str = until_dt.strftime("%Y%m%dT%H%M%SZ")
     out: list[str] = []
     for line in recurrence:
