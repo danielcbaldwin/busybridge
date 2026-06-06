@@ -30,6 +30,9 @@ services:
       - TEST_MODE_ALLOWED_CLIENT_EMAILS=${TEST_MODE_ALLOWED_CLIENT_EMAILS:-}
       - MANAGED_EVENT_PREFIX=${MANAGED_EVENT_PREFIX:-[BusyBridge]}
       - SERVICE_ACCOUNT_KEY_FILE=${SERVICE_ACCOUNT_KEY_FILE:-}
+      # Phase-1 organizer-delete propagation: off (default) | shadow | on.
+      # See DELETE_PROPAGATION_PLAN.md.
+      - DELETE_PROPAGATION_MODE=${DELETE_PROPAGATION_MODE:-off}
     volumes:
       - ./data:/data
       - ./secrets:/secrets
