@@ -62,13 +62,23 @@ stay read-only (deleting their mirror = drift-revert, never propagate).
 - **Still open — O-1:** does a user-deleted managed-copy *tombstone* on Google preserve our
   `extendedProperties.private.bb_proj_id`? Needs a live Google API read (do at the start of Phase 1).
 
-**Phase 1 — Single (non-recurring) event, organizer deletes on main → delete source. (LOW risk)**
-- In the `_mark_user_intentionally_deleted` path, arm `source_delete_pending` **only when**: client
-  source **AND** user is organizer/`user_can_edit` **AND** non-recurring **AND** Condition-B provenance
-  holds (the deleted main copy carried our `bb_proj_id`, i.e. it's genuinely our managed copy the user
-  removed — consumed once, with an etag/sequence change vs our last write).
-- Attendee (not organizer) → route to the existing RSVP-decline write-back instead.
-- Covers the everyday "I made a one-off meeting, deleted it on main, it should vanish at the client."
+**Phase 1 — Single (non-recurring) event, organizer deletes on main → delete source. ✅ IMPLEMENTED (default OFF) 2026-06-06.**
+- Config flag `DELETE_PROPAGATION_MODE` ∈ {off (default) | shadow | on} (`config.py`).
+- Arming: `ingest/main._maybe_arm_organizer_source_delete` — in the `_mark_user_intentionally_deleted`
+  path, arm `source_delete_pending` **only when** client source **AND** `user_can_edit` **AND**
+  non-recurring **AND** mode==on (`shadow` logs only). Provenance here is just `proj_match` (the user
+  deleted OUR managed copy, recognized by the projection's `google_event_id`) — sufficient for the
+  non-recurring case, which has no `_R` churn-artifact ambiguity. (The durable `bb_proj_id` provenance
+  AND-gate is still required for the recurring per-occurrence case — Phase 3.)
+- Gate: `diff._decide` extended — `OP_DELETE_SOURCE` now fires for an instance OR a whole NON-recurring
+  event, NEVER a recurring series master. `outbox._do_delete_source` already deletes by
+  `source_event_id` (the whole event for a non-recurring row).
+- Tests: `tests/test_delete_propagation_phase1.py` — off→survives, on→deletes, shadow→survives+not-armed,
+  recurring-series→survives, non-editable→survives. Full suite 751 passed / 3 xfailed.
+- **Default OFF → zero production behavior change** until `DELETE_PROPAGATION_MODE` is set.
+- **Deferred:** attendee (not organizer) → RSVP-decline mapping (RSVP-decline itself already works when
+  the user explicitly RSVPs no); a delete-by-an-attendee → auto-decline convenience is a follow-up.
+- **Next:** run on live in `shadow` mode for a few days, eyeball the logged candidates, then flip to `on`.
 
 **Phase 2 — Whole recurring SERIES delete (organizer) → delete source series. (MEDIUM risk)**
 - Whole-series delete is far safer than per-occurrence; target the series master deliberately and

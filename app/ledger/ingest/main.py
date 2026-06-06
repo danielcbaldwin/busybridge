@@ -27,6 +27,7 @@ from typing import Iterable, Optional
 
 import aiosqlite
 
+from app.config import get_settings
 from app.ledger.async_google import as_async_google
 from app.ledger.google_client import GoogleClient
 from app.ledger.identity import (
@@ -228,7 +229,8 @@ async def _ingest_one_main_event(
         if proj_match is not None and status == "cancelled":
             ledger_id = int(proj_match["ledger_event_id"])
             matched = await (await db.execute(
-                """SELECT parent_canonical_uid, source_type, status
+                """SELECT parent_canonical_uid, source_type, status,
+                          user_can_edit, is_recurring
                      FROM ledger_events WHERE id = ?""",
                 (ledger_id,),
             )).fetchone()
@@ -270,6 +272,7 @@ async def _ingest_one_main_event(
             # User deleted our copy on main → flip
             # user_intentionally_deleted on the source ledger row.
             await _mark_user_intentionally_deleted(db, ledger_id)
+            await _maybe_arm_organizer_source_delete(db, matched, ledger_id)
             return "user_deletes", ledger_id
         # Edit-on-main detection: the user has changed our copy.
         # Two outcomes:
@@ -865,6 +868,46 @@ async def _mark_user_intentionally_deleted(
             WHERE id = ?""",
         (when, ledger_event_id),
     )
+
+
+async def _maybe_arm_organizer_source_delete(
+    db: aiosqlite.Connection, row, ledger_event_id: int,
+) -> None:
+    """Phase-1 organizer-delete propagation (DELETE_PROPAGATION_PLAN.md).
+
+    The user deleted our managed copy of an event on main (the caller already
+    flagged ``user_intentionally_deleted``).  When that event is a NON-recurring
+    CLIENT event the user can edit (organizer / guestsCanModify / solo), and
+    delete-propagation is enabled, arm a destructive delete of the real source
+    event so it is removed at the source too — mirroring how an RSVP/edit on
+    main already writes back.
+
+    Safety: default mode ``"off"`` never propagates; ``"shadow"`` only logs.
+    Recurring events are NEVER armed here — the per-occurrence / "_R" case
+    stays disarmed pending the Layer-1/2 work (it is the path that caused the
+    2026-06-02 data loss).  The destructive op itself stays gated in
+    ``diff._decide`` on ``source_delete_pending`` + an origin-writeback
+    projection, so arming here is the only switch.
+    """
+    if not (
+        row["source_type"] == "client"
+        and row["user_can_edit"]
+        and not row["is_recurring"]
+    ):
+        return
+    mode = getattr(get_settings(), "delete_propagation_mode", "off")
+    if mode == "on":
+        await db.execute(
+            "UPDATE ledger_events SET source_delete_pending = 1 WHERE id = ?",
+            (ledger_event_id,),
+        )
+    elif mode == "shadow":
+        logger.info(
+            "delete-propagation [shadow]: WOULD delete the source event for "
+            "ledger_event id=%s (non-recurring client event the organizer "
+            "deleted on main); set DELETE_PROPAGATION_MODE=on to enable.",
+            ledger_event_id,
+        )
 
 
 async def _mark_main_drift_reverted(

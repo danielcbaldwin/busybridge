@@ -374,12 +374,20 @@ def _decide(
         # parent series.  source_delete_pending is set only for a
         # main-originated cancellation, so a cancellation ingested
         # FROM the source never re-triggers a delete.
-        if (
-            proj["parent_canonical_uid"]
-            and desired == ABSENT
-            and bool(proj["source_delete_pending"])
-        ):
-            return OP_DELETE_SOURCE, None, target_cal
+        # Fires for a recurring INSTANCE (parent_canonical_uid) OR a whole
+        # NON-recurring event — never for a recurring SERIES master (parent
+        # NULL + an RRULE), which would nuke the entire series.  Always gated
+        # on source_delete_pending, which is armed only by a deliberate,
+        # scoped user delete-on-main (see ingest/main._maybe_arm_organizer_
+        # source_delete and _mark_managed_instance_cancelled).
+        if desired == ABSENT and bool(proj["source_delete_pending"]):
+            is_instance = bool(proj["parent_canonical_uid"])
+            is_nonrecurring_whole = (
+                not proj["parent_canonical_uid"]
+                and not proj["recurrence_rule_json"]
+            )
+            if is_instance or is_nonrecurring_whole:
+                return OP_DELETE_SOURCE, None, target_cal
         if desired != PRESENT_FULL_RSVP_ONLY:
             return None, None, target_cal
         # The writeback patches an event we do NOT own, so it must fire

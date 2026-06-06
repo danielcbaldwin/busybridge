@@ -47,6 +47,15 @@ class Settings(BaseSettings):
     # real Google, watch what the new system would do, without
     # touching anything.
     ledger_dry_run: bool = False
+    # Phase-1 organizer-delete propagation (DELETE_PROPAGATION_PLAN.md).
+    #   "off"    — never propagate a delete to the source (current safe default).
+    #   "shadow" — log what WOULD be source-deleted, but never delete.
+    #   "on"     — when the user deletes our managed copy of a NON-recurring
+    #              CLIENT event they can edit on main, delete it on the source
+    #              calendar too.
+    # Recurring / per-occurrence ("_R") delete propagation is NOT covered here;
+    # it stays disarmed pending the Layer-1/2 work in the plan.
+    delete_propagation_mode: str = "off"
 
     # Test mode controls
     test_mode: bool = False

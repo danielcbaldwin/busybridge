@@ -641,15 +641,17 @@ async def _do_delete_source(
     *,
     now: datetime,
 ) -> None:
-    """Destructively delete one occurrence on the user's real source
-    calendar.
+    """Destructively delete on the user's real source calendar — either a
+    single occurrence of a managed recurring copy, or a whole non-recurring
+    event (Phase-1 organizer-delete propagation).
 
-    The user cancelled a single occurrence of a managed recurring
-    copy on the main calendar (Option A: propagate it everywhere).
-    The target is the source occurrence, addressed by the ledger
-    row's ``source_event_id`` (``<series>_<stamp>``) — exactly that
-    one occurrence, never the parent series.  Idempotent: a 404/410
-    means the occurrence is already gone, which is the goal.
+    The target is addressed by the ledger row's ``source_event_id``: for a
+    recurring instance that is ``<series>_<stamp>`` (exactly that occurrence,
+    never the parent series); for a non-recurring event it is the event's own
+    id (the whole event).  Only ever reached behind the
+    ``source_delete_pending`` gate in ``diff._decide``.  Idempotent: a 404/410
+    means it is already gone, which is the goal.  Personal sources are
+    read-only and short-circuit without calling Google.
     """
     proj = await _get_projection(db, op["projection_id"])
     led = await (await db.execute(
