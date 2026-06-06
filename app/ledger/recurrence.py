@@ -34,12 +34,15 @@ except Exception:  # pragma: no cover - defensive
 UTC = timezone.utc
 
 # Google's server-generated "this and following" split suffix is
-# ``<originalParentId>_R<YYYYMMDDTHHMMSSZ>``.  The ``R`` plus the compact-UTC
-# timestamp use uppercase characters that are ILLEGAL in client-supplied event
-# ids (Google's client alphabet is base32hex: lowercase a-v + 0-9), so this
-# anchored pattern cannot false-match a legitimate base id.  Google chains
-# splits (``<base>_R<ts1>_R<ts2>``), so strip iteratively to the ultimate base.
-_R_SUFFIX_RE = re.compile(r"_R\d{8}T\d{6}Z$")
+# ``<originalParentId>_R<YYYYMMDD>T<HHMMSS>`` — a compact timestamp.  The trailing
+# ``Z`` shown in some Google docs is OPTIONAL and is in fact absent on the real
+# ids this deployment receives (observed in production), so we accept it but do
+# not require it.  The ``R`` and ``T`` are uppercase, which are ILLEGAL in
+# client-supplied event ids (Google's client alphabet is base32hex: lowercase
+# a-v + 0-9), so this anchored pattern cannot false-match a legitimate base id
+# even without the ``Z``.  Google chains splits (``<base>_R<ts1>_R<ts2>``), so
+# strip iteratively to the ultimate base.
+_R_SUFFIX_RE = re.compile(r"_R\d{8}T\d{6}Z?$")
 
 
 def strip_r_suffix(event_id: str) -> str:

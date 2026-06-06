@@ -36,6 +36,21 @@ def test_strip_r_suffix():
     # A literal "_R" not followed by a full server timestamp is NOT stripped.
     assert strip_r_suffix("ab_Rxyz") == "ab_Rxyz"
     assert strip_r_suffix("ab_R2026") == "ab_R2026"
+    # Real Google "this and following" ids carry NO trailing ``Z`` (this is the
+    # form actually observed in production — the earlier ``Z``-only regex never
+    # matched them, leaving the family-strip a silent no-op).  Bare, chained, and
+    # mixed Z/no-Z forms must all strip to the base.
+    assert strip_r_suffix("abc_R20260617T010500") == "abc"
+    assert strip_r_suffix("abc_R20260302T090000_R20260406T110000") == "abc"
+    assert strip_r_suffix("abc_R20260302T090000Z_R20260406T110000") == "abc"
+    # An actual id pulled from the live system.
+    assert (
+        strip_r_suffix("5vmg9ua4udrgl42or6hbprr63r_R20260617T010500")
+        == "5vmg9ua4udrgl42or6hbprr63r"
+    )
+    # A plain recurring-instance suffix (no ``_R``) is NOT a split and is left
+    # intact — only "this and following" splits are stripped.
+    assert strip_r_suffix("abc_20260617T010500Z") == "abc_20260617T010500Z"
 
 
 # --- finding #2: naive wall-time + IANA zone ------------------------------
