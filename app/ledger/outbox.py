@@ -590,6 +590,26 @@ async def _do_update(
             )
             await _request_projection_replan(db, op["projection_id"])
             return "superseded"
+        if getattr(e, "status", None) == 400:
+            # A status:confirmed "revive" UPDATE on a derived instance id
+            # can hit an out-of-range, DETACHED cancelled tombstone.  When
+            # a recurring source is split "this and following", BusyBridge
+            # shrinks the old managed master's RRULE and creates a newer
+            # keeper segment that now owns the later dates — but the old
+            # exception-instance projection still derives
+            # <old_master>_<date> for a date the bounded master no longer
+            # generates.  Google keeps that id only as a cancelled
+            # exception with no recurringEventId, and rejects un-cancelling
+            # an occurrence the parent no longer contains with 400 — every
+            # retry, forever (poison-pilling it as a permanent failure).
+            # Retire the orphaned projection instead: the keeper segment
+            # already holds the correct copy, so its true desired state is
+            # absent.  Any OTHER 400 (a genuinely malformed payload) falls
+            # through to the poison-pill path so real bugs still surface.
+            if await _retire_orphaned_instance_tombstone(
+                db, google, proj, cal_id, op, now=now,
+            ):
+                return "superseded"
         raise
     await _record_success(
         db, op,
@@ -598,6 +618,94 @@ async def _do_update(
         now=now,
     )
     return "succeeded"
+
+
+async def _retire_orphaned_instance_tombstone(
+    db: aiosqlite.Connection,
+    google: GoogleClient,
+    proj: aiosqlite.Row,
+    cal_id: str,
+    op: aiosqlite.Row,
+    *,
+    now: datetime,
+) -> bool:
+    """Converge an orphaned out-of-range instance projection to absent.
+
+    Returns ``True`` (and supersedes the op) only when a 400 on an
+    instance UPDATE matches the un-revivable tombstone signature:
+
+    * the projection is a recurring-instance row (its ledger event has a
+      ``parent_canonical_uid``), AND
+    * the target Google event is a DETACHED cancelled tombstone — its
+      ``status`` is ``cancelled`` and it has no ``recurringEventId`` (the
+      now-bounded master no longer generates this occurrence), which is
+      why Google rejects the status:confirmed revive with 400.
+
+    Otherwise returns ``False`` so the caller re-raises and the existing
+    poison-pill path handles a genuinely-bad-payload 400.  The keeper
+    segment created by the split already holds the correct copy for this
+    date, so the orphaned projection's true desired state is ``absent``;
+    converging it (rather than poison-pilling) stops the endless retry.
+    The convergence uses the codebase's absent-projection convention —
+    ``desired_payload_hash`` and ``applied_payload_hash`` both set to the
+    ``'absent'`` sentinel (cf. ``planner._mark_implicit_absent``) with
+    ``applied_ledger_version == desired_ledger_version`` — so the row is
+    immediately quiescent: the diff's divergence query does not re-select
+    it, no follow-up op is enqueued, and ``google_event_id`` is cleared so
+    no live Google event is ever touched (the cancelled tombstone simply
+    stays cancelled).
+    """
+    gid = proj["google_event_id"]
+    if not gid:
+        return False
+    # Only an instance projection can hit the _R-split id-drift tombstone.
+    row = await (await db.execute(
+        """SELECT e.parent_canonical_uid
+             FROM ledger_projections p
+             JOIN ledger_events e ON e.id = p.ledger_event_id
+            WHERE p.id = ?""",
+        (int(proj["id"]),),
+    )).fetchone()
+    if row is None or not row["parent_canonical_uid"]:
+        return False
+    # Confirm the target really is a detached cancelled tombstone before
+    # giving up on it; a 400 on a still-live event is a different bug.
+    try:
+        target = await google.get_event(cal_id, gid)
+    except Exception:
+        return False  # cannot confirm — let the normal 400 path decide
+    if target.get("status") != "cancelled" or target.get("recurringEventId"):
+        return False
+    await db.execute(
+        """UPDATE ledger_projections
+              SET desired_state = 'absent',
+                  current_state = 'absent',
+                  desired_payload_hash = 'absent',
+                  applied_payload_hash = 'absent',
+                  applied_ledger_version = desired_ledger_version,
+                  google_event_id = NULL,
+                  google_etag = NULL,
+                  permanently_failed = 0,
+                  last_error = NULL,
+                  updated_at = ?
+            WHERE id = ?""",
+        (now.isoformat(), int(proj["id"])),
+    )
+    await db.commit()
+    await _mark_superseded(
+        db, op,
+        error="instance_tombstone_out_of_range",
+        http_status=400,
+        now=now,
+    )
+    logger.info(
+        "outbox: retired orphaned out-of-range instance projection %s — "
+        "google_event_id %s is a detached cancelled tombstone (its managed "
+        "master was re-bounded by a this-and-following split; the keeper "
+        "segment owns this date), converged to absent instead of poison-pill",
+        int(proj["id"]), gid,
+    )
+    return True
 
 
 async def _do_delete(
