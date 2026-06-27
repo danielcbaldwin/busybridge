@@ -19,7 +19,9 @@ never see what a given client meeting actually is.
   calendar.
 - **Personal calendar sync** — connect personal Gmail/Workspace calendars as
   **read-only** sources that cast privacy-preserving "Busy (personal)" blocks on
-  your main and all client calendars. No details are shared.
+  your main and all client calendars. No details are shared. All-day personal
+  events are not mirrored (they would only block out the whole day with no
+  information); toggle with `SYNC_PERSONAL_ALL_DAY_EVENTS`.
 - **Webcal/ICS subscriptions** — subscribe to external ICS feeds (conferences,
   travel) that mirror to your main calendar (and optionally one chosen client),
   with busy blocks elsewhere. Unstable-UID feeds are handled by content hashing.
@@ -50,6 +52,9 @@ never see what a given client meeting actually is.
   BusyBridge-managed events (for migration or external backup).
 - **Email alerts** — notifications for token revocation, unmirrorable events,
   failing calendars, webhook-registration failures, and circuit-breaker trips.
+- **History preservation** — past one-off events are *released* (frozen on the
+  calendars and retired from sync) at the retention window rather than deleted, so
+  old history stays visible; toggle with `RELEASE_EXPIRED_EVENTS`.
 - **Automated backups** — daily database + ICS backups with 7-daily / 2-weekly /
   6-monthly retention, and a drop-in restore flow.
 - **Admin dashboard** — user management, system health, sync activity, log
@@ -88,7 +93,9 @@ Event on Client A
 
 Personal calendars never receive writes. Their events cast privacy-preserving
 blocks titled **"Busy (personal)"** on your main calendar and all client
-calendars — no titles, no details.
+calendars — no titles, no details. **All-day** personal events are skipped
+entirely (an all-day "Personal" block only marks the whole day busy without
+conveying anything); set `SYNC_PERSONAL_ALL_DAY_EVENTS=true` to mirror them.
 
 ### Webcal/ICS subscriptions
 
@@ -332,10 +339,18 @@ credentials and SMTP live in the database, not here.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `EVENT_RETENTION_DAYS` | Prune single-occurrence events past their end | `30` |
+| `EVENT_RETENTION_DAYS` | Age (since end) at which a single-occurrence event is released or pruned | `30` |
+| `RELEASE_EXPIRED_EVENTS` | At the window, *release* expired one-off events (freeze their copies on the calendars, retire them from sync) instead of deleting them. `false` restores the legacy delete. Genuine cancellations are deleted either way. | `true` |
 | `RECURRING_SOFT_DELETE_DAYS` | Hard-delete cancelled series after | `30` |
 | `AUDIT_LOG_RETENTION_DAYS` | Keep `sync_log` rows | `90` |
 | `DISCONNECTED_CALENDAR_RETENTION_DAYS` | Purge disconnected calendars after | `30` |
+
+**Behavior**
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SYNC_PERSONAL_ALL_DAY_EVENTS` | Mirror all-day personal-calendar events as busy blocks. Off = suppress them everywhere (they only block the whole day with no info). | `false` |
+| `DELETE_PROPAGATION_MODE` | Propagate a delete of a managed non-recurring client copy back to the source: `off` / `shadow` (log only) / `on`. See `DELETE_PROPAGATION_PLAN.md`. | `off` |
 
 **Markers, titles & test mode**
 
@@ -365,7 +380,7 @@ In the default ledger mode (`ENABLE_LEDGER_JOBS=true`):
 | Orphan scan | every 6 h | Reclaim Google events that escaped tracking |
 | Webhook renewal | every 6 h | Renew channels expiring within 24 h |
 | Webhook registration | on startup | Register push channels for all users |
-| Retention cleanup | daily 3:00 AM | Prune expired records (fault-isolated per bucket) |
+| Retention cleanup | daily 3:00 AM | Release/prune expired records (fault-isolated per bucket) |
 | Stale alert cleanup | daily 4:00 AM | Remove old sent/failed alerts |
 | Database VACUUM | weekly Sun 4:30 AM | Reclaim space after deletes |
 | Daily backup | daily 11:00 PM | DB + ICS backup, then enforce retention |
@@ -446,6 +461,13 @@ be demoted).
   propagated back.
 - **Color coding.** Full copies take the source client calendar's color, read at
   render time; busy blocks are uncolored.
+- **Retention / history.** A one-off event past `EVENT_RETENTION_DAYS` (since its
+  end) is, by default, *released*: its copies are frozen on the calendars and the
+  event is retired from sync (planner, diff, every ingest path, and the orphan
+  scan all leave a `released` row alone — its projections are kept, so the copy
+  reads as live). Set `RELEASE_EXPIRED_EVENTS=false` to delete the copies instead.
+  Recurring series are unaffected (one mirrored event whose occurrences persist
+  while the series is active); genuine user cancellations are always deleted.
 
 ---
 
