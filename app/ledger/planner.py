@@ -21,6 +21,7 @@ from typing import Optional
 
 import aiosqlite
 
+from app.config import get_settings
 from app.ledger.recurrence import (
     expand_occurrences,
     looks_finite_recurrence,
@@ -73,6 +74,7 @@ async def plan_for_ledger_event(
         parent_inactive=parent_inactive,
         no_live_occurrences=no_live_occurrences,
         main_native_redundant=main_native_redundant,
+        sync_personal_all_day=get_settings().sync_personal_all_day_events,
     )
 
     active_clients = await _active_client_calendars(db, user_id)
@@ -264,6 +266,7 @@ def _compute_desired_projections(
     parent_inactive: bool = False,
     no_live_occurrences: bool = False,
     main_native_redundant: bool = False,
+    sync_personal_all_day: bool = True,
 ) -> dict[str, str]:
     """Return ``{role: desired_state}`` keys: 'main', 'peer_clients',
     'origin_client'.  The caller resolves 'peer_clients' against
@@ -319,6 +322,13 @@ def _compute_desired_projections(
         # Personal calendars are read-only sources.  They cast opaque
         # busy blocks onto main and client calendars, but they never
         # receive a projection or writeback target themselves.
+        #
+        # All-day personal events are suppressed everywhere (unless
+        # sync_personal_all_day): an all-day "Personal" block only marks
+        # the whole day busy on main and on every client without
+        # conveying anything, making the user look unavailable all day.
+        if bool(ledger["is_all_day"]) and not sync_personal_all_day:
+            return {"main": ABSENT, "peer_clients": ABSENT, "origin_client": ABSENT}
         return {
             "main": PRESENT_PERSONAL_BUSY,
             "peer_clients": PRESENT_PERSONAL_BUSY,

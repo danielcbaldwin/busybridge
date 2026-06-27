@@ -57,6 +57,16 @@ class Settings(BaseSettings):
     # it stays disarmed pending the Layer-1/2 work in the plan.
     delete_propagation_mode: str = "off"
 
+    # All-day personal events.  Default (False): all-day events from a
+    # personal (read-only) calendar are NOT mirrored anywhere — they
+    # only block out the entire day on main and on every client calendar
+    # without conveying any information, making the user look unavailable
+    # all day.  Timed personal events still cast their opaque busy blocks
+    # as before.  Set True to restore the legacy behavior (all-day
+    # personal events cast full-day "Personal" busy blocks on main +
+    # clients).
+    sync_personal_all_day_events: bool = False
+
     # Test mode controls
     test_mode: bool = False
     test_mode_allowed_home_emails: str = ""

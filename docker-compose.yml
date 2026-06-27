@@ -33,6 +33,11 @@ services:
       # Phase-1 organizer-delete propagation: off (default) | shadow | on.
       # See DELETE_PROPAGATION_PLAN.md.
       - DELETE_PROPAGATION_MODE=${DELETE_PROPAGATION_MODE:-off}
+      # Mirror all-day personal-calendar events as busy blocks. Default
+      # false: all-day personal events are suppressed everywhere (they
+      # only block out the whole day with no information). Set true to
+      # restore the legacy full-day "Personal" busy blocks.
+      - SYNC_PERSONAL_ALL_DAY_EVENTS=${SYNC_PERSONAL_ALL_DAY_EVENTS:-false}
     volumes:
       - ./data:/data
       - ./secrets:/secrets

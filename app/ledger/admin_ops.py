@@ -481,6 +481,51 @@ async def retry_permanent_failures(
 
 
 # ---------------------------------------------------------------------------
+# Personal all-day cleanup
+# ---------------------------------------------------------------------------
+async def cleanup_personal_all_day_blocks(
+    db: aiosqlite.Connection,
+    *,
+    user_id: Optional[int] = None,
+) -> int:
+    """Re-plan every active all-day personal event so the next reconcile
+    removes the now-suppressed busy blocks from main and every client.
+
+    Turning ``SYNC_PERSONAL_ALL_DAY_EVENTS`` off changes the *desired*
+    projection for all-day personal events to absent, but the reconciler
+    only re-plans events that changed since the last pass — a static
+    all-day personal event (birthday, vacation, OOO) never re-ingests, so
+    its already-written busy blocks would linger.  Marking those rows
+    affected makes the planner recompute them to absent; the diff then
+    deletes the stale main/client copies (it diverges on the payload
+    hash, so no ledger-version bump is needed).
+
+    Scoped to one user when ``user_id`` is given; otherwise sweeps every
+    user.  Idempotent — a second run finds nothing new diverged.  Returns
+    the number of ledger events enqueued for replan.
+    """
+    params: list = []
+    clause = ""
+    if user_id is not None:
+        clause = " AND user_id = ?"
+        params.append(user_id)
+    rows = await (await db.execute(
+        f"""SELECT id, user_id FROM ledger_events
+              WHERE source_type = 'personal'
+                AND is_all_day = 1
+                AND status = 'active'{clause}""",
+        params,
+    )).fetchall()
+    by_user: dict[int, list[int]] = {}
+    for row in rows:
+        by_user.setdefault(int(row["user_id"]), []).append(int(row["id"]))
+    for uid, ids in by_user.items():
+        await _append_affected(db, user_id=uid, ledger_ids=ids)
+    await db.commit()
+    return sum(len(ids) for ids in by_user.values())
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 async def _append_affected(
