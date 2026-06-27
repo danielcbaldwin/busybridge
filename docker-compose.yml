@@ -38,6 +38,11 @@ services:
       # only block out the whole day with no information). Set true to
       # restore the legacy full-day "Personal" busy blocks.
       - SYNC_PERSONAL_ALL_DAY_EVENTS=${SYNC_PERSONAL_ALL_DAY_EVENTS:-false}
+      # Expired one-off events. Default true: an event past
+      # EVENT_RETENTION_DAYS is RELEASED (left frozen on the calendars,
+      # retired from sync) instead of deleted, so old history is kept.
+      # Set false for the legacy behavior (delete the managed copies).
+      - RELEASE_EXPIRED_EVENTS=${RELEASE_EXPIRED_EVENTS:-true}
     volumes:
       - ./data:/data
       - ./secrets:/secrets

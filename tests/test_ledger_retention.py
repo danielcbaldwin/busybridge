@@ -23,6 +23,26 @@ UTC = timezone.utc
 pytestmark = pytest.mark.asyncio
 
 
+def _pin_release_mode(monkeypatch, release: bool) -> None:
+    """Force the retention cleanup's release_expired_events flag.
+
+    Replaces cleanup's get_settings with a SimpleNamespace carrying the
+    real retention windows plus the chosen release flag, so a test does
+    not depend on the live default (which is release=True)."""
+    from types import SimpleNamespace
+    import app.jobs.cleanup as cleanup_mod
+    from app.config import get_settings as _gs
+    real = _gs()
+    fake = SimpleNamespace(
+        event_retention_days=real.event_retention_days,
+        recurring_soft_delete_days=real.recurring_soft_delete_days,
+        audit_log_retention_days=real.audit_log_retention_days,
+        disconnected_calendar_retention_days=real.disconnected_calendar_retention_days,
+        release_expired_events=release,
+    )
+    monkeypatch.setattr(cleanup_mod, "get_settings", lambda: fake)
+
+
 async def _seed_user(db, email: str = "ret@example.com") -> int:
     cursor = await db.execute(
         """INSERT INTO users (email, google_user_id, display_name)
@@ -172,11 +192,15 @@ async def test_disconnected_calendars_age_out(test_db):
 # Orphan-safe retention
 # ---------------------------------------------------------------------------
 async def test_active_expired_event_with_live_projection_is_cancelled_not_deleted(
-    test_db,
+    test_db, monkeypatch,
 ):
     """An expired event whose busy block is still live on Google must
     NOT be hard-deleted — that would orphan the Google copy.  It is
-    cancelled and re-planned; the next reconcile drains the delete."""
+    cancelled and re-planned; the next reconcile drains the delete.
+
+    This is the legacy DELETE mode (release_expired_events=False); the
+    default release mode is covered in test_expired_event_release.py."""
+    _pin_release_mode(monkeypatch, False)
     db = await get_database()
     user_id = await _seed_user(db, "reta@example.com")
     long_ago = (datetime.utcnow() - timedelta(days=60)).isoformat()

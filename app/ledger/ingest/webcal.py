@@ -438,8 +438,10 @@ async def _ingest_ics_event(
         )).fetchone()
         if existing is None:
             return "skipped", None, canonical
-        if existing["status"] == "cancelled":
-            return "skipped", int(existing["id"]), canonical
+        if existing["status"] in ("cancelled", "released"):
+            # 'released' = retired from sync (frozen on the calendars on
+            # purpose); a feed cancellation must not delete its copy.
+            return "skipped", None, canonical
         await _mark_cancelled(db, ledger_event_id=int(existing["id"]), now=now)
         return "cancelled", int(existing["id"]), canonical
 
@@ -472,6 +474,11 @@ async def _ingest_ics_event(
                 WHERE user_id = ? AND canonical_uid = ?""",
             (user_id, canonical),
         )).fetchone()
+
+    # A 'released' event was retired from sync by retention (frozen on the
+    # calendars on purpose); never re-ingest or un-release it.
+    if existing is not None and existing["status"] == "released":
+        return "skipped", None, canonical
 
     if existing is None:
         cursor = await db.execute(

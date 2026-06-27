@@ -55,6 +55,7 @@ async def run_retention_cleanup() -> dict:
 
     summary = {
         "expired_events_cancelled": 0,
+        "expired_events_released": 0,
         "expired_ledger_events": 0,
         "deleted_recurring_series": 0,
         "old_sync_logs": 0,
@@ -147,14 +148,26 @@ async def _prune_settled_outbox(db, now, settings, summary) -> None:
 
 
 async def _expire_single_events(db, now, settings, summary) -> None:
-    """Cancel + re-plan expired single events, then hard-delete the
-    ones whose projections have all drained.
+    """Age out expired single events, then hard-delete genuinely-cancelled
+    rows whose projections have all drained.
 
-    Active expired events are CANCELLED and re-planned — the planner
-    drives every projection to 'absent' and the next reconcile's diff
-    drains the Google deletes.  Only rows whose projections have all
-    drained ('present' nowhere) are then hard-deleted: deleting a row
-    with a live projection would orphan its Google copy.
+    Two retention modes for an active one-off event past
+    ``event_retention_days`` (by end time):
+
+    * ``release_expired_events`` True (default) — RELEASE it: flip status
+      to 'released' and leave its copies frozen on main + every client.
+      The planner, diff, and ingest all skip a 'released' row, so it is
+      retired from sync without deleting anything — old calendar history
+      is preserved.  No re-plan: the projections stay exactly as they are.
+    * ``release_expired_events`` False — CANCEL it and re-plan, so the
+      planner drives every projection to 'absent' and the next reconcile's
+      diff drains the Google deletes (the legacy behavior).
+
+    The final hard-delete only ever removes status='cancelled' rows whose
+    projections have all drained ('present' nowhere) — genuine user
+    cancellations and legacy delete-mode expiry.  'released' rows are
+    never hard-deleted: deleting them would either orphan their live copy
+    or (once forgotten) let a full re-sync recreate them.
     """
     from app.ledger.planner import plan_for_ledger_event
 
@@ -163,24 +176,41 @@ async def _expire_single_events(db, now, settings, summary) -> None:
         now - timedelta(days=settings.event_retention_days)
     ).isoformat()
 
-    cancelled_rows = await (await db.execute(
-        """UPDATE ledger_events
-              SET status = 'cancelled',
-                  cancelled_at = COALESCE(cancelled_at, ?),
-                  version = version + 1,
-                  updated_at = ?
-            WHERE is_recurring = 0
-              AND status = 'active'
-              AND end_at IS NOT NULL
-              AND end_at < ?
-            RETURNING id""",
-        (nowiso, nowiso, event_cutoff),
-    )).fetchall()
-    summary["expired_events_cancelled"] = len(cancelled_rows)
-    # Re-plan each freshly-cancelled row so its projections flip to
-    # 'absent' and become diverged; the next reconcile drains them.
-    for row in cancelled_rows:
-        await plan_for_ledger_event(db, ledger_event_id=int(row["id"]))
+    if getattr(settings, "release_expired_events", True):
+        released_rows = await (await db.execute(
+            """UPDATE ledger_events
+                  SET status = 'released',
+                      version = version + 1,
+                      updated_at = ?
+                WHERE is_recurring = 0
+                  AND status = 'active'
+                  AND end_at IS NOT NULL
+                  AND end_at < ?
+                RETURNING id""",
+            (nowiso, event_cutoff),
+        )).fetchall()
+        summary["expired_events_released"] = len(released_rows)
+        # Deliberately NOT re-planned: the projections must stay frozen
+        # (present) so the copies remain on the calendars.
+    else:
+        cancelled_rows = await (await db.execute(
+            """UPDATE ledger_events
+                  SET status = 'cancelled',
+                      cancelled_at = COALESCE(cancelled_at, ?),
+                      version = version + 1,
+                      updated_at = ?
+                WHERE is_recurring = 0
+                  AND status = 'active'
+                  AND end_at IS NOT NULL
+                  AND end_at < ?
+                RETURNING id""",
+            (nowiso, nowiso, event_cutoff),
+        )).fetchall()
+        summary["expired_events_cancelled"] = len(cancelled_rows)
+        # Re-plan each freshly-cancelled row so its projections flip to
+        # 'absent' and become diverged; the next reconcile drains them.
+        for row in cancelled_rows:
+            await plan_for_ledger_event(db, ledger_event_id=int(row["id"]))
 
     cursor = await db.execute(
         """DELETE FROM ledger_events

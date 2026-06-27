@@ -219,6 +219,11 @@ async def _ingest_one(
         (user_id, canonical),
     )).fetchone()
 
+    # A 'released' event was retired from sync by retention (frozen on the
+    # calendars on purpose); never re-ingest or un-release it.
+    if existing is not None and existing["status"] == "released":
+        return "skipped", None
+
     if status == "cancelled":
         if existing is None:
             return "skipped", None

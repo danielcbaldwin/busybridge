@@ -218,7 +218,8 @@ async def _ingest_one_main_event(
     is_our_write = is_managed_google_event_id(event_id)
     proj_match = await (await db.execute(
         """SELECT p.id AS projection_id, p.ledger_event_id,
-                  p.google_etag, p.applied_payload_hash
+                  p.google_etag, p.applied_payload_hash,
+                  e.status AS ledger_status
              FROM ledger_projections p
              JOIN ledger_events e ON e.id = p.ledger_event_id
             WHERE p.google_event_id = ? AND e.user_id = ?
@@ -226,6 +227,12 @@ async def _ingest_one_main_event(
         (event_id, user_id),
     )).fetchone()
     if proj_match is not None or is_our_write:
+        # A 'released' event is retired from sync — its copy is frozen on
+        # main on purpose.  Leave it fully alone: do not revert drift,
+        # propagate a main-side edit, or (critically) arm a source delete
+        # if the user removes the frozen copy.  Hands off.
+        if proj_match is not None and proj_match["ledger_status"] == "released":
+            return "our_writes_skipped", None
         if proj_match is not None and status == "cancelled":
             ledger_id = int(proj_match["ledger_event_id"])
             matched = await (await db.execute(
@@ -358,6 +365,11 @@ async def _ingest_one_main_event(
             WHERE user_id = ? AND canonical_uid = ?""",
         (user_id, canonical),
     )).fetchone()
+
+    # A 'released' event was retired from sync by retention (frozen on the
+    # calendars on purpose); never re-ingest, update, or un-release it.
+    if existing is not None and existing["status"] == "released":
+        return "skipped", None
 
     if status == "cancelled":
         if existing is None:

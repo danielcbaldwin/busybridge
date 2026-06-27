@@ -387,6 +387,13 @@ async def _ingest_one_event(
         (user_id, canonical),
     )).fetchone()
 
+    # A 'released' event was retired from sync by retention (its copies
+    # are frozen on the calendars on purpose).  Never re-ingest, update,
+    # or un-release it — a full re-sync re-lists old events, and this is
+    # what keeps them frozen.
+    if existing is not None and existing["status"] == "released":
+        return "skipped", None
+
     # 3. Cancellations: flip to status=cancelled (don't delete the row).
     if status == "cancelled":
         if existing is None:
@@ -579,6 +586,11 @@ async def _ingest_instance(
             WHERE user_id = ? AND canonical_uid = ?""",
         (user_id, instance_canonical),
     )).fetchone()
+
+    # A 'released' instance was retired from sync by retention (frozen on
+    # the calendars on purpose); never re-ingest or un-release it.
+    if existing is not None and existing["status"] == "released":
+        return "skipped", None
 
     # Cancelled instance — sticky ledger row that survives parent
     # full-sync (since incremental sync surfaces the cancellation

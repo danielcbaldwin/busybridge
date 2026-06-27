@@ -58,6 +58,14 @@ async def plan_for_ledger_event(
     Returns the number of projection rows written or updated.
     """
     ledger = await _get_ledger_row(db, ledger_event_id)
+
+    # A 'released' event has been retired from sync by retention: its
+    # copies are frozen on the calendars on purpose (history past the
+    # retention window).  Leave its projections exactly as they are —
+    # recomputing them would either delete the frozen copies or churn.
+    if ledger["status"] == "released":
+        return 0
+
     user_id = int(ledger["user_id"])
 
     # A modified-instance row's desired state also depends on its

@@ -111,6 +111,17 @@ class Settings(BaseSettings):
     audit_log_retention_days: int = 90
     disconnected_calendar_retention_days: int = 30
 
+    # Expired one-off events.  When True (default), a non-recurring event
+    # whose end is past ``event_retention_days`` is RELEASED rather than
+    # deleted: its copies are left frozen on main + every client calendar
+    # and it is retired from sync (planner, diff, and ingest all skip a
+    # ``released`` row), so old calendar history is preserved instead of
+    # being erased at the retention window.  Set False to restore the
+    # legacy behavior (cancel the event and delete its managed copies once
+    # past the window).  Genuine user cancellations are deleted in either
+    # mode — only age-based expiry is affected.
+    release_expired_events: bool = True
+
     # Service account
     # service_account_key_file was removed at the cutover.  Kept as a
     # no-op field on Settings only if the env var is set, since
