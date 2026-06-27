@@ -131,8 +131,11 @@ class Settings(BaseSettings):
     # Google Calendar
     calendar_sync_tag: str = "calendarSyncEngine"
     managed_event_prefix: str = "[BusyBridge]"
-    busy_block_title: str = "Busy"
-    personal_busy_block_title: str = "Personal"
+    # Titles of the opaque placeholder copies (read at render time in
+    # app/ledger/payload.py).  Defaults are the historical rendered
+    # values, so changing nothing keeps every existing block byte-stable.
+    busy_block_title: str = "Busy"  # client busy block (a main/client source)
+    personal_busy_block_title: str = "Busy (personal)"  # personal-source block
 
     class Config:
         env_file = ".env"

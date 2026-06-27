@@ -357,7 +357,8 @@ credentials and SMTP live in the database, not here.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MANAGED_EVENT_PREFIX` | Tag appended to managed event descriptions (empty disables) | `[BusyBridge]` |
-| `BUSY_BLOCK_TITLE` | Title of client busy blocks | `Busy` |
+| `BUSY_BLOCK_TITLE` | Title of busy blocks from main/client sources | `Busy` |
+| `PERSONAL_BUSY_BLOCK_TITLE` | Title of busy blocks from personal sources | `Busy (personal)` |
 | `TEST_MODE` | Gmail-safe testing mode (see below) | `false` |
 | `TEST_MODE_ALLOWED_HOME_EMAILS` | Home-login email allowlist | _(none)_ |
 | `TEST_MODE_ALLOWED_CLIENT_EMAILS` | Client-connect email allowlist | _(none)_ |

@@ -214,7 +214,7 @@ def _render_full_copy(
 def _render_busy_block(row: dict) -> dict:
     """Opaque "Busy" placeholder on a peer client calendar."""
     body: dict[str, Any] = {
-        "summary": BUSY_SUMMARY,
+        "summary": _busy_title(),
         "start": _start_dict(row),
         "end": _end_dict(row),
         "transparency": "opaque",
@@ -232,7 +232,7 @@ def _render_personal_busy(row: dict) -> dict:
     """Opaque "Busy (personal)" placeholder.  No detail leaks across
     the personal/work boundary."""
     body: dict[str, Any] = {
-        "summary": PERSONAL_BUSY_SUMMARY,
+        "summary": _personal_busy_title(),
         "start": _start_dict(row),
         "end": _end_dict(row),
         "transparency": "opaque",
@@ -316,6 +316,21 @@ def managed_tag() -> str:
     ``MANAGED_EVENT_PREFIX``; an empty value disables tagging.
     """
     return (get_settings().managed_event_prefix or "").strip()
+
+
+def _busy_title() -> str:
+    """Title of a client busy block; ``BUSY_BLOCK_TITLE`` (default 'Busy').
+    Read at render time, like the managed prefix; the default matches the
+    historical literal so existing blocks stay byte-stable."""
+    return getattr(get_settings(), "busy_block_title", "") or BUSY_SUMMARY
+
+
+def _personal_busy_title() -> str:
+    """Title of a personal-source busy block; ``PERSONAL_BUSY_BLOCK_TITLE``
+    (default 'Busy (personal)')."""
+    return getattr(
+        get_settings(), "personal_busy_block_title", "",
+    ) or PERSONAL_BUSY_SUMMARY
 
 
 def _attendee_display_name(att: dict) -> str:
