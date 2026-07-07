@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
@@ -62,8 +63,15 @@ async def _pause_mode(
         global_row = await (await db.execute(
             "SELECT value_plain FROM settings WHERE key = 'sync_paused'",
         )).fetchone()
-    except Exception:
-        # Minimal test databases may omit the settings table.
+    except sqlite3.OperationalError as e:
+        # ONLY a missing settings table is tolerated — minimal test
+        # databases omit it.  Any other failure (locked DB, disk I/O
+        # error, corruption) must propagate: this read is the admin
+        # "pause everything" emergency stop, and swallowing a real
+        # error would silently fail OPEN — the pass would proceed to
+        # ingest/diff/drain while the operator believes sync is frozen.
+        if "no such table" not in str(e).lower():
+            raise
         global_row = None
     if global_row and global_row["value_plain"] == "true":
         return "global"
@@ -155,11 +163,15 @@ async def reconcile_user(
         "paused": paused,
     }
 
-    # Record the outbox high-water mark before any enqueue so a
-    # dry-run can identify — and discard — exactly the rows this pass
-    # creates, without touching real work queued by an earlier pass.
-    dry_run_watermark = (
-        await _outbox_watermark(db, user_id) if dry_run else 0
+    # Snapshot the outbox before any enqueue so a dry-run can undo
+    # exactly what this pass does to it: the snapshot's high-water mark
+    # identifies the rows the pass CREATES (discarded afterwards), and
+    # the per-row statuses let the discard also restore any
+    # PRE-EXISTING row that ``enqueue`` mutated in place (conflict
+    # resurrection, supersede) — see _discard_dry_run_outbox.
+    dry_run_snapshot = (
+        await _snapshot_dry_run_outbox(db, user_id=user_id)
+        if dry_run else {}
     )
 
     # Diff/outbox needs the Google ID for any calendar a projection
@@ -179,29 +191,19 @@ async def reconcile_user(
     if paused:
         # Skip ingest + plan (don't pull new state).  But DO run
         # diff+drain so admin-staged cleanup work (cleanup_and_pause
-        # sets projections to absent) can converge.  The fixed-point
-        # loop below handles this uniformly.
-        out["drain"] = {"processed": 0, "succeeded": 0, "retried": 0,
-                        "failed_permanent": 0, "superseded": 0}
-        for _ in range(3):
-            enq = await diff_and_enqueue_for_user(
-                db, user_id=user_id,
-                main_calendar_id=main_google_calendar_id,
-                google_calendar_id_for=google_id_for,
-                now=now,
-            )
-            out["enqueued"] += enq
-            await db.commit()
-            if not drain:
-                break
-            counters = await drain_user(db, google, user_id=user_id, now=now)
-            for k, v in counters.items():
-                out["drain"][k] = out["drain"].get(k, 0) + v
-            if counters["processed"] == 0 and counters["superseded"] == 0:
-                break
+        # sets projections to absent) can converge.
+        await _diff_drain_until_quiescent(
+            db, google,
+            user_id=user_id,
+            main_calendar_id=main_google_calendar_id,
+            google_calendar_id_for=google_id_for,
+            drain=drain,
+            now=now,
+            out=out,
+        )
         if dry_run:
             out["preview_operations"] = await _discard_dry_run_outbox(
-                db, user_id=user_id, watermark=dry_run_watermark,
+                db, user_id=user_id, snapshot=dry_run_snapshot,
             )
         return out
 
@@ -315,39 +317,21 @@ async def reconcile_user(
             db, row_ids=[rid for rid, _ in affected_rows],
         )
 
-    # 4. Diff + drain + replan loop.  An etag-mismatch on update
-    #    marks an op superseded and clears the projection's
-    #    applied_ledger_version (asking for a replan).  Iterating
-    #    until quiescent lets revert-on-drift converge in one
-    #    reconcile pass instead of waiting for the next caller.
-    #    A hard cap (3 inner passes) guards against infinite
-    #    bounce; soak tests cover the edge cases.
-    max_inner_passes = 3
-    out["drain"] = {"processed": 0, "succeeded": 0, "retried": 0,
-                    "failed_permanent": 0, "superseded": 0}
-    for _ in range(max_inner_passes):
-        enq = await diff_and_enqueue_for_user(
-            db,
-            user_id=user_id,
-            main_calendar_id=main_google_calendar_id,
-            google_calendar_id_for=google_id_for,
-            now=now,
-        )
-        out["enqueued"] += enq
-        await db.commit()
-        if not drain:
-            break
-        drain_counters = await drain_user(db, google, user_id=user_id, now=now)
-        for k, v in drain_counters.items():
-            out["drain"][k] = out["drain"].get(k, 0) + v
-        # If nothing was processed AND nothing was superseded
-        # (which would trigger another replan), we're done.
-        if drain_counters["processed"] == 0 and drain_counters["superseded"] == 0:
-            break
+    # 4. Diff + drain + replan fixed-point loop (see
+    #    _diff_drain_until_quiescent for the convergence rationale).
+    await _diff_drain_until_quiescent(
+        db, google,
+        user_id=user_id,
+        main_calendar_id=main_google_calendar_id,
+        google_calendar_id_for=google_id_for,
+        drain=drain,
+        now=now,
+        out=out,
+    )
 
     if dry_run:
         out["preview_operations"] = await _discard_dry_run_outbox(
-            db, user_id=user_id, watermark=dry_run_watermark,
+            db, user_id=user_id, snapshot=dry_run_snapshot,
         )
 
     return out
@@ -439,22 +423,15 @@ async def audit_user(
         int(c["id"]): c["google_calendar_id"]
         for c in (all_known_client_calendars or client_calendars)
     }
-    for _ in range(3):
-        out["enqueued"] += await diff_and_enqueue_for_user(
-            db,
-            user_id=user_id,
-            main_calendar_id=main_google_calendar_id,
-            google_calendar_id_for=google_id_for,
-            now=now,
-        )
-        await db.commit()
-        if not drain:
-            break
-        dc = await drain_user(db, google, user_id=user_id, now=now)
-        for k, v in dc.items():
-            out["drain"][k] = out["drain"].get(k, 0) + v
-        if dc["processed"] == 0 and dc["superseded"] == 0:
-            break
+    await _diff_drain_until_quiescent(
+        db, google,
+        user_id=user_id,
+        main_calendar_id=main_google_calendar_id,
+        google_calendar_id_for=google_id_for,
+        drain=drain,
+        now=now,
+        out=out,
+    )
     return out
 
 
@@ -518,38 +495,152 @@ async def _audit_client_calendar(
             break
 
 
-async def _outbox_watermark(db: aiosqlite.Connection, user_id: int) -> int:
-    """Highest outbox row id for a user, or 0 when the queue is empty."""
-    row = await (await db.execute(
-        "SELECT COALESCE(MAX(id), 0) AS m FROM outbox_operations WHERE user_id = ?",
+async def _diff_drain_until_quiescent(
+    db: aiosqlite.Connection,
+    google: GoogleClient,
+    *,
+    user_id: int,
+    main_calendar_id: str,
+    google_calendar_id_for: dict[int, str],
+    drain: bool,
+    now: Optional[datetime],
+    out: dict,
+    max_passes: int = 3,
+) -> None:
+    """Run the diff → drain → replan fixed-point loop until quiescent.
+
+    An etag-mismatch on update marks an op superseded and clears the
+    projection's ``applied_ledger_version`` (asking for a replan).
+    Iterating until nothing was processed AND nothing was superseded
+    (which would trigger another replan) lets revert-on-drift converge
+    in one pass instead of waiting for the next caller.  ``max_passes``
+    is a hard cap guarding against infinite bounce; soak tests cover
+    the edge cases.
+
+    Shared by ``reconcile_user`` — both the per-user-paused branch
+    (where staged cleanup still has to converge) and the normal path —
+    and ``audit_user``.  Accumulates into ``out["enqueued"]`` and
+    ``out["drain"]`` in place; the drain counters dict is (re)seeded
+    with all five keys so callers can index them unconditionally even
+    when ``drain`` is off and no drain ever runs.
+    """
+    counters_out = out.setdefault("drain", {})
+    for key in ("processed", "succeeded", "retried",
+                "failed_permanent", "superseded"):
+        counters_out.setdefault(key, 0)
+    for _ in range(max_passes):
+        enq = await diff_and_enqueue_for_user(
+            db,
+            user_id=user_id,
+            main_calendar_id=main_calendar_id,
+            google_calendar_id_for=google_calendar_id_for,
+            now=now,
+        )
+        out["enqueued"] += enq
+        await db.commit()
+        if not drain:
+            break
+        drain_counters = await drain_user(db, google, user_id=user_id, now=now)
+        for k, v in drain_counters.items():
+            counters_out[k] = counters_out.get(k, 0) + v
+        # If nothing was processed AND nothing was superseded
+        # (which would trigger another replan), we're done.
+        if drain_counters["processed"] == 0 and drain_counters["superseded"] == 0:
+            break
+
+
+# The outbox columns ``enqueue`` can rewrite on a PRE-EXISTING row: the
+# conflict-resurrection UPDATE touches all of them; the supersede step
+# touches status + completed_at.  A dry-run snapshot captures exactly
+# this set so the discard can restore a mutated row byte-for-byte.
+_OUTBOX_SNAPSHOT_COLUMNS = (
+    "status", "attempts", "next_attempt_at", "last_error",
+    "last_http_status", "payload_json", "started_at", "completed_at",
+    "ledger_version_at_enqueue", "desired_payload_hash",
+)
+
+
+async def _snapshot_dry_run_outbox(
+    db: aiosqlite.Connection, *, user_id: int,
+) -> dict[int, aiosqlite.Row]:
+    """Snapshot a user's outbox rows before a dry-run pass.
+
+    The snapshot serves two purposes in :func:`_discard_dry_run_outbox`:
+    its highest id is the high-water mark separating rows the pass
+    CREATES (deleted on discard) from pre-existing real work, and the
+    per-row column values let the discard restore any pre-existing row
+    the pass MUTATED in place.  Taken under the per-user reconcile
+    lock, so it cannot race a concurrent enqueue/drain for this user.
+    """
+    rows = await (await db.execute(
+        f"""SELECT id, {', '.join(_OUTBOX_SNAPSHOT_COLUMNS)}
+              FROM outbox_operations
+             WHERE user_id = ?""",
         (user_id,),
-    )).fetchone()
-    return int(row["m"])
+    )).fetchall()
+    return {int(r["id"]): r for r in rows}
 
 
 async def _discard_dry_run_outbox(
-    db: aiosqlite.Connection, *, user_id: int, watermark: int,
+    db: aiosqlite.Connection,
+    *,
+    user_id: int,
+    snapshot: dict[int, aiosqlite.Row],
 ) -> list[dict]:
-    """Capture, then delete, the outbox rows a dry-run pass enqueued.
+    """Capture the writes a dry-run pass staged, then undo the outbox.
 
     The diff step always enqueues — there is no preview mode in it —
-    so a dry-run leaves real ``pending`` rows behind.  Left in place a
-    later reconcile would drain them to Google.  Every row above
-    ``watermark`` was created by this pass (rows at or below it are
-    pre-existing real work and are left untouched).  This runs under
-    the per-user reconcile lock, so no drain can claim a row between
-    the capture and the delete.
+    so a dry-run leaves real ``pending`` work behind, in two shapes:
+
+    * NEW rows (id above the snapshot's high-water mark).  Captured
+      into the preview, then deleted.
+    * PRE-EXISTING rows ``enqueue`` mutated in place.  Its conflict-
+      resurrection path flips a done/superseded row (same idempotency
+      key re-derived) back to ``pending`` — id at or below the
+      watermark, so deleting above it both omits the op from the
+      preview and leaves a live pending op a later pass would drain,
+      violating the dry-run guarantee.  Its supersede step can also
+      knock a pre-existing pending op (real queued work) to
+      ``superseded``.  Both are detected by comparing statuses against
+      the snapshot — every in-place mutation changes ``status`` —
+      and restored to their snapshotted column values; resurrected
+      rows (now pending) additionally join the preview, since they are
+      writes the pass would have sent.
+
+    This runs under the per-user reconcile lock, so no drain can claim
+    a row between the capture and the delete/restore.
     """
-    rows = await (await db.execute(
-        """SELECT o.id, o.operation, o.target_google_calendar_id,
-                  o.payload_json, e.summary, e.canonical_uid,
-                  p.target_kind
-             FROM outbox_operations o
-             JOIN ledger_projections p ON p.id = o.projection_id
-             JOIN ledger_events e ON e.id = p.ledger_event_id
-            WHERE o.user_id = ? AND o.id > ?
-            ORDER BY o.id""",
+    watermark = max(snapshot, default=0)
+    changed = await (await db.execute(
+        "SELECT id, status FROM outbox_operations WHERE user_id = ? AND id <= ?",
         (user_id, watermark),
+    )).fetchall()
+    changed_ids = [
+        int(r["id"]) for r in changed
+        if r["status"] != snapshot[int(r["id"])]["status"]
+    ]
+    # Resurrected = mutated back to pending (in_flight is impossible
+    # here: a dry-run forces the drain off, so nothing claims rows).
+    resurrected_ids = [
+        int(r["id"]) for r in changed
+        if r["status"] == "pending"
+        and snapshot[int(r["id"])]["status"] != "pending"
+    ]
+
+    # Preview: everything this pass would have sent — new rows plus
+    # resurrected pre-existing ones, in queue (id) order.
+    id_marks = ",".join("?" * len(resurrected_ids))
+    rows = await (await db.execute(
+        f"""SELECT o.id, o.operation, o.target_google_calendar_id,
+                   o.payload_json, e.summary, e.canonical_uid,
+                   p.target_kind
+              FROM outbox_operations o
+              JOIN ledger_projections p ON p.id = o.projection_id
+              JOIN ledger_events e ON e.id = p.ledger_event_id
+             WHERE o.user_id = ?
+               AND (o.id > ?{f' OR o.id IN ({id_marks})' if resurrected_ids else ''})
+             ORDER BY o.id""",
+        (user_id, watermark, *resurrected_ids),
     )).fetchall()
     preview: list[dict] = []
     for r in rows:
@@ -563,10 +654,20 @@ async def _discard_dry_run_outbox(
             "canonical_uid": r["canonical_uid"],
             "would_send_summary": (payload or {}).get("summary"),
         })
+
     await db.execute(
         "DELETE FROM outbox_operations WHERE user_id = ? AND id > ?",
         (user_id, watermark),
     )
+    if changed_ids:
+        set_clause = ", ".join(f"{c} = ?" for c in _OUTBOX_SNAPSHOT_COLUMNS)
+        await db.executemany(
+            f"UPDATE outbox_operations SET {set_clause} WHERE id = ?",
+            [
+                tuple(snapshot[i][c] for c in _OUTBOX_SNAPSHOT_COLUMNS) + (i,)
+                for i in changed_ids
+            ],
+        )
     await db.commit()
     return preview
 
@@ -625,13 +726,24 @@ async def _read_affected_ledger_rows(
     return [(int(r["id"]), int(r["ledger_event_id"])) for r in rows]
 
 
+# SQLite's default host-parameter ceiling is 999 (SQLITE_MAX_VARIABLE_
+# NUMBER; raised to 32766 in 3.32+, but don't rely on the build).  A
+# reconcile pass rarely queues more than a few hundred affected rows —
+# a full-sync burst is the realistic worst case — so chunking below the
+# classic limit keeps every DELETE valid on any SQLite while still
+# issuing one statement per ~500 rows instead of one per row.
+_DELETE_CHUNK = 500
+
+
 async def _clear_affected_ledger_rows(
     db: aiosqlite.Connection, *, row_ids: list[int],
 ) -> None:
     """Delete affected-event rows by id once their planning succeeded."""
-    for rid in row_ids:
+    for start in range(0, len(row_ids), _DELETE_CHUNK):
+        chunk = row_ids[start:start + _DELETE_CHUNK]
+        marks = ",".join("?" * len(chunk))
         await db.execute(
-            "DELETE FROM affected_ledger_events WHERE id = ?", (int(rid),),
+            f"DELETE FROM affected_ledger_events WHERE id IN ({marks})",
+            [int(rid) for rid in chunk],
         )
-    await db.commit()
     await db.commit()

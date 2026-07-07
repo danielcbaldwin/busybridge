@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -135,13 +136,22 @@ async def _global_sync_paused(db: aiosqlite.Connection) -> bool:
     row keyed ``sync_paused``).  Read directly here so the drain enforces
     the kill switch on the actual write path; per-user soft pauses are
     intentionally not consulted (they keep draining).  Tolerant of a
-    minimal test DB without the settings table.
+    minimal test DB without the settings table — and of NOTHING else.
     """
     try:
         row = await (await db.execute(
             "SELECT value_plain FROM settings WHERE key = 'sync_paused'",
         )).fetchone()
-    except Exception:
+    except sqlite3.OperationalError as e:
+        # ONLY the missing-table case is tolerated (minimal test DBs
+        # omit the settings table).  Any other failure — locked DB,
+        # disk I/O error, corruption — must propagate: this read guards
+        # the admin emergency stop on the one path that writes to
+        # Google, and swallowing a real error would silently fail OPEN,
+        # draining the backlog out while the operator believes sync is
+        # paused.  Aborting the drain (fail closed) is the safe answer.
+        if "no such table" not in str(e).lower():
+            raise
         return False
     return bool(row and row["value_plain"] == "true")
 
@@ -391,6 +401,17 @@ async def _execute_op(
 ) -> str:
     """Run one op against Google.  Returns one of:
     'succeeded', 'retried', 'failed_permanent', 'superseded'.
+
+    Every ``_do_*`` handler returns the outcome it recorded, and that
+    return value is propagated verbatim — there is deliberately no
+    blanket ``return "succeeded"`` fall-through.  A handler can resolve
+    an op *internally* to something other than success (``_do_create``
+    marks the op superseded on the etag_mismatch_on_409 race, and a
+    permanent failure when it gives up on burned ids); flattening those
+    to "succeeded" made drain counters lie — ``failed_permanent``
+    stayed 0 for the burned-id give-up (the case that should alert
+    operators) and the reconciler's ``superseded`` convergence signal
+    undercounted, so its fixed-point loop could stop a pass early.
     """
     operation = op["operation"]
     cal_id = op["target_google_calendar_id"]
@@ -403,20 +424,18 @@ async def _execute_op(
         # catch-all, which retries with no attempts ceiling forever.
         payload = json.loads(op["payload_json"]) if op["payload_json"] else None
         if operation == OP_CREATE:
-            await _do_create(db, google, op, cal_id, payload, now=now)
-        elif operation == OP_UPDATE:
+            return await _do_create(db, google, op, cal_id, payload, now=now)
+        if operation == OP_UPDATE:
             return await _do_update(db, google, op, cal_id, payload, now=now)
-        elif operation == OP_DELETE:
-            await _do_delete(db, google, op, cal_id, now=now)
-        elif operation == OP_PATCH:
+        if operation == OP_DELETE:
+            return await _do_delete(db, google, op, cal_id, now=now)
+        if operation == OP_PATCH:
             return await _do_patch(db, google, op, cal_id, payload, now=now)
-        elif operation == OP_DELETE_SOURCE:
-            await _do_delete_source(db, google, op, cal_id, now=now)
-        else:
-            raise ValueError(f"unknown operation: {operation!r}")
+        if operation == OP_DELETE_SOURCE:
+            return await _do_delete_source(db, google, op, cal_id, now=now)
+        raise ValueError(f"unknown operation: {operation!r}")
     except Exception as e:
         return await _classify_and_retry(db, op, e, now=now)
-    return "succeeded"
 
 
 async def _do_create(
@@ -427,7 +446,7 @@ async def _do_create(
     payload: Optional[dict],
     *,
     now: datetime,
-) -> None:
+) -> str:
     """Insert with a deterministic ID; treat 409 as success.
 
     If the 409 turns out to be a *cancelled tombstone* — a user
@@ -437,6 +456,12 @@ async def _do_create(
     bump the projection's ``google_id_generation``, which yields a
     fresh deterministic id, and retry the insert.  Bumping is
     persisted before each retry so a crash mid-recreate is idempotent.
+
+    Returns the outcome it recorded ('succeeded', 'superseded', or
+    'failed_permanent') so drain counters reflect what actually
+    happened — the give-up and supersede paths resolve the op
+    internally and return normally, so a caller cannot infer the
+    outcome from "didn't raise".
     """
     if payload is None:
         raise ValueError(f"create op {op['id']} has no payload")
@@ -448,7 +473,7 @@ async def _do_create(
     # reached the cap stops here rather than burning more ids.
     if generation >= _MAX_TOTAL_ID_GENERATIONS:
         await _give_up_burned_ids(db, op, generation=generation, now=now)
-        return
+        return "failed_permanent"
 
     for _ in range(_MAX_ID_GENERATIONS):
         google_id = derive_google_event_id(
@@ -484,7 +509,7 @@ async def _do_create(
                     await _give_up_burned_ids(
                         db, op, generation=generation, now=now,
                     )
-                    return
+                    return "failed_permanent"
                 await db.execute(
                     """UPDATE ledger_projections
                           SET google_id_generation = ?
@@ -511,7 +536,7 @@ async def _do_create(
                         now=now,
                     )
                     await _request_projection_replan(db, op["projection_id"])
-                    return
+                    return "superseded"
                 raise
         await _record_success(
             db, op,
@@ -519,7 +544,7 @@ async def _do_create(
             google_etag=result.get("etag", ""),
             now=now,
         )
-        return
+        return "succeeded"
 
     raise RuntimeError(
         f"create op {op['id']}: exhausted {_MAX_ID_GENERATIONS} id "
@@ -725,7 +750,7 @@ async def _do_delete(
     cal_id: str,
     *,
     now: datetime,
-) -> None:
+) -> str:
     """Idempotent delete: 404/410 are treated as success.
 
     The delete is intentionally *unconditional* — no ``If-Match``.
@@ -734,13 +759,17 @@ async def _do_delete(
     currently sits on Google.  Sending the stored ETag would only
     invite a 412 ping-pong (event changed since we last saw it) for
     no benefit, since the outcome we want is "gone" either way.
+
+    Always returns 'succeeded' — unlike ``_do_create``/``_do_update``
+    there is no internal supersede / give-up path here; every
+    non-success raises and is classified by the caller.
     """
     proj = await _get_projection(db, op["projection_id"])
     if not proj["google_event_id"]:
         # Never created — nothing to delete.  Mark projection
         # absent and consider done.
         await _record_absent(db, op, now=now)
-        return
+        return "succeeded"
     try:
         await google.delete_event(cal_id, proj["google_event_id"])
     except Exception as e:
@@ -749,6 +778,7 @@ async def _do_delete(
         else:
             raise
     await _record_absent(db, op, now=now)
+    return "succeeded"
 
 
 async def _do_delete_source(
@@ -758,7 +788,7 @@ async def _do_delete_source(
     cal_id: str,
     *,
     now: datetime,
-) -> None:
+) -> str:
     """Destructively delete on the user's real source calendar — either a
     single occurrence of a managed recurring copy, or a whole non-recurring
     event (Phase-1 organizer-delete propagation).
@@ -770,6 +800,9 @@ async def _do_delete_source(
     ``source_delete_pending`` gate in ``diff._decide``.  Idempotent: a 404/410
     means it is already gone, which is the goal.  Personal sources are
     read-only and short-circuit without calling Google.
+
+    Always returns 'succeeded' — like ``_do_delete``, every non-success
+    path raises and is classified by the caller.
     """
     proj = await _get_projection(db, op["projection_id"])
     led = await (await db.execute(
@@ -785,7 +818,7 @@ async def _do_delete_source(
             (int(led["id"]),),
         )
         await _record_absent(db, op, now=now)
-        return
+        return "succeeded"
     if led is not None and led["source_event_id"]:
         try:
             await google.delete_event(cal_id, led["source_event_id"])
@@ -801,6 +834,7 @@ async def _do_delete_source(
             (int(led["id"]),),
         )
     await _record_absent(db, op, now=now)
+    return "succeeded"
 
 
 async def _do_patch(
