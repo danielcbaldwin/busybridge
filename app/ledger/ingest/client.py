@@ -244,42 +244,59 @@ async def scan_full_sync_recurring_cancellations(
     """
     failed = 0
     for parent_id in recurring_parent_ids:
-        try:
-            inst_resp = await google.list_instances(
-                google_calendar_id, parent_id,
-                show_deleted=True, max_results=2500,
-            )
-        except Exception as e:
-            logger.warning(
-                "instance scan failed for %s/%s: %s — sync token will "
-                "be held back so the next full sync retries",
-                google_calendar_id, parent_id, e,
-            )
-            failed += 1
-            continue
-        for inst in inst_resp.get("items", []):
-            if inst.get("status") != "cancelled":
-                continue
-            if not inst.get("recurringEventId"):
-                continue
-            counters["seen"] += 1
+        # ``events.instances`` paginates via nextPageToken: a daily
+        # series older than ~7 years exceeds one 2500-item page, and a
+        # cancellation past page 1 would be silently missed if we read
+        # only the first page.  Follow every page.
+        page_token: Optional[str] = None
+        while True:
             try:
-                outcome, ledger_id = await ingest_one(inst)
-            except Exception:
-                # Isolate per-instance failures, same rationale as the
-                # main page loop: one bad cancelled instance must not
-                # abort the whole scan.
-                logger.exception(
-                    "instance scan: skipping cancelled instance %s of %s "
-                    "after error",
-                    inst.get("id"), parent_id,
+                inst_resp = await google.list_instances(
+                    google_calendar_id, parent_id,
+                    show_deleted=True, max_results=2500,
+                    page_token=page_token,
                 )
-                counters["failed"] = counters.get("failed", 0) + 1
-                continue
-            counters[outcome] = counters.get(outcome, 0) + 1
-            if ledger_id is not None:
-                affected_ledger_ids.append(ledger_id)
-                await _stamp_ical_uid(db, ledger_id, inst)
+            except Exception as e:
+                logger.warning(
+                    "instance scan failed for %s/%s (page_token=%s): %s — "
+                    "sync token will be held back so the next full sync "
+                    "retries",
+                    google_calendar_id, parent_id, page_token, e,
+                )
+                # Invariant: if ANY page of a parent's scan fails —
+                # even after earlier pages were processed — the parent
+                # counts as failed, so the caller holds the sync token
+                # back and the next full sync re-runs the whole scan
+                # (idempotent).  Advancing the token here would strand
+                # any cancellations on the unfetched pages.
+                failed += 1
+                break
+            for inst in inst_resp.get("items", []):
+                if inst.get("status") != "cancelled":
+                    continue
+                if not inst.get("recurringEventId"):
+                    continue
+                counters["seen"] += 1
+                try:
+                    outcome, ledger_id = await ingest_one(inst)
+                except Exception:
+                    # Isolate per-instance failures, same rationale as the
+                    # main page loop: one bad cancelled instance must not
+                    # abort the whole scan.
+                    logger.exception(
+                        "instance scan: skipping cancelled instance %s of %s "
+                        "after error",
+                        inst.get("id"), parent_id,
+                    )
+                    counters["failed"] = counters.get("failed", 0) + 1
+                    continue
+                counters[outcome] = counters.get(outcome, 0) + 1
+                if ledger_id is not None:
+                    affected_ledger_ids.append(ledger_id)
+                    await _stamp_ical_uid(db, ledger_id, inst)
+            page_token = inst_resp.get("nextPageToken")
+            if not page_token:
+                break
     return failed
 
 

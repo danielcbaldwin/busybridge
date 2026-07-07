@@ -77,6 +77,7 @@ class GoogleClient(Protocol):
         event_id: str,
         show_deleted: bool = False,
         max_results: int = 250,
+        page_token: Optional[str] = None,
     ) -> dict: ...
 
     def list_calendar_list(self) -> dict:

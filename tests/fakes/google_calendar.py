@@ -216,6 +216,22 @@ class _PageTokenState:
     page_size: int
 
 
+@dataclass
+class _InstancePageState:
+    """Per-token bookkeeping for ``events.instances`` pagination.
+
+    Like :class:`_PageTokenState`, the snapshot is server-side: the
+    full expansion is captured on the first request and dripped out
+    one page at a time, so a concurrent mutation cannot skew a page
+    boundary.  Instances are stored as rendered API dicts (many are
+    synthesized from the RRULE and have no backing event row).
+    """
+
+    calendar_id: str
+    event_id: str
+    remaining_items: list[dict]
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -339,7 +355,13 @@ class FakeGoogleCalendar:
         self._calendars: dict[str, _Calendar] = {}
         self._sync_tokens: dict[str, _SyncTokenState] = {}
         self._page_tokens: dict[str, _PageTokenState] = {}
+        self._instance_page_tokens: dict[str, _InstancePageState] = {}
         self._failures = failure_injector
+        # Optional cap on the effective ``events.instances`` page size,
+        # applied on top of the caller's ``max_results``.  Tests set
+        # this to a small number to force multi-page pagination without
+        # having to create thousands of instances.
+        self.instances_page_size: Optional[int] = None
 
     def _check_failures(self, operation: str, *, has_sync_token: bool = False) -> None:
         """Roll the failure injector for a pre-operation failure.
@@ -1020,6 +1042,7 @@ class FakeGoogleCalendar:
         max_results: int = 250,
         time_min: Optional[datetime | str] = None,
         time_max: Optional[datetime | str] = None,
+        page_token: Optional[str] = None,
     ) -> dict:
         """Return the instances of a recurring series.
 
@@ -1035,23 +1058,54 @@ class FakeGoogleCalendar:
 
         Default time window: ``[parent.start, parent.start + 2y]`` —
         enough to catch normal weekly/monthly series in tests.
+
+        Paginates like the real endpoint: when the expansion exceeds
+        the effective page size (``max_results``, further capped by
+        ``self.instances_page_size`` if a test set it), the response
+        carries a ``nextPageToken``; pass it back as ``page_token`` to
+        fetch the next page of the same server-side snapshot.
         """
         self._check_failures("instances")
         cal = self._require_calendar(calendar_id)
-        parent = cal.events.get(event_id)
-        if parent is None:
-            raise _not_found(f"event {event_id} not found on {calendar_id}")
-        if not parent.recurrence:
-            raise _bad_request(f"event {event_id} is not a recurring series")
+        if page_token is not None:
+            state = self._instance_page_tokens.pop(page_token, None)
+            if state is None:
+                raise _bad_request(f"invalid page token {page_token!r}")
+            if state.calendar_id != calendar_id or state.event_id != event_id:
+                raise _bad_request(
+                    f"page token {page_token!r} does not belong to "
+                    f"{calendar_id}/{event_id}"
+                )
+            instances = state.remaining_items
+        else:
+            parent = cal.events.get(event_id)
+            if parent is None:
+                raise _not_found(f"event {event_id} not found on {calendar_id}")
+            if not parent.recurrence:
+                raise _bad_request(f"event {event_id} is not a recurring series")
 
-        tmin = _coerce_datetime(time_min) if time_min is not None else None
-        tmax = _coerce_datetime(time_max) if time_max is not None else None
+            tmin = _coerce_datetime(time_min) if time_min is not None else None
+            tmax = _coerce_datetime(time_max) if time_max is not None else None
 
-        instances = self._expand_instances(
-            cal, parent, tmin, tmax, show_deleted=show_deleted,
-        )
-        items = [inst for inst in instances][:max_results]
-        return {"kind": "calendar#events", "items": items}
+            instances = self._expand_instances(
+                cal, parent, tmin, tmax, show_deleted=show_deleted,
+            )
+
+        page_size = max(1, int(max_results))
+        if self.instances_page_size is not None:
+            page_size = min(page_size, max(1, int(self.instances_page_size)))
+        items = instances[:page_size]
+        remaining = instances[page_size:]
+        resp: dict = {"kind": "calendar#events", "items": items}
+        if remaining:
+            token = f"ipage-{uuid.uuid4().hex}"
+            self._instance_page_tokens[token] = _InstancePageState(
+                calendar_id=calendar_id,
+                event_id=event_id,
+                remaining_items=remaining,
+            )
+            resp["nextPageToken"] = token
+        return resp
 
     def reschedule_series_this_and_following(
         self,

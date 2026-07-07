@@ -232,14 +232,21 @@ class RealGoogleClient:
         event_id: str,
         show_deleted: bool = False,
         max_results: int = 250,
+        page_token: Optional[str] = None,
     ) -> dict:
+        params: dict = {
+            "calendarId": calendar_id,
+            "eventId": event_id,
+            "showDeleted": show_deleted,
+            "maxResults": max_results,
+        }
+        # ``events.instances`` paginates via nextPageToken just like
+        # ``events.list`` — a long-running daily series exceeds any
+        # single page, so callers must be able to follow pages.
+        if page_token is not None:
+            params["pageToken"] = page_token
         try:
-            return self._service.events().instances(
-                calendarId=calendar_id,
-                eventId=event_id,
-                showDeleted=show_deleted,
-                maxResults=max_results,
-            ).execute()
+            return self._service.events().instances(**params).execute()
         except HttpError as e:
             raise _wrap(e) from e
 
