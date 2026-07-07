@@ -75,7 +75,7 @@ async def ingest_webcal_subscription(
     counters = {
         "seen": 0, "created": 0, "updated": 0,
         "stale_cancelled": 0, "skipped": 0, "not_modified": 0,
-        "errors": 0, "empty_skipped": 0,
+        "errors": 0, "empty_skipped": 0, "failed": 0,
     }
     state = await _get_subscription(db, subscription_id=subscription_id)
     if state is None:
@@ -124,13 +124,29 @@ async def ingest_webcal_subscription(
 
     for ev in parsed_events:
         counters["seen"] += 1
-        outcome, ledger_id, canonical = await _ingest_ics_event(
-            db,
-            user_id=user_id,
-            subscription_id=subscription_id,
-            event=ev,
-            now=now,
-        )
+        try:
+            outcome, ledger_id, canonical = await _ingest_ics_event(
+                db,
+                user_id=user_id,
+                subscription_id=subscription_id,
+                event=ev,
+                now=now,
+            )
+        except Exception:
+            # Isolate per-event failures.  A single poison VEVENT must
+            # NOT abort the poll — that would skip _record_fetch_success,
+            # freeze the etag, refail the identical body on every poll,
+            # and silently stop every later VEVENT from ingesting.  Log
+            # loudly, skip this one, keep going; stale-detection below is
+            # suppressed for this poll so the failed event's existing
+            # busy block is not misread as "gone from feed".
+            logger.exception(
+                "webcal ingest: skipping event uid=%s on sub=%s "
+                "after error",
+                ev.get("uid"), subscription_id,
+            )
+            counters["failed"] = counters.get("failed", 0) + 1
+            continue
         counters[outcome] = counters.get(outcome, 0) + 1
         if ledger_id is not None:
             affected_ledger_ids.append(ledger_id)
@@ -202,16 +218,31 @@ async def ingest_webcal_subscription(
     # override removes that occurrence's busy block; a true
     # revert-to-series-default is a richer behaviour the model does
     # not yet express.
-    rows = await (await db.execute(
-        """SELECT id, canonical_uid FROM ledger_events
-            WHERE user_id = ?
-              AND source_type = 'webcal'
-              AND source_calendar_id = ?
-              AND status = 'active'
-              AND user_intentionally_deleted = 0
-              AND (last_seen_at IS NULL OR last_seen_at < ?)""",
-        (user_id, subscription_id, stale_cutoff),
-    )).fetchall()
+    # A poll with per-event failures cannot drive stale-detection: a
+    # failed event never reached the seen set (its canonical UID may
+    # not even be computable — the failure can precede the unstable-UID
+    # ordinal probe), so it would be misread as "gone from feed" and
+    # its real busy block cancelled.  Not cancelling is the safe
+    # direction (same reasoning as the empty-feed guard above); a
+    # later clean poll performs any genuinely-needed cancellation.
+    if counters["failed"]:
+        logger.warning(
+            "webcal sub=%s: %d event(s) failed this poll; skipping "
+            "stale-cancellation until a clean poll.",
+            subscription_id, counters["failed"],
+        )
+        rows = []
+    else:
+        rows = await (await db.execute(
+            """SELECT id, canonical_uid FROM ledger_events
+                WHERE user_id = ?
+                  AND source_type = 'webcal'
+                  AND source_calendar_id = ?
+                  AND status = 'active'
+                  AND user_intentionally_deleted = 0
+                  AND (last_seen_at IS NULL OR last_seen_at < ?)""",
+            (user_id, subscription_id, stale_cutoff),
+        )).fetchall()
     for row in rows:
         if row["canonical_uid"] in seen_canonical_uids:
             continue
@@ -254,7 +285,7 @@ def _vevent_to_dict(comp) -> dict:
     dtstart = comp.get("DTSTART")
     dtend = comp.get("DTEND")
     start_at, end_at, start_tz, end_tz, is_all_day = _normalize_times(
-        dtstart, dtend,
+        dtstart, dtend, comp.get("DURATION"),
     )
 
     # RRULE + EXDATE + RDATE all belong in the `recurrence` array
@@ -293,7 +324,13 @@ def _vevent_to_dict(comp) -> dict:
 def _extract_recurrence(comp) -> Optional[list[str]]:
     """Collect RRULE / EXDATE / RDATE lines for the Google
     ``recurrence`` array.  Each property may appear more than once
-    (common for EXDATE)."""
+    (common for EXDATE).
+
+    Serialise via ``content_line`` so property PARAMETERS survive:
+    ``item.to_ical()`` alone drops ``;VALUE=DATE`` / ``;TZID=...``,
+    turning an all-day exclusion into an invalid line and a
+    zoned one into a floating time that excludes the wrong instant —
+    Google gets these lines verbatim as its ``recurrence`` array."""
     lines: list[str] = []
     for key in ("RRULE", "EXDATE", "RDATE"):
         val = comp.get(key)
@@ -301,13 +338,20 @@ def _extract_recurrence(comp) -> Optional[list[str]]:
             continue
         items = val if isinstance(val, list) else [val]
         for item in items:
-            if hasattr(item, "to_ical"):
-                try:
-                    lines.append(f"{key}:" + item.to_ical().decode("ascii"))
-                except Exception:
+            try:
+                # Full RFC 5545 content line WITH parameters, e.g.
+                # ``EXDATE;TZID=America/New_York:20260217T090000``.
+                lines.append(str(comp.content_line(key, item)))
+            except Exception:
+                if hasattr(item, "to_ical"):
+                    try:
+                        lines.append(
+                            f"{key}:" + item.to_ical().decode("ascii")
+                        )
+                    except Exception:
+                        lines.append(f"{key}:" + str(item))
+                else:
                     lines.append(f"{key}:" + str(item))
-            else:
-                lines.append(f"{key}:" + str(item))
     return lines or None
 
 
@@ -334,25 +378,31 @@ def _first_str(comp, key: str) -> Optional[str]:
 
 
 def _normalize_times(
-    dtstart, dtend,
+    dtstart, dtend, duration=None,
 ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], bool]:
     """Return ``(start_at, end_at, start_timezone, end_timezone,
     is_all_day)``.  All-day events keep their ``YYYY-MM-DD`` shape and
     carry no zone; timed events get an ISO-8601 UTC string plus the
     IANA zone their RRULE expands in (so a mirrored recurring webcal
     event stays correct across DST instead of drifting onto a fixed
-    UTC grid)."""
+    UTC grid).
+
+    RFC 5545 allows DTSTART + DURATION instead of DTEND; honour it so
+    e.g. a 2-hour meeting is not shrunk to the 30-minute default.  The
+    default only applies when NEITHER DTEND nor DURATION is present."""
     if dtstart is None:
         return None, None, None, None, False
     sdt = dtstart.dt
     edt = dtend.dt if dtend is not None else None
+    dur = getattr(duration, "dt", None) if duration is not None else None
     if isinstance(sdt, datetime):
         s = sdt.astimezone(UTC) if sdt.tzinfo else sdt.replace(tzinfo=UTC)
-        e = (
-            (edt.astimezone(UTC) if edt.tzinfo else edt.replace(tzinfo=UTC))
-            if isinstance(edt, datetime)
-            else (s + timedelta(minutes=30))
-        )
+        if isinstance(edt, datetime):
+            e = edt.astimezone(UTC) if edt.tzinfo else edt.replace(tzinfo=UTC)
+        elif isinstance(dur, timedelta):
+            e = s + dur
+        else:
+            e = s + timedelta(minutes=30)
         return (
             s.strftime("%Y-%m-%dT%H:%M:%SZ"),
             e.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -361,7 +411,14 @@ def _normalize_times(
             False,
         )
     # date-only → all-day
-    e = edt if edt is not None else (sdt + timedelta(days=1))
+    if edt is not None:
+        e = edt
+    elif isinstance(dur, timedelta):
+        # RFC 5545 restricts an all-day DURATION to whole days/weeks
+        # (e.g. P2D); guard a degenerate sub-day value back to one day.
+        e = sdt + (dur if dur >= timedelta(days=1) else timedelta(days=1))
+    else:
+        e = sdt + timedelta(days=1)
     return sdt.isoformat(), e.isoformat(), None, None, True
 
 

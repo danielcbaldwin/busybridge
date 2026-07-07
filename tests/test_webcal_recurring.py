@@ -54,6 +54,44 @@ def test_exdate_is_carried_into_the_recurrence_array():
     ), f"EXDATE dropped from recurrence array: {rec}"
 
 
+def test_exdate_value_date_parameter_is_preserved():
+    """An all-day series' ``EXDATE;VALUE=DATE:...`` must keep its
+    parameter — serialising the bare value would hand Google an
+    invalid (time-less but typed-as-datetime) recurrence line."""
+    comp = _vevent(_ics(
+        "UID:series-allday@example.com\n"
+        "SUMMARY:Daily block\n"
+        "DTSTART;VALUE=DATE:20260202\n"
+        "DTEND;VALUE=DATE:20260203\n"
+        "RRULE:FREQ=DAILY;COUNT=30\n"
+        "EXDATE;VALUE=DATE:20260217"
+    ))
+    d = _vevent_to_dict(comp)
+    rec = json.loads(d["recurrence_rule_json"])
+    assert "EXDATE;VALUE=DATE:20260217" in rec, (
+        f"VALUE=DATE parameter dropped: {rec}"
+    )
+
+
+def test_exdate_tzid_parameter_is_preserved():
+    """A zoned series' ``EXDATE;TZID=...`` must keep its parameter —
+    dropping it leaves a floating local time that excludes the wrong
+    instant (or nothing at all) once Google expands the series."""
+    comp = _vevent(_ics(
+        "UID:series-zoned@example.com\n"
+        "SUMMARY:Weekly standup\n"
+        "DTSTART;TZID=America/New_York:20260203T090000\n"
+        "DTEND;TZID=America/New_York:20260203T093000\n"
+        "RRULE:FREQ=WEEKLY;COUNT=10\n"
+        "EXDATE;TZID=America/New_York:20260217T090000"
+    ))
+    d = _vevent_to_dict(comp)
+    rec = json.loads(d["recurrence_rule_json"])
+    assert "EXDATE;TZID=America/New_York:20260217T090000" in rec, (
+        f"TZID parameter dropped: {rec}"
+    )
+
+
 def test_recurrence_id_override_is_detected():
     comp = _vevent(_ics(
         "UID:series-1@example.com\n"

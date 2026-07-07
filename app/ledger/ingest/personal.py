@@ -53,7 +53,8 @@ async def ingest_personal_calendar(
 ) -> dict:
     """Run one ingest pass for one personal calendar.
 
-    Counters: ``{seen, created, updated, rekeyed, cancelled, skipped}``.
+    Counters: ``{seen, created, updated, rekeyed, cancelled, skipped,
+    failed}``.
     The schema reuses ``client_calendars`` with
     ``calendar_type='personal'``; the sync state lives on the same
     ``calendar_sync_state`` row keyed by client_calendar_id.
@@ -63,7 +64,7 @@ async def ingest_personal_calendar(
     sync_token: Optional[str] = state["sync_token"]
     counters: dict[str, int] = {
         "seen": 0, "created": 0, "updated": 0,
-        "rekeyed": 0, "cancelled": 0, "skipped": 0,
+        "rekeyed": 0, "cancelled": 0, "skipped": 0, "failed": 0,
     }
     affected_ledger_ids: list[int] = []
     page_token: Optional[str] = None
@@ -97,14 +98,29 @@ async def ingest_personal_calendar(
             counters["seen"] += 1
             if _is_recurring_parent(event):
                 recurring_parent_ids.add(event["id"])
-            outcome, ledger_id = await _ingest_one(
-                db,
-                user_id=user_id,
-                personal_calendar_id=personal_calendar_id,
-                user_email=user_email,
-                owned_emails=owned_emails,
-                event=event,
-            )
+            try:
+                outcome, ledger_id = await _ingest_one(
+                    db,
+                    user_id=user_id,
+                    personal_calendar_id=personal_calendar_id,
+                    user_email=user_email,
+                    owned_emails=owned_emails,
+                    event=event,
+                )
+            except Exception:
+                # Isolate per-event failures.  A single poison event
+                # (e.g. a canonical_uid UNIQUE collision) must NOT
+                # abort the pass — that would strand the sync token and
+                # silently stop every later event from reaching the
+                # main calendar.  Log loudly, skip this one, keep going;
+                # the token still advances so the calendar keeps syncing.
+                logger.exception(
+                    "personal ingest: skipping event %s on "
+                    "personal_calendar_id=%s after error",
+                    event.get("id"), personal_calendar_id,
+                )
+                counters["failed"] = counters.get("failed", 0) + 1
+                continue
             counters[outcome] = counters.get(outcome, 0) + 1
             if ledger_id is not None:
                 affected_ledger_ids.append(ledger_id)
