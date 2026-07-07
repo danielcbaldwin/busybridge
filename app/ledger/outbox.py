@@ -17,10 +17,15 @@ two structural choices:
 
 Errors are routed by class:
 
-* :class:`Exception` whose status is 401/403/404 → permanent
+* :class:`Exception` whose status is 400/401/403/404 → permanent
   failure after ``POISON_PILL_THRESHOLD`` attempts.
-* status 408/429/500/502/503/504 or any non-HTTP exception →
-  retry with exponential backoff.
+* deterministic local failures — :class:`ValueError` (including
+  ``json.JSONDecodeError`` from a malformed ``payload_json``) with
+  no HTTP status — → same permanent-failure ceiling; retrying an
+  op that is structurally broken can never succeed.
+* status 408/429/500/502/503/504 or any non-HTTP transport
+  exception → retry with exponential backoff, unbounded (a network
+  blip must never poison-pill real work).
 * status 412 (etag mismatch) → mark superseded, schedule replan.
 
 The retry timing matches the existing
@@ -389,9 +394,14 @@ async def _execute_op(
     """
     operation = op["operation"]
     cal_id = op["target_google_calendar_id"]
-    payload = json.loads(op["payload_json"]) if op["payload_json"] else None
 
     try:
+        # Parsed INSIDE the try: a malformed payload_json (corrupt row,
+        # partial write) must become a *classified* failure — routed to
+        # the deterministic-failure ceiling in _classify_and_retry —
+        # rather than escape _execute_op into drain_user's defensive
+        # catch-all, which retries with no attempts ceiling forever.
+        payload = json.loads(op["payload_json"]) if op["payload_json"] else None
         if operation == OP_CREATE:
             await _do_create(db, google, op, cal_id, payload, now=now)
         elif operation == OP_UPDATE:
@@ -1106,6 +1116,23 @@ async def _give_up_burned_ids(
         logger.warning("could not queue event_unmirrorable alert: %s", e)
 
 
+def _is_deterministic_local_failure(error: Exception) -> bool:
+    """True for a failure that is local and deterministic — retrying
+    the identical op can never succeed.
+
+    Covers the ``ValueError``s raised before any network I/O for
+    structurally-broken ops (``_do_create``/``_do_update``/``_do_patch``
+    "has no payload" / "has no google_event_id", the unknown-operation
+    guard) and ``json.JSONDecodeError`` from a malformed
+    ``payload_json`` (a ``ValueError`` subclass).  Genuine transients
+    never look like this: HTTP failures arrive as ``GoogleApiError`` /
+    ``HttpError``-shaped exceptions carrying a ``status`` (and are
+    routed by status before this check), and transport failures are
+    ``OSError`` / timeout types — none of them ``ValueError``.
+    """
+    return isinstance(error, ValueError)
+
+
 async def _classify_and_retry(
     db: aiosqlite.Connection,
     op: aiosqlite.Row,
@@ -1124,18 +1151,28 @@ async def _classify_and_retry(
         # blip poison-pills a real event.
         await _mark_retry(db, op, error=msg, http_status=status, now=now)
         return "retried"
-    if status in PERMANENT_FAILURE_STATUSES:
+    if status in PERMANENT_FAILURE_STATUSES or (
+        status is None and _is_deterministic_local_failure(error)
+    ):
+        # Deterministic failures — a 4xx from Google, or a local
+        # ValueError / JSON-decode error that no retry can fix — share
+        # one attempts ceiling.  Without it, a non-HTTP deterministic
+        # failure (malformed payload_json, an update whose projection
+        # never got a google_event_id) fell through to the transient
+        # branch below and retried every drain forever.
         if int(op["attempts"]) >= POISON_PILL_THRESHOLD:
             await _mark_permanent_failure(
                 db, op, error=msg, http_status=status, now=now,
             )
             return "failed_permanent"
-        # First few 4xxs: retry slowly; the planner may produce a
+        # First few failures: retry slowly; the planner may produce a
         # corrected payload after the next ingest.
         await _mark_retry(db, op, error=msg, http_status=status, now=now)
         return "retried"
 
-    # Retryable: 408/429/5xx and any non-HTTP exception (network).
+    # Retryable: 408/429/5xx and any non-HTTP transport exception
+    # (network).  Deliberately unbounded — an outage must never
+    # poison-pill real work.
     await _mark_retry(db, op, error=msg, http_status=status, now=now)
     return "retried"
 

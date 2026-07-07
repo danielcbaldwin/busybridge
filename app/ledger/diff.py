@@ -39,6 +39,68 @@ from app.ledger.payload import ABSENT, PRESENT_FULL_RSVP_ONLY, render_payload
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
 
+# Shared SELECT for every diff-side projection read: the projection row
+# joined to its ledger event plus the source-label / color / placement
+# joins.  Used by BOTH _diverged_projections and the instance re-read in
+# diff_and_enqueue_for_user — the two MUST stay column-identical, or a
+# re-read row renders a different payload than the one the planner
+# hashed.  (Regression: the re-read once omitted the webcal joins, so
+# webcal recurring-instance copies were sent without their feed prefix,
+# Placement footer, or color.)
+_PROJECTION_SELECT = """
+    SELECT p.*, e.user_id AS user_id_from_ledger,
+           e.summary, e.description, e.location,
+           e.start_at, e.end_at,
+           e.start_timezone, e.end_timezone,
+           e.origin_writeback_pending,
+           e.source_delete_pending,
+           e.is_all_day, e.show_as,
+           e.color_id, e.user_can_edit, e.user_rsvp_status,
+           e.recurrence_rule_json, e.version AS ledger_version,
+           e.parent_canonical_uid,
+           e.recurrence_instance_original_start,
+           e.source_type, e.source_calendar_id, e.attendees_json,
+           e.conference_data_json, e.source_html_link,
+           -- Source label: client/personal -> client_calendars.display_name,
+           -- webcal -> webcal_subscriptions.display_prefix.  See
+           -- webcal.md §Label, Footer, Color.  COALESCE keeps the
+           -- diff payload byte-identical to the planner hash.
+           COALESCE(
+               cc.display_name,
+               NULLIF(ws.display_prefix, '')
+           ) AS source_label,
+           -- Color: client/personal -> source client's color;
+           -- webcal placed on an active client -> that client's
+           -- color; otherwise no color.
+           CASE
+             WHEN e.source_type IN ('client', 'personal')
+               THEN cc.color_id
+             WHEN e.source_type = 'webcal'
+               AND ws.placement_kind = 'client'
+               THEN cc_placement.color_id
+             ELSE NULL
+           END AS calendar_color_id,
+           -- Placement label: only the webcal-on-active-client
+           -- branch produces a "Placement:" footer line.
+           CASE
+             WHEN e.source_type = 'webcal'
+               AND ws.placement_kind = 'client'
+               THEN cc_placement.display_name
+             ELSE NULL
+           END AS placement_label
+      FROM ledger_projections p
+      JOIN ledger_events e ON e.id = p.ledger_event_id
+      LEFT JOIN client_calendars cc
+             ON cc.id = e.source_calendar_id
+            AND e.source_type IN ('client', 'personal')
+      LEFT JOIN webcal_subscriptions ws
+             ON ws.id = e.source_calendar_id
+            AND e.source_type = 'webcal'
+      LEFT JOIN client_calendars cc_placement
+             ON cc_placement.id = ws.placement_client_calendar_id
+            AND cc_placement.is_active = 1
+"""
+
 
 async def diff_and_enqueue_for_user(
     db: aiosqlite.Connection,
@@ -122,30 +184,15 @@ async def diff_and_enqueue_for_user(
                         WHERE id = ?""",
                     (derived, int(proj["id"])),
                 )
-                # Re-read; otherwise _decide sees the stale row.
+                # Re-read; otherwise _decide sees the stale row.  Uses
+                # the SAME select as _diverged_projections (shared
+                # fragment) so the re-read row carries the identical
+                # source_label / calendar_color_id / placement_label
+                # the planner hashed — an instance payload rendered
+                # from a narrower row would silently drop the webcal
+                # feed prefix, Placement footer, and color.
                 proj = await (await db.execute(
-                    """SELECT p.*, e.user_id AS user_id_from_ledger,
-                              e.summary, e.description, e.location,
-                              e.start_at, e.end_at,
-                              e.start_timezone, e.end_timezone,
-                              e.origin_writeback_pending,
-                              e.source_delete_pending,
-                              e.is_all_day, e.show_as,
-                              e.color_id, e.user_can_edit, e.user_rsvp_status,
-                              e.recurrence_rule_json, e.version AS ledger_version,
-                              e.parent_canonical_uid,
-                              e.recurrence_instance_original_start,
-                              e.source_type, e.source_calendar_id,
-                              e.attendees_json,
-                              e.conference_data_json, e.source_html_link,
-                              cc.color_id AS calendar_color_id,
-                              cc.display_name AS source_label
-                         FROM ledger_projections p
-                         JOIN ledger_events e ON e.id = p.ledger_event_id
-                         LEFT JOIN client_calendars cc
-                                ON cc.id = e.source_calendar_id
-                               AND e.source_type IN ('client', 'personal')
-                        WHERE p.id = ?""",
+                    _PROJECTION_SELECT + " WHERE p.id = ?",
                     (int(proj["id"]),),
                 )).fetchone()
 
@@ -155,6 +202,7 @@ async def diff_and_enqueue_for_user(
             google_calendar_id_for=google_calendar_id_for,
         )
         if op_kind is None:
+            await _clear_converged_writeback_flag(db, proj)
             await _snap_applied(db, proj["id"], int(proj["desired_ledger_version"]))
             continue
         # Instances are applied via UPDATE on the derived ID (the
@@ -226,58 +274,8 @@ async def _diverged_projections(
 ) -> list[aiosqlite.Row]:
     """All projections for ``user_id`` whose desired != applied."""
     cursor = await db.execute(
-        """SELECT p.*, e.user_id AS user_id_from_ledger,
-                  e.summary, e.description, e.location,
-                  e.start_at, e.end_at,
-                  e.start_timezone, e.end_timezone,
-                  e.origin_writeback_pending,
-                  e.source_delete_pending,
-                  e.is_all_day, e.show_as,
-                  e.color_id, e.user_can_edit, e.user_rsvp_status,
-                  e.recurrence_rule_json, e.version AS ledger_version,
-                  e.parent_canonical_uid,
-                  e.recurrence_instance_original_start,
-                  e.source_type, e.source_calendar_id, e.attendees_json,
-                  e.conference_data_json, e.source_html_link,
-                  -- Source label: client/personal -> client_calendars.display_name,
-                  -- webcal -> webcal_subscriptions.display_prefix.  See
-                  -- webcal.md §Label, Footer, Color.  COALESCE keeps the
-                  -- diff payload byte-identical to the planner hash.
-                  COALESCE(
-                      cc.display_name,
-                      NULLIF(ws.display_prefix, '')
-                  ) AS source_label,
-                  -- Color: client/personal -> source client's color;
-                  -- webcal placed on an active client -> that client's
-                  -- color; otherwise no color.
-                  CASE
-                    WHEN e.source_type IN ('client', 'personal')
-                      THEN cc.color_id
-                    WHEN e.source_type = 'webcal'
-                      AND ws.placement_kind = 'client'
-                      THEN cc_placement.color_id
-                    ELSE NULL
-                  END AS calendar_color_id,
-                  -- Placement label: only the webcal-on-active-client
-                  -- branch produces a "Placement:" footer line.
-                  CASE
-                    WHEN e.source_type = 'webcal'
-                      AND ws.placement_kind = 'client'
-                      THEN cc_placement.display_name
-                    ELSE NULL
-                  END AS placement_label
-             FROM ledger_projections p
-             JOIN ledger_events e ON e.id = p.ledger_event_id
-             LEFT JOIN client_calendars cc
-                    ON cc.id = e.source_calendar_id
-                   AND e.source_type IN ('client', 'personal')
-             LEFT JOIN webcal_subscriptions ws
-                    ON ws.id = e.source_calendar_id
-                   AND e.source_type = 'webcal'
-             LEFT JOIN client_calendars cc_placement
-                    ON cc_placement.id = ws.placement_client_calendar_id
-                   AND cc_placement.is_active = 1
-            WHERE e.user_id = ?
+        _PROJECTION_SELECT
+        + """WHERE e.user_id = ?
               AND (p.applied_ledger_version IS NULL
                    OR p.applied_ledger_version != p.desired_ledger_version
                    OR p.applied_payload_hash IS NULL
@@ -328,7 +326,12 @@ def _decide(
     main_calendar_id: str,
     google_calendar_id_for: dict[int, str],
 ) -> tuple[str | None, dict | None, str]:
-    """Return ``(op, payload, target_google_calendar)``."""
+    """Return ``(op, payload, target_google_calendar)``.
+
+    ``op`` is ``None`` for a no-op — the caller snaps the projection
+    applied without enqueuing anything, so ``target_cal`` may be an
+    empty placeholder on that path (it is never sent anywhere).
+    """
     desired = proj["desired_state"]
     current = proj["current_state"]
     target_kind = proj["target_kind"]
@@ -336,16 +339,33 @@ def _decide(
     if target_kind == "main":
         target_cal = main_calendar_id
     else:
-        client_cal_id = int(proj["target_calendar_id"])
-        if client_cal_id not in google_calendar_id_for:
-            raise ValueError(
-                f"projection {proj['id']} targets client_calendar_id "
-                f"{client_cal_id} but no Google ID mapping was provided"
-            )
-        target_cal = google_calendar_id_for[client_cal_id]
+        # Resolved leniently (.get, not []): retention hard-deletes
+        # disconnected client_calendars rows while projections keep the
+        # integer id (deliberately no FK), so an orphaned projection can
+        # outlive its calendar's Google-ID mapping entirely.
+        target_cal = google_calendar_id_for.get(int(proj["target_calendar_id"]))
 
     if _is_legacy_personal_source_target(proj):
-        return None, None, target_cal
+        return None, None, target_cal or ""
+
+    if target_cal is None:
+        # No mapping for this client calendar — the row it pointed at is
+        # gone (hard-deleted by retention after a disconnect).  Raising
+        # here would abort the ENTIRE reconcile pass for the user, which
+        # the scheduler then retries every tick forever; instead mirror
+        # verify._resolve and converge the projection as a no-op — there
+        # is no calendar left to write to (or delete from) anyway.  Log
+        # only when the projection was genuinely diverged; an absent
+        # projection with nothing ever written is expected debris and
+        # converges silently.
+        if not (desired == ABSENT and not proj["google_event_id"]):
+            logger.warning(
+                "projection %s targets client_calendar_id %s but no Google "
+                "ID mapping was provided (calendar row deleted?) — "
+                "skipping and marking converged",
+                proj["id"], proj["target_calendar_id"],
+            )
+        return None, None, ""
 
     payload = render_payload(
         desired_state=desired,
@@ -409,9 +429,13 @@ def _decide(
             return None, None, target_cal
         applied = proj["applied_payload_hash"]
         if applied is not None and applied == proj["desired_payload_hash"]:
-            # Flag is set but the source already matches (e.g. the
-            # patch just ran).  Outbox will clear the flag on the next
-            # successful patch; here just no-op.
+            # Flag is set but the source already matches (e.g. a main
+            # edit bumped the version without changing the rendered
+            # writeback payload).  No patch is enqueued here, and the
+            # outbox only clears the flag after a successful patch — so
+            # the caller (diff_and_enqueue_for_user) clears it on this
+            # no-op path via _clear_converged_writeback_flag; see the
+            # rationale there.
             return None, None, target_cal
         return OP_PATCH, payload, target_cal
 
@@ -453,9 +477,56 @@ def _proj_row_to_ledger_dict(proj) -> dict:
         "source_type": proj["source_type"],
         "calendar_color_id": proj["calendar_color_id"],
         "source_label": proj["source_label"],
+        # Placement footer line for a webcal feed placed on a client
+        # calendar.  The planner hashes the payload WITH this field, so
+        # dropping it here would send a body missing the "Placement:"
+        # footer while the applied hash (stamped from the planner's
+        # value) masks the mismatch forever.
+        "placement_label": proj["placement_label"],
         "conference_data_json": proj["conference_data_json"],
         "source_html_link": proj["source_html_link"],
     }
+
+
+async def _clear_converged_writeback_flag(
+    db: aiosqlite.Connection, proj,
+) -> None:
+    """Clear ``origin_writeback_pending`` when the writeback converged
+    as a no-op.
+
+    The flag is normally cleared by the outbox after a successful patch
+    (``_record_origin_writeback_applied``).  But when a main-side edit
+    sets the flag WITHOUT changing the rendered writeback payload
+    (applied hash already equals desired hash), ``_decide`` no-ops and
+    no patch will ever run — so the outbox never gets the chance to
+    clear it.  Left set, the flag arms a *stale* writeback: the next
+    genuine source-side change (an attendee responding, the user
+    RSVPing on the source itself) bumps the desired hash and the
+    pending flag then fires a patch carrying BB's cached snapshot,
+    clobbering whatever just happened on the source.  Clear it here —
+    the same UPDATE the outbox uses — since a matching hash means the
+    source already holds everything the flag was set to deliver.
+
+    Deliberately scoped to the exact ``_decide`` no-op branch (origin
+    writeback, desired ``present_full_rsvp_only``, flag set, applied ==
+    desired): every other no-op path leaves the flag alone so a
+    writeback that has not landed yet still fires.
+    """
+    if not _is_origin_writeback(proj):
+        return
+    if proj["desired_state"] != PRESENT_FULL_RSVP_ONLY:
+        return
+    if not bool(proj["origin_writeback_pending"]):
+        return
+    applied = proj["applied_payload_hash"]
+    if applied is None or applied != proj["desired_payload_hash"]:
+        return
+    await db.execute(
+        """UPDATE ledger_events
+              SET origin_writeback_pending = 0
+            WHERE id = ?""",
+        (int(proj["ledger_event_id"]),),
+    )
 
 
 async def _snap_applied(

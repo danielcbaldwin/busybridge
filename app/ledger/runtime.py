@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 import aiosqlite
@@ -441,6 +441,34 @@ async def build_user_google_access(
     }
 
 
+# ---------------------------------------------------------------------------
+# Failed-reconcile backoff
+# ---------------------------------------------------------------------------
+# Consecutive reconcile-failure count per user, feeding the escalating
+# retry backoff in drain_all_due_users.  ``reconcile_requests`` has no
+# failure-count column and triggers.py owns that table's semantics, so
+# the count lives in process memory.  Scope is deliberately the PROCESS
+# LIFETIME — the same scope as the scheduler loop that consumes it; the
+# app is single-process (see reconcile_user_by_id's locking notes).  A
+# restart resets the counts, costing at most one fast retry per user,
+# after which a persistent failure immediately re-escalates.
+_reconcile_failure_counts: dict[int, int] = {}
+
+# First retry after a failed reconcile; doubles per consecutive failure.
+_RECONCILE_RETRY_BASE = timedelta(minutes=1)
+# Ceiling: a persistently failing user is retried at most this often —
+# NOT a full ingest re-run on every 30s scheduler tick forever.
+_RECONCILE_RETRY_MAX = timedelta(minutes=30)
+
+
+def _reconcile_retry_delay(failures: int) -> timedelta:
+    """Escalating backoff for consecutive reconcile failures: 1m, 2m,
+    4m, … capped at ``_RECONCILE_RETRY_MAX``.  The exponent is bounded
+    before the shift so an arbitrarily large streak stays cheap."""
+    exponent = min(max(failures - 1, 0), 10)
+    return min(_RECONCILE_RETRY_BASE * (2 ** exponent), _RECONCILE_RETRY_MAX)
+
+
 async def drain_all_due_users(*, now: Optional[datetime] = None) -> dict:
     """Pull every user with a due ``reconcile_requests`` row,
     run their reconciler, and release the row.
@@ -476,11 +504,26 @@ async def drain_all_due_users(*, now: Optional[datetime] = None) -> dict:
         except Exception as e:
             logger.exception("reconcile user %s failed: %s", user_id, e)
             out[user_id] = {"error": str(e)}
-            await release_request(db, user_id=user_id, retry_at=now)
+            # Escalating backoff, NOT retry_at=now: a deterministic
+            # failure (revoked token state, a poison calendar) at zero
+            # backoff re-runs the user's full ingest on every scheduler
+            # tick forever.  release_request COALESCEs scheduled_for, so
+            # a webhook/manual enqueue that landed mid-run — asking for
+            # a sooner retry — still wins over the backoff.
+            _reconcile_failure_counts[user_id] = (
+                _reconcile_failure_counts.get(user_id, 0) + 1
+            )
+            retry_at = now + _reconcile_retry_delay(
+                _reconcile_failure_counts[user_id],
+            )
+            await release_request(db, user_id=user_id, retry_at=retry_at)
             continue
         finally:
             result = out.get(user_id)
             if not (isinstance(result, dict) and "error" in result):
+                # Clean pass — reset the failure streak so the next
+                # genuine failure starts from the small end again.
+                _reconcile_failure_counts.pop(user_id, None)
                 await release_request(db, user_id=user_id)
     return out
 
