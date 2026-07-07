@@ -24,9 +24,11 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import sqlite3
 import tempfile
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -71,26 +73,54 @@ def apply_retention_policy() -> dict:
     """
     Enforce 7 daily / 2 weekly / 6 monthly retention.
 
+    The unit of retention is the calendar DAY, not the file: within each
+    bucket the most-recent backup from each distinct day (derived from
+    ``created_at``) is kept, up to the bucket's day limit — exactly what
+    the module docstring promises ("most-recent backup from each of the
+    last 7 days").  Same-day extras (e.g. several manual backups in one
+    afternoon) collapse to that day's newest instead of each consuming a
+    retention slot and evicting a week of scheduled history.  The same
+    per-day rule keeps the weekly/monthly buckets consistent: two backups
+    taken on one Sunday count as ONE retained Sunday, not two.
+
+    A backup whose metadata cannot be read is never deleted: without
+    ``created_at`` it cannot be classified or aged, and a transiently
+    unreadable file must not be destroyed.  It is kept and logged.
+
     Returns {'kept': [...], 'deleted': [...]} lists of backup IDs.
     """
     limits = {"daily": 7, "weekly": 2, "monthly": 6}
     backups = list_backups()  # newest-first
 
-    by_type: dict[str, list] = {"daily": [], "weekly": [], "monthly": []}
-    for b in backups:
-        btype = b.get("backup_type", "daily")
-        if btype in by_type:
-            by_type[btype].append(b)
-
     to_delete: list[str] = []
     kept: list[str] = []
+    # Distinct days that already hold a kept backup, per bucket
+    # (newest-first, mirroring the list_backups sort).
+    days_kept: dict[str, list[str]] = {"daily": [], "weekly": [], "monthly": []}
 
-    for btype, limit in limits.items():
-        for i, entry in enumerate(by_type[btype]):
-            if i < limit:
-                kept.append(entry["backup_id"])
-            else:
-                to_delete.append(entry["backup_id"])
+    for b in backups:
+        backup_id = b["backup_id"]
+        if b.get("metadata_unreadable") or not b.get("created_at"):
+            logger.warning(
+                f"Retention: keeping backup {backup_id} — its metadata is "
+                f"unreadable or lacks created_at, refusing to delete a "
+                f"backup that cannot be classified"
+            )
+            kept.append(backup_id)
+            continue
+        btype = b.get("backup_type", "daily")
+        if btype not in limits:
+            continue  # unknown type: leave it alone
+        day = str(b["created_at"])[:10]  # ISO timestamp → YYYY-MM-DD
+        days = days_kept[btype]
+        if day in days:
+            # An older backup from a day whose newest is already kept.
+            to_delete.append(backup_id)
+        elif len(days) < limits[btype]:
+            days.append(day)
+            kept.append(backup_id)
+        else:
+            to_delete.append(backup_id)  # beyond the bucket's day window
 
     for backup_id in to_delete:
         path = _backup_filepath(backup_id)
@@ -351,7 +381,11 @@ def list_backups() -> list[dict]:
                 with zf.open("metadata.json") as f:
                     meta = json.load(f)
         except Exception:
-            meta = {"backup_id": backup_id}
+            # Corrupt zip, missing metadata.json, or a transient read
+            # failure.  Surface the backup with an explicit marker rather
+            # than a bare fallback dict: apply_retention_policy uses the
+            # marker to refuse to delete a backup it cannot classify.
+            meta = {"backup_id": backup_id, "metadata_unreadable": True}
 
         meta["file_size_bytes"] = os.path.getsize(fpath)
         results.append(meta)
@@ -520,17 +554,94 @@ async def _restore_single_user(live_db, bk_conn: sqlite3.Connection, user_id: in
             await live_db.execute(sql, list(row))
 
 
-async def _restore_db_for_users(backup_zip: zipfile.ZipFile, user_ids: list[int]) -> None:
-    """Restore database rows for specific users from the backup ZIP."""
+@contextmanager
+def _extracted_backup_db(backup_zip: zipfile.ZipFile):
+    """Extract the backup's ``database.db`` to a temp file; yield its path.
+
+    The zip entry is STREAMED out with shutil.copyfileobj for the same
+    reason the create side streams (see create_backup): database.db can
+    be hundreds of MB on the Pi, and ``src.read()`` spiked RAM by that
+    much.  The temp file is always removed on exit.
+    """
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         tmp_path = tmp.name
     try:
         with backup_zip.open("database.db") as src:
             with open(tmp_path, "wb") as dst:
-                dst.write(src.read())
+                shutil.copyfileobj(src, dst)
+        yield tmp_path
+    finally:
+        os.unlink(tmp_path)
 
+
+# Tables a ledger-native restore cannot do without — per the mapping
+# comment above, the canonical ledger "MUST be restored".  The per-user
+# restore path deletes a user's live rows before copying the backup
+# rows in, so discovering a missing table mid-copy (a bare "no such
+# table" OperationalError out of _fetch_backup_user_rows) would come
+# far too late — and after a dry-run preview that implied the restore
+# was fine.  A pre-ledger or unreadable backup database is therefore
+# rejected up front, with the SAME clear error on both the preview and
+# the real path.  (The whole-file swap paths deliberately stay
+# tolerant: init_schema migrates a swapped-in pre-ledger file when the
+# connection reopens, and apply_startup_restore's file-level reset
+# skips missing tables by design.)
+_REQUIRED_RESTORE_TABLES = (
+    "users", "ledger_events", "ledger_projections", "outbox_operations",
+)
+
+
+def _require_restorable_backup_db(conn: sqlite3.Connection) -> None:
+    """Raise ValueError unless ``conn`` is a readable, ledger-era backup DB."""
+    try:
+        tables = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+    except sqlite3.DatabaseError as e:
+        raise ValueError(
+            f"Not a restorable backup: database.db is not a readable "
+            f"SQLite database ({e})"
+        )
+    missing = [t for t in _REQUIRED_RESTORE_TABLES if t not in tables]
+    if missing:
+        raise ValueError(
+            f"Not a restorable backup: database.db predates the ledger "
+            f"schema (missing tables: {', '.join(missing)})"
+        )
+
+
+def _backup_db_user_ids(backup_zip: zipfile.ZipFile) -> set[int]:
+    """Return the set of user ids present in the backup's ``users`` table.
+
+    This — not metadata's ``user_ids_snapshotted`` — is what a scoped
+    restore must validate against: the snapshot list only names users
+    that had a main calendar at backup time, but database.db carries
+    EVERY user's rows, so a half-onboarded user is fully restorable.
+    Also validates the backup DB up front (see
+    :func:`_require_restorable_backup_db`).
+    """
+    with _extracted_backup_db(backup_zip) as tmp_path:
+        conn = sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True)
+        try:
+            _require_restorable_backup_db(conn)
+            return {
+                int(r[0])
+                for r in conn.execute("SELECT id FROM users").fetchall()
+            }
+        finally:
+            conn.close()
+
+
+async def _restore_db_for_users(backup_zip: zipfile.ZipFile, user_ids: list[int]) -> None:
+    """Restore database rows for specific users from the backup ZIP."""
+    with _extracted_backup_db(backup_zip) as tmp_path:
         bk_conn = sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True)
         try:
+            # Fail BEFORE any live rows are deleted: a backup without the
+            # ledger tables has nothing to put back after the delete.
+            _require_restorable_backup_db(bk_conn)
             live_db = await get_database()
             # The app connection runs in autocommit mode (isolation_level
             # =None), so without an explicit transaction every DELETE and
@@ -548,8 +659,6 @@ async def _restore_db_for_users(backup_zip: zipfile.ZipFile, user_ids: list[int]
             await live_db.commit()
         finally:
             bk_conn.close()
-    finally:
-        os.unlink(tmp_path)
 
 
 async def _restore_full_db(backup_zip: zipfile.ZipFile) -> None:
@@ -565,15 +674,8 @@ async def _restore_full_db(backup_zip: zipfile.ZipFile) -> None:
     from app.database import replace_database_file
 
     dest_db_path = get_settings().database_path
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        with backup_zip.open("database.db") as src:
-            with open(tmp_path, "wb") as dst:
-                dst.write(src.read())
+    with _extracted_backup_db(backup_zip) as tmp_path:
         await replace_database_file(tmp_path, dest_db_path)
-    finally:
-        os.unlink(tmp_path)
 
 
 async def _clear_sync_tokens(user_ids: Optional[list[int]] = None) -> None:
@@ -741,51 +843,54 @@ def _preview_restore(zip_path: str, user_ids: list[int]) -> list[dict]:
     """Open the backup DB read-only and report per-user row counts.
 
     This is the dry-run preview: it states what the restore WOULD
-    replace, without touching the live DB or Google.
+    replace, without touching the live DB or Google.  It applies the
+    same up-front backup-DB validation as the real restore path
+    (:func:`_require_restorable_backup_db`) — a preview must not imply
+    that an unrestorable (pre-ledger / corrupt) backup would restore
+    fine.
     """
     actions: list[dict] = []
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            with zf.open("database.db") as src, open(tmp_path, "wb") as dst:
-                dst.write(src.read())
-        conn = sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-
-        def _count(sql: str, params: tuple) -> int:
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        with _extracted_backup_db(zf) as tmp_path:
+            conn = sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
             try:
-                row = conn.execute(sql, params).fetchone()
-                return int(row["n"]) if row else 0
-            except sqlite3.DatabaseError:
-                return 0  # pre-ledger backup, or not a usable database
+                _require_restorable_backup_db(conn)
 
-        for uid in user_ids:
-            actions.append({
-                "action": "restore_user",
-                "user_id": uid,
-                "ledger_events": _count(
-                    "SELECT COUNT(*) AS n FROM ledger_events WHERE user_id = ?",
-                    (uid,),
-                ),
-                "ledger_projections": _count(
-                    """SELECT COUNT(*) AS n FROM ledger_projections
-                        WHERE ledger_event_id IN (
-                            SELECT id FROM ledger_events WHERE user_id = ?)""",
-                    (uid,),
-                ),
-                "client_calendars": _count(
-                    "SELECT COUNT(*) AS n FROM client_calendars WHERE user_id = ?",
-                    (uid,),
-                ),
-                "note": (
-                    "DB rows replaced from backup; calendars then "
-                    "re-converged idempotently via the ledger outbox"
-                ),
-            })
-        conn.close()
-    finally:
-        os.unlink(tmp_path)
+                def _count(sql: str, params: tuple) -> int:
+                    try:
+                        row = conn.execute(sql, params).fetchone()
+                        return int(row["n"]) if row else 0
+                    except sqlite3.DatabaseError:
+                        # Defensive: tables beyond the required set may
+                        # be absent in an old-but-restorable backup.
+                        return 0
+
+                for uid in user_ids:
+                    actions.append({
+                        "action": "restore_user",
+                        "user_id": uid,
+                        "ledger_events": _count(
+                            "SELECT COUNT(*) AS n FROM ledger_events WHERE user_id = ?",
+                            (uid,),
+                        ),
+                        "ledger_projections": _count(
+                            """SELECT COUNT(*) AS n FROM ledger_projections
+                                WHERE ledger_event_id IN (
+                                    SELECT id FROM ledger_events WHERE user_id = ?)""",
+                            (uid,),
+                        ),
+                        "client_calendars": _count(
+                            "SELECT COUNT(*) AS n FROM client_calendars WHERE user_id = ?",
+                            (uid,),
+                        ),
+                        "note": (
+                            "DB rows replaced from backup; calendars then "
+                            "re-converged idempotently via the ledger outbox"
+                        ),
+                    })
+            finally:
+                conn.close()
     return actions
 
 
@@ -815,8 +920,14 @@ async def restore_from_backup(
     Args:
         backup_id:          ID of the backup to restore from.
         user_ids:           Users to restore. None = all users in the backup.
-        restore_db:         Whether to replace the DB rows.
-        restore_calendars:  Whether to re-converge Google after the DB restore.
+        restore_db:         Whether to replace the DB rows.  This also
+                            resets the restored projections and clears
+                            sync tokens (step 2 is inseparable from a
+                            ledger rewrite).
+        restore_calendars:  Whether to run the immediate Google
+                            re-converge pass after the DB restore.  If
+                            False, the reset state simply waits for the
+                            next scheduled reconcile.
         dry_run:            Preview what would be restored; touch nothing.
 
     Returns a summary dict.
@@ -835,11 +946,18 @@ async def restore_from_backup(
         # this backup.  _restore_single_user deletes the live rows
         # before loading the backup rows, so a typo'd / stale id would
         # otherwise wipe that live user with nothing to restore.
-        unknown = sorted(set(user_ids) - set(backup_user_ids))
+        # Validate against the backup DATABASE's users table, not
+        # metadata's user_ids_snapshotted: the snapshot list only holds
+        # users that had a main calendar at backup time, but
+        # database.db carries every user's rows — a half-onboarded
+        # user is fully restorable and must not be rejected.
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            present_user_ids = _backup_db_user_ids(zf)
+        unknown = sorted(set(user_ids) - present_user_ids)
         if unknown:
             raise ValueError(
                 f"users {unknown} are not in backup {backup_id} "
-                f"(snapshotted: {sorted(backup_user_ids)})"
+                f"(present in backup database: {sorted(present_user_ids)})"
             )
         target_user_ids: list[int] = list(user_ids)
     else:
@@ -907,22 +1025,45 @@ async def restore_from_backup(
                     )
             summary["db_restored"] = True
 
-        # Step 2: re-converge Google from the restored ledger.
-        if restore_calendars:
+            # Step 2: queue re-convergence.  Tied to restore_db — NOT
+            # restore_calendars — because it is what any restore that
+            # rewrites ledger state needs: the backup captured a
+            # converged ledger (applied_* == desired_*), so once the
+            # rows are rewritten every future reconcile would no-op
+            # against a live Google that may have drifted.  Skipping
+            # the immediate Google pass (restore_calendars=False) must
+            # not skip this reset, or a DB-only restore leaves Google
+            # permanently drifted (see the module docstring and
+            # apply_startup_restore, which resets for the same reason).
             await _clear_sync_tokens(target_user_ids if user_ids else None)
             db = await get_database()
             for uid in target_user_ids:
                 try:
                     n = await _reset_projections_for_reconverge(db, uid)
+                    logger.info(
+                        "Restore: reset %d projections for user %s "
+                        "(re-converges on the next reconcile)", n, uid,
+                    )
+                except Exception as e:
+                    # A user whose projections stayed applied==desired
+                    # WILL drift — record it so the audit row and the
+                    # summary make the failure visible.
+                    msg = f"projection reset failed for user {uid}: {e}"
+                    logger.error(msg)
+                    summary["errors"].append(msg)
+
+        # Step 3: immediate Google re-converge pass (optional).  With
+        # restore_db=False nothing was rewritten and nothing was reset,
+        # so this is just an ordinary on-demand reconcile.
+        if restore_calendars:
+            for uid in target_user_ids:
+                try:
                     counters = await _reconverge_user(uid, restore_started)
                     summary["events_created"] += counters["create"]
                     summary["events_updated"] += counters["update"]
                     summary["events_deleted"] += counters["delete"]
                     summary["users_restored"].append(uid)
-                    logger.info(
-                        "Restore: re-converged user %s (%d projections reset)",
-                        uid, n,
-                    )
+                    logger.info("Restore: re-converged user %s", uid)
                 except Exception as e:
                     msg = f"calendar re-converge failed for user {uid}: {e}"
                     logger.error(msg)
@@ -930,19 +1071,27 @@ async def restore_from_backup(
         else:
             summary["users_restored"] = list(target_user_ids)
 
-        # Step 3: audit log.
+        # Step 4: audit log.  The status must reflect the outcome: the
+        # admin dashboards (app/api/admin.py, app/ui/routes.py) count
+        # sync_log rows WHERE status = 'failure' as "sync errors", and
+        # no consumer recognizes 'partial' — so any restore that hit
+        # errors is recorded as 'failure' rather than hidden behind
+        # 'success' (or an invisible 'partial').  The errors themselves
+        # go into details; per-user granularity lives in the summary.
         db = await get_database()
+        audit_status = "failure" if summary["errors"] else "success"
         await db.execute(
             """INSERT INTO sync_log (action, status, details)
-               VALUES ('backup_restore', 'success', ?)""",
-            (json.dumps({
+               VALUES ('backup_restore', ?, ?)""",
+            (audit_status, json.dumps({
                 "backup_id": backup_id,
                 "users": target_user_ids,
                 "db_restored": summary["db_restored"],
                 "events_created": summary["events_created"],
                 "events_updated": summary["events_updated"],
                 "events_deleted": summary["events_deleted"],
-            }),),
+                "errors": summary["errors"],
+            })),
         )
         await db.commit()
 

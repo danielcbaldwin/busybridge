@@ -457,11 +457,29 @@ class TestRestoreFromBackupDryRun:
     async def test_dry_run_returns_planned_actions_without_modifying_db(
         self, test_db, tmp_path, monkeypatch
     ):
+        import aiosqlite
+        from app.database import init_schema
         from app.sync.backup import restore_from_backup
 
         monkeypatch.setenv("BACKUP_PATH", str(tmp_path))
 
         user_id = await _insert_user("dry-user@example.com", "dry-google")
+
+        # The preview now validates the backup's database.db up front
+        # (same check as the real restore path), so the backup must
+        # carry a real ledger-era database, not a placeholder blob.
+        backup_db = tmp_path / "dry_src.db"
+        bconn = await aiosqlite.connect(str(backup_db))
+        await init_schema(bconn)
+        await bconn.execute(
+            """INSERT INTO users
+                  (id, email, google_user_id, display_name, main_calendar_id)
+               VALUES (?, 'dry-user@example.com', 'dry-google', 'dry-user',
+                       'main-cal')""",
+            (user_id,),
+        )
+        await bconn.commit()
+        await bconn.close()
 
         metadata = {
             "backup_id": "backup-20240101-120000-daily",
@@ -469,7 +487,7 @@ class TestRestoreFromBackupDryRun:
             "created_at": "2024-01-01T12:00:00",
             "user_ids_snapshotted": [user_id],
         }
-        zip_data = _make_backup_zip(metadata)
+        zip_data = _make_backup_zip(metadata, db_bytes=backup_db.read_bytes())
         bid = metadata["backup_id"]
         (tmp_path / f"{bid}.zip").write_bytes(zip_data)
 
@@ -573,7 +591,13 @@ class TestRestorePreservesLedger:
             bid,
             user_ids=[1],             # subset → exercises the per-user path
             restore_db=True,
-            restore_calendars=False,  # skip the Google re-converge
+            # Skips only the IMMEDIATE Google re-converge pass.  The
+            # projection reset + sync-token clearing still run: they are
+            # tied to restore_db (any restore that rewrites ledger
+            # state), otherwise the restored applied==desired state
+            # would make every future reconcile a no-op and leave
+            # Google permanently drifted.
+            restore_calendars=False,
             dry_run=False,
         )
         assert result["db_restored"] is True
@@ -584,9 +608,15 @@ class TestRestorePreservesLedger:
         )).fetchall()
         assert [r["summary"] for r in ev] == ["Restored meeting"]
         proj = await (await live.execute(
-            "SELECT desired_state FROM ledger_projections WHERE ledger_event_id = 10"
+            """SELECT desired_state, current_state, applied_ledger_version
+                 FROM ledger_projections WHERE ledger_event_id = 10"""
         )).fetchall()
         assert [r["desired_state"] for r in proj] == ["present_full"]
+        # Even with restore_calendars=False the restored projection is
+        # RESET (applied_* nulled, current_state 'unknown') so the next
+        # scheduled reconcile re-asserts it against Google.
+        assert proj[0]["current_state"] == "unknown"
+        assert proj[0]["applied_ledger_version"] is None
         ob = await (await live.execute(
             "SELECT operation FROM outbox_operations WHERE user_id = 1"
         )).fetchall()
