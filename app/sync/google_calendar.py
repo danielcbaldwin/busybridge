@@ -18,14 +18,25 @@ logger = logging.getLogger(__name__)
 # Server errors worth retrying (rate-limit errors are handled separately).
 _RETRYABLE_SERVER_STATUSES = {500, 502, 503}
 
+# Google encodes quota / rate-limit errors as one of these reason codes,
+# carried in an HTTP 403 (classic) or 429 response.  Lowercase substring
+# checks — same classification as app/ledger/outbox.py.
+_RATE_LIMIT_TOKENS = (
+    "ratelimitexceeded",
+    "userratelimitexceeded",
+    "quotaexceeded",
+    "dailylimitexceeded",
+    "rate limit exceeded",
+)
+
 
 def _is_rate_limit_error(error: HttpError) -> bool:
     """Check if an HttpError is a rate-limit (not a permission) error."""
     if error.resp.status == 429:
         return True
     if error.resp.status == 403:
-        msg = str(error)
-        return "rateLimitExceeded" in msg or "Rate Limit Exceeded" in msg
+        msg = str(error).lower()
+        return any(tok in msg for tok in _RATE_LIMIT_TOKENS)
     return False
 
 

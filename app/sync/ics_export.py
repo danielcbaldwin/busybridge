@@ -11,9 +11,10 @@ ICS is generated from events fetched via the Google Calendar API.
 import logging
 import os
 import re
+import secrets
 import zipfile
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from app.config import get_settings
@@ -34,8 +35,27 @@ def _escape_ics(text: str) -> str:
     text = text.replace("\\", "\\\\")
     text = text.replace(";", "\\;")
     text = text.replace(",", "\\,")
+    # Normalise CRLF / lone CR to LF first — a raw CR in the output
+    # would corrupt the CRLF line structure of the file.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\n", "\\n")
     return text
+
+
+def _quote_param(value: str) -> str:
+    """Format a parameter value (e.g. CN=) per RFC 5545.
+
+    Parameter values are NOT backslash-escaped like property values.
+    A value containing ``,``, ``;`` or ``:`` must instead be
+    double-quoted; DQUOTE itself can never appear in a parameter
+    value, so it is replaced with a single quote.  Newlines are not
+    allowed either — collapse them to spaces.
+    """
+    value = value.replace('"', "'")
+    value = value.replace("\r", " ").replace("\n", " ")
+    if any(ch in value for ch in ",;:"):
+        return f'"{value}"'
+    return value
 
 
 def _fold_line(line: str) -> str:
@@ -58,43 +78,48 @@ def _fold_line(line: str) -> str:
 
 def _format_dt(dt_dict: dict, prop_name: str) -> Optional[str]:
     """Convert a Google Calendar start/end dict to an ICS line."""
+    formatted = _format_dt_value(dt_dict)
+    if formatted is None:
+        return None
+    params, value = formatted
+    return f"{prop_name}{params}:{value}"
+
+
+def _format_dt_value(dt_dict: dict) -> Optional[tuple[str, str]]:
+    """Format a Google start/end dict as an ICS (params, value) pair.
+
+    ``params`` is the parameter string to append to the property name
+    (``;VALUE=DATE``, ``;TZID=...`` or empty); ``value`` is the
+    formatted date / date-time.  Keeping them separate lets callers
+    emit valid property lines (``EXDATE;TZID=...:value`` — a parameter
+    can never appear after the colon).
+    """
     if "date" in dt_dict:
-        d = dt_dict["date"].replace("-", "")
-        return f"{prop_name};VALUE=DATE:{d}"
+        return ";VALUE=DATE", dt_dict["date"].replace("-", "")
     elif "dateTime" in dt_dict:
         raw = dt_dict["dateTime"]
         tz = dt_dict.get("timeZone")
+        raw = re.sub(r"\.\d+", "", raw)  # fractional seconds are invalid in ICS
         if raw.endswith("Z"):
-            clean = re.sub(r"[:\-]", "", raw.replace("Z", "")) + "Z"
-            return f"{prop_name}:{clean}"
-        dt_part = re.sub(r"[+\-]\d{2}:\d{2}$", "", raw)
-        clean = re.sub(r"[:\-]", "", dt_part)
+            return "", re.sub(r"[:\-]", "", raw[:-1]) + "Z"
         if tz:
-            return f"{prop_name};TZID={tz}:{clean}"
-        return f"{prop_name}:{clean}Z"
-    return None
-
-
-def _format_dt_value(dt_dict: dict) -> Optional[str]:
-    """Return just the formatted value (no property name) for EXDATE use."""
-    if "date" in dt_dict:
-        return dt_dict["date"].replace("-", "")
-    elif "dateTime" in dt_dict:
-        raw = dt_dict["dateTime"]
-        tz = dt_dict.get("timeZone")
-        if raw.endswith("Z"):
-            return re.sub(r"[:\-]", "", raw.replace("Z", "")) + "Z"
-        dt_part = re.sub(r"[+\-]\d{2}:\d{2}$", "", raw)
-        clean = re.sub(r"[:\-]", "", dt_part)
-        if tz:
-            return f"TZID={tz}:{clean}"
-        return clean + "Z"
+            # Named timezone: keep the local wall time, drop any offset.
+            dt_part = re.sub(r"[+\-]\d{2}:\d{2}$", "", raw)
+            return f";TZID={tz}", re.sub(r"[:\-]", "", dt_part)
+        # Offset-bearing dateTime with no named timezone (what Google
+        # returns for single events): convert to UTC before labelling
+        # the value ``Z`` — just stripping the offset would shift the
+        # event by the UTC offset.
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
+        return "", dt.strftime("%Y%m%dT%H%M%S") + "Z"
     return None
 
 
 def _clean_timestamp(ts: str) -> str:
-    """Convert Google timestamp to ICS format."""
-    return re.sub(r"[:\-]", "", ts.replace(".000Z", "Z").replace(".000", ""))
+    """Convert Google timestamp to ICS format (drops fractional seconds)."""
+    return re.sub(r"[:\-]", "", re.sub(r"\.\d+", "", ts))
 
 
 def _build_conference_description(event: dict) -> str:
@@ -197,12 +222,13 @@ _COLOR_MAP = {
 }
 
 
-def _event_to_vevent(event: dict, exdates: list[str] = None) -> Optional[str]:
+def _event_to_vevent(event: dict, exdates: list[tuple[str, str]] = None) -> Optional[str]:
     """Convert a Google Calendar event dict to a VEVENT block.
 
     Args:
         event: Google Calendar event dict
-        exdates: List of pre-formatted EXDATE values for cancelled recurring instances
+        exdates: List of (params, value) pairs from _format_dt_value for
+            cancelled recurring instances
     """
     if event.get("status") == "cancelled":
         return None
@@ -276,10 +302,12 @@ def _event_to_vevent(event: dict, exdates: list[str] = None) -> Optional[str]:
     for rule in event.get("recurrence", []):
         lines.append(_fold_line(rule))
 
-    # EXDATE — cancelled instances of this recurring event
+    # EXDATE — cancelled instances of this recurring event.  The params
+    # (;TZID=... for timed, ;VALUE=DATE for all-day) must match the
+    # DTSTART form and go before the colon.
     if exdates:
-        for exdate in exdates:
-            lines.append(_fold_line(f"EXDATE:{exdate}"))
+        for exdate_params, exdate_value in exdates:
+            lines.append(_fold_line(f"EXDATE{exdate_params}:{exdate_value}"))
 
     # Color
     color_id = event.get("colorId")
@@ -303,7 +331,7 @@ def _event_to_vevent(event: dict, exdates: list[str] = None) -> Optional[str]:
         partstat = partstat_map.get(rsvp, "NEEDS-ACTION")
         parts = [f"PARTSTAT={partstat}"]
         if name:
-            parts.append(f"CN={_escape_ics(name)}")
+            parts.append(f"CN={_quote_param(name)}")
         if attendee.get("organizer"):
             parts.append("ROLE=CHAIR")
         elif attendee.get("optional"):
@@ -320,7 +348,7 @@ def _event_to_vevent(event: dict, exdates: list[str] = None) -> Optional[str]:
         org_name = organizer.get("displayName", "")
         if org_name:
             lines.append(_fold_line(
-                f"ORGANIZER;CN={_escape_ics(org_name)}:mailto:{organizer['email']}"
+                f"ORGANIZER;CN={_quote_param(org_name)}:mailto:{organizer['email']}"
             ))
         else:
             lines.append(_fold_line(f"ORGANIZER:mailto:{organizer['email']}"))
@@ -358,7 +386,7 @@ def _event_to_vevent(event: dict, exdates: list[str] = None) -> Optional[str]:
             if mime_type:
                 attach_parts.append(f"FMTTYPE={mime_type}")
             if title:
-                attach_parts.append(f"FILENAME={_escape_ics(title)}")
+                attach_parts.append(f"FILENAME={_quote_param(title)}")
             if attach_parts:
                 lines.append(_fold_line(f"ATTACH;{';'.join(attach_parts)}:{file_url}"))
             else:
@@ -404,7 +432,7 @@ def _events_to_ics(events: list[dict], calendar_name: str) -> str:
     ])
 
     # Collect cancelled instances to build EXDATE entries per parent event
-    exdates_by_parent: dict[str, list[str]] = defaultdict(list)
+    exdates_by_parent: dict[str, list[tuple[str, str]]] = defaultdict(list)
     active_events = []
 
     for event in events:
@@ -443,6 +471,23 @@ def _safe_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*]', '_', name)
     name = name.strip('. ')
     return name or "calendar"
+
+
+def _unique_entry_name(name: str, used: set[str]) -> str:
+    """Return a ZIP entry name not already in ``used`` (and record it).
+
+    Duplicate calendar names (across users, or two client calendars
+    with the same display name) would otherwise write the same entry
+    name twice — ZipFile happily appends both, and most extractors
+    silently keep only one.
+    """
+    candidate = f"{name}.ics"
+    counter = 2
+    while candidate in used:
+        candidate = f"{name}-{counter}.ics"
+        counter += 1
+    used.add(candidate)
+    return candidate
 
 
 def _is_busybridge_event(event: dict) -> bool:
@@ -487,11 +532,15 @@ def _is_busybridge_event(event: dict) -> bool:
 # Fetch events from all calendars
 # ---------------------------------------------------------------------------
 
-async def _fetch_all_user_calendars(user_id: int) -> list[dict]:
+async def _fetch_all_user_calendars(user_id: int) -> tuple[list[dict], list[str]]:
     """Fetch all events from all calendars for a user via the Calendar API.
 
-    Returns list of dicts with: calendar_name, events
-    Events include cancelled instances (needed for EXDATE generation).
+    Returns (results, errors):
+      - results: list of dicts with calendar_name, events.  Events
+        include cancelled instances (needed for EXDATE generation).
+      - errors: per-calendar fetch failures, so the backup metadata can
+        surface calendars missing from the ZIPs (mirrors backup.py's
+        snapshot_errors) instead of silently reporting success.
     """
     from app.auth.google import get_valid_access_token
     from app.sync.google_calendar import AsyncGoogleCalendarClient
@@ -502,9 +551,10 @@ async def _fetch_all_user_calendars(user_id: int) -> list[dict]:
     cursor = await db.execute("SELECT * FROM users WHERE id = ?", (user_id,))
     user = await cursor.fetchone()
     if not user or not user["main_calendar_id"]:
-        return []
+        return [], []
 
     results = []
+    errors: list[str] = []
 
     # Full export — wide time range to capture everything
     time_min = datetime(2000, 1, 1)
@@ -530,6 +580,7 @@ async def _fetch_all_user_calendars(user_id: int) -> list[dict]:
         })
     except Exception as e:
         logger.error(f"ICS export: main calendar failed for user {user_id}: {e}")
+        errors.append(f"user {user_id}: main calendar failed: {e}")
 
     # Client calendars
     cursor = await db.execute(
@@ -563,8 +614,9 @@ async def _fetch_all_user_calendars(user_id: int) -> list[dict]:
             })
         except Exception as e:
             logger.error(f"ICS export: client calendar {cal['id']} failed: {e}")
+            errors.append(f"user {user_id}: client calendar {cal['id']} failed: {e}")
 
-    return results
+    return results, errors
 
 
 # ---------------------------------------------------------------------------
@@ -586,7 +638,9 @@ async def create_ics_backup() -> dict:
     """
     db = await get_database()
     now = datetime.now()
-    timestamp = now.strftime("%Y%m%d-%H%M%S")
+    # A random suffix keeps two backups started in the same second
+    # from colliding on the same id (and overwriting each other's ZIPs).
+    timestamp = f"{now.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
 
     full_id = f"{ICS_FULL_PREFIX}{timestamp}"
     clean_id = f"{ICS_CLEAN_PREFIX}{timestamp}"
@@ -605,34 +659,50 @@ async def create_ics_backup() -> dict:
     total_clean = 0
     errors = []
 
-    with zipfile.ZipFile(full_path, "w", zipfile.ZIP_DEFLATED) as zf_full, \
-         zipfile.ZipFile(clean_path, "w", zipfile.ZIP_DEFLATED) as zf_clean:
+    used_names: set[str] = set()
 
-        for user in users:
+    try:
+        with zipfile.ZipFile(full_path, "w", zipfile.ZIP_DEFLATED) as zf_full, \
+             zipfile.ZipFile(clean_path, "w", zipfile.ZIP_DEFLATED) as zf_clean:
+
+            for user in users:
+                try:
+                    calendars, fetch_errors = await _fetch_all_user_calendars(user["id"])
+                    errors.extend(fetch_errors)
+                except Exception as e:
+                    errors.append(f"user {user['id']}: {e}")
+                    continue
+
+                for cal in calendars:
+                    total_calendars += 1
+                    events = cal["events"]
+                    # user-id prefix + dedupe suffix: entry names are shared
+                    # across all users, and clashing names would silently
+                    # clobber each other in the ZIPs.
+                    name = _safe_filename(f"user{user['id']} - {cal['calendar_name']}")
+                    filename = _unique_entry_name(name, used_names)
+
+                    # Full ICS — all events
+                    full_ics = _events_to_ics(events, cal["calendar_name"])
+                    zf_full.writestr(filename, full_ics)
+                    active_count = sum(1 for e in events if e.get("status") != "cancelled")
+                    total_full += active_count
+
+                    # Clean ICS — BusyBridge events removed
+                    clean_events = [e for e in events if not _is_busybridge_event(e)]
+                    clean_ics = _events_to_ics(clean_events, cal["calendar_name"])
+                    zf_clean.writestr(filename, clean_ics)
+                    clean_active = sum(1 for e in clean_events if e.get("status") != "cancelled")
+                    total_clean += clean_active
+    except BaseException:
+        # Never leave half-written ZIPs that masquerade as backups —
+        # retention would count them against the daily/weekly quota.
+        for path in (full_path, clean_path):
             try:
-                calendars = await _fetch_all_user_calendars(user["id"])
-            except Exception as e:
-                errors.append(f"user {user['id']}: {e}")
-                continue
-
-            for cal in calendars:
-                total_calendars += 1
-                events = cal["events"]
-                name = _safe_filename(cal["calendar_name"])
-                filename = f"{name}.ics"
-
-                # Full ICS — all events
-                full_ics = _events_to_ics(events, cal["calendar_name"])
-                zf_full.writestr(filename, full_ics)
-                active_count = sum(1 for e in events if e.get("status") != "cancelled")
-                total_full += active_count
-
-                # Clean ICS — BusyBridge events removed
-                clean_events = [e for e in events if not _is_busybridge_event(e)]
-                clean_ics = _events_to_ics(clean_events, cal["calendar_name"])
-                zf_clean.writestr(filename, clean_ics)
-                clean_active = sum(1 for e in clean_events if e.get("status") != "cancelled")
-                total_clean += clean_active
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        raise
 
     metadata = {
         "created_at": now.isoformat(),
@@ -688,7 +758,8 @@ def list_ics_backups() -> list[dict]:
     for ts in sorted(timestamps.keys(), reverse=True):
         entry = timestamps[ts]
         try:
-            dt = datetime.strptime(ts, "%Y%m%d-%H%M%S")
+            # Ignore the random collision suffix (ts[:15] = YYYYMMDD-HHMMSS)
+            dt = datetime.strptime(ts[:15], "%Y%m%d-%H%M%S")
             created_at = dt.isoformat()
         except ValueError:
             created_at = ts
@@ -729,7 +800,8 @@ def apply_ics_retention_policy() -> dict:
     by_type: dict[str, list] = {"daily": [], "weekly": [], "monthly": []}
     for b in backups:
         try:
-            dt = datetime.strptime(b["timestamp"], "%Y%m%d-%H%M%S")
+            # Ignore the random collision suffix (ts[:15] = YYYYMMDD-HHMMSS)
+            dt = datetime.strptime(b["timestamp"][:15], "%Y%m%d-%H%M%S")
             btype = _classify_backup(dt)
         except ValueError:
             btype = "daily"
