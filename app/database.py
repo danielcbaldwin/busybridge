@@ -77,6 +77,23 @@ CREATE TABLE IF NOT EXISTS client_calendars (
     disconnected_at TIMESTAMP
 );
 
+-- One ACTIVE connection per (user, Google calendar).  Partial on
+-- is_active because disconnect + reconnect legitimately leaves
+-- inactive duplicates behind; this closes the check-then-insert race
+-- in the connect endpoints, where a slow Google verify call sits
+-- between the duplicate check and the INSERT.
+-- The UPDATE first retires any duplicates a pre-index database may
+-- already contain (keeping the oldest row), so creating the index
+-- can't fail at startup; on a clean database it is a no-op.
+UPDATE client_calendars
+    SET is_active = FALSE, disconnected_at = CURRENT_TIMESTAMP
+    WHERE is_active AND id NOT IN (
+        SELECT MIN(id) FROM client_calendars
+        WHERE is_active GROUP BY user_id, google_calendar_id
+    );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_client_calendars_active_unique
+    ON client_calendars(user_id, google_calendar_id) WHERE is_active;
+
 -- Tracks sync state for each calendar
 CREATE TABLE IF NOT EXISTS calendar_sync_state (
     id INTEGER PRIMARY KEY,

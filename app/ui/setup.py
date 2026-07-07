@@ -34,6 +34,13 @@ _oobe_data: dict = {}
 
 _OOBE_COOKIE = "oobe_session"
 
+# Set by the final step-6 commit to the completing browser's session
+# token.  is_oobe_completed() flips to True the moment the commit
+# lands, which bounces every /setup request to /app — this token lets
+# exactly the browser that finished the wizard still render the
+# step-7 completion page it was redirected to.
+_oobe_completed_token: Optional[str] = None
+
 # Serialises the first-request bind so two concurrent first visitors
 # cannot both mint a session token.
 _oobe_lock = asyncio.Lock()
@@ -142,10 +149,20 @@ async def setup_wizard(
 ):
     """OOBE setup wizard."""
     if await is_oobe_completed():
-        return RedirectResponse(url="/app", status_code=status.HTTP_302_FOUND)
-
-    # Bind the wizard to this browser on its very first request.
-    token = await _ensure_oobe_session(request)
+        # The final commit redirects here with ?step=7 AFTER setup is
+        # complete — let exactly the browser that committed step 6 see
+        # the completion page; every other request goes to the app.
+        cookies = getattr(request, "cookies", None) or {}
+        if not (
+            step == 7
+            and _oobe_completed_token
+            and cookies.get(_OOBE_COOKIE) == _oobe_completed_token
+        ):
+            return RedirectResponse(url="/app", status_code=status.HTTP_302_FOUND)
+        token = _oobe_completed_token
+    else:
+        # Bind the wizard to this browser on its very first request.
+        token = await _ensure_oobe_session(request)
 
     # Step 5 (service-account upload) was removed at the Stage-5
     # cutover; the wizard now jumps step 4 → step 6 (encryption).
@@ -256,6 +273,7 @@ async def setup_step_2(request: Request):
 async def test_credentials(request: Request):
     """Test OAuth credentials."""
     await _reject_if_oobe_done()
+    _require_oobe_session(request)
     form = await request.form()
     client_id = form.get("client_id", "").strip()
     client_secret = form.get("client_secret", "").strip()
@@ -389,12 +407,51 @@ async def setup_step_4(request: Request):
 
 @router.post("/step/4/test")
 async def test_email(request: Request):
-    """Send test email."""
+    """Send a test email with the SMTP values from the form."""
     await _reject_if_oobe_done()
+    _require_oobe_session(request)
     form = await request.form()
 
-    # This would actually test the email settings
-    # For now, return success
+    smtp_host = form.get("smtp_host", "").strip()
+    if not smtp_host:
+        return {"success": False, "error": "SMTP host is required"}
+
+    # Recipient: an explicit form value, falling back to the admin
+    # account from step 3.
+    to_address = form.get("to", "").strip() or _oobe_data.get("admin_email", "")
+    if not to_address:
+        return {"success": False, "error": "No recipient address available"}
+
+    # Same message + transport as app.alerts.email.send_email, but
+    # built from the form's SMTP values — during OOBE nothing has been
+    # saved to the settings table yet, so the DB-backed helper cannot
+    # be reused directly.
+    from email.mime.text import MIMEText
+
+    import aiosmtplib
+
+    msg = MIMEText(
+        "This is a test email from Calendar Sync Engine.\n\n"
+        "If you received this, your email configuration is working correctly.",
+        "plain",
+    )
+    msg["Subject"] = "Calendar Sync - Test Email"
+    msg["From"] = form.get("from_address", "").strip() or form.get("smtp_username", "").strip()
+    msg["To"] = to_address
+
+    try:
+        await aiosmtplib.send(
+            msg,
+            hostname=smtp_host,
+            port=int(form.get("smtp_port") or 587),
+            username=form.get("smtp_username", "").strip() or None,
+            password=form.get("smtp_password", "") or None,
+            start_tls=True,
+        )
+    except Exception as e:
+        logger.warning(f"OOBE test email failed: {e}")
+        return {"success": False, "error": "Failed to send test email. Check the SMTP settings."}
+
     return {"success": True}
 
 
@@ -546,6 +603,12 @@ async def setup_step_6(request: Request):
         await set_setting("alerts_enabled", "false")
 
     # Service-account activation block was removed at the cutover.
+
+    # Remember which browser completed setup so the redirect below can
+    # still render the step-7 completion page now that
+    # is_oobe_completed() bounces everyone else to /app.
+    global _oobe_completed_token
+    _oobe_completed_token = _oobe_data.get("_session_token")
 
     # Clear OOBE data
     _oobe_data.clear()

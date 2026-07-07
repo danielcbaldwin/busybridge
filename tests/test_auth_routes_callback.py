@@ -93,6 +93,20 @@ class TestOAuthCallbackInvalidState:
             await oauth_callback(request=req, code="somecode", state="nonexistent-state")
         assert exc_info.value.status_code == 400
 
+    @pytest.mark.asyncio
+    async def test_wrong_state_type_raises_400(self, test_db):
+        from app.auth.routes import oauth_callback
+        from fastapi import HTTPException
+
+        state = "wrong-type-login-state"
+        await _store_state(state, "client")  # "client" type, not "login"
+
+        req = _fake_request()
+        with pytest.raises(HTTPException) as exc_info:
+            await oauth_callback(request=req, code="code", state=state)
+        assert exc_info.value.status_code == 400
+        assert "state type" in exc_info.value.detail.lower()
+
 
 # ---------------------------------------------------------------------------
 # oauth_callback — domain mismatch
@@ -315,6 +329,48 @@ class TestOAuthCallbackMainCalendarInit:
         row = await cursor.fetchone()
         assert row is not None
         assert row["main_calendar_id"] == "primary@example.com"
+
+
+# ---------------------------------------------------------------------------
+# oauth_callback — session cookie lifetime follows settings
+# ---------------------------------------------------------------------------
+
+
+class TestOAuthCallbackCookieMaxAge:
+    @pytest.mark.asyncio
+    async def test_session_cookie_max_age_uses_session_expire_days(self, test_db, monkeypatch):
+        from app.auth.routes import oauth_callback
+
+        state = "cookie-max-age-state"
+        await _store_state(state, "login", next_url="/app")
+
+        async def fake_exchange(code, redirect_uri):
+            return {"access_token": "tok", "refresh_token": "ref", "expires_in": 3600}
+
+        async def fake_user_info(token):
+            return {"email": "cookie@example.com", "id": "gid-cookie", "name": "Cookie User"}
+
+        from types import SimpleNamespace
+        monkeypatch.setattr("app.auth.routes.exchange_code_for_tokens", fake_exchange)
+        monkeypatch.setattr("app.auth.routes.get_user_info", fake_user_info)
+        monkeypatch.setattr("app.auth.routes.store_oauth_tokens", AsyncMock(return_value=1))
+        monkeypatch.setattr("app.auth.routes.update_user_last_login", AsyncMock())
+        monkeypatch.setattr(
+            "app.auth.routes.get_settings",
+            lambda: SimpleNamespace(test_mode=False, public_url="http://localhost:3000", session_expire_days=3),
+        )
+        monkeypatch.setattr("app.auth.routes.get_organization", AsyncMock(return_value=None))
+        monkeypatch.setattr("app.auth.routes.is_oobe_completed", AsyncMock(return_value=True))
+        monkeypatch.setattr(
+            "app.auth.routes.fetch_calendar_list",
+            AsyncMock(return_value=[{"id": "primary@example.com", "primary": True}]),
+        )
+
+        req = _fake_request()
+        resp = await oauth_callback(request=req, code="code", state=state)
+
+        # 3 days * 86400 seconds — not the old hardcoded 7 days.
+        assert "max-age=259200" in resp.headers["set-cookie"].lower()
 
 
 # ---------------------------------------------------------------------------

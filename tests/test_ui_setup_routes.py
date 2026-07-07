@@ -186,7 +186,7 @@ async def test_setup_step4_and_step6_completion_flow(test_db, monkeypatch, tmp_p
     now a redirect to step 6.)
     """
     from app.ui import setup as setup_module
-    from app.ui.setup import setup_complete, setup_step_4, setup_step_6, test_email
+    from app.ui.setup import setup_complete, setup_step_4, setup_step_6, setup_wizard, test_email
 
     setup_module._oobe_data.clear()
     # Step 4 now requires the admin OAuth step to have completed.
@@ -214,7 +214,40 @@ async def test_setup_step4_and_step6_completion_flow(test_db, monkeypatch, tmp_p
     assert setup_module._oobe_data["smtp_enabled"] is True
     assert setup_module._oobe_data["smtp_port"] == 2525
 
-    assert (await test_email(FakeFormRequest({})))["success"] is True
+    # Test email sends through SMTP with the form's values.
+    sent = {}
+
+    async def fake_smtp_send(msg, **kwargs):
+        sent["to"] = msg["To"]
+        sent.update(kwargs)
+
+    monkeypatch.setattr("aiosmtplib.send", fake_smtp_send)
+    ok = await test_email(
+        FakeFormRequest(
+            {
+                "smtp_host": "smtp.example.com",
+                "smtp_port": "2525",
+                "smtp_username": "user",
+                "smtp_password": "pass",
+                "from_address": "noreply@example.com",
+            }
+        )
+    )
+    assert ok["success"] is True
+    assert sent["hostname"] == "smtp.example.com"
+    assert sent["port"] == 2525
+    # Falls back to the step-3 admin as the recipient.
+    assert sent["to"] == "admin@example.com"
+
+    # An SMTP failure surfaces as success=False, not an exception.
+    async def failing_smtp_send(*_args, **_kwargs):
+        raise RuntimeError("smtp down")
+
+    monkeypatch.setattr("aiosmtplib.send", failing_smtp_send)
+    assert (await test_email(FakeFormRequest({"smtp_host": "smtp.example.com"})))["success"] is False
+
+    # A missing host is rejected without attempting a send.
+    assert (await test_email(FakeFormRequest({})))["success"] is False
 
     # Step 6 requires confirmation.
     setup_module._oobe_data["encryption_key_b64"] = "abc"
@@ -248,14 +281,44 @@ async def test_setup_step4_and_step6_completion_flow(test_db, monkeypatch, tmp_p
 
     monkeypatch.setattr(
         "app.ui.setup.get_settings",
-        lambda: SimpleNamespace(encryption_key_file=str(key_path)),
+        lambda: SimpleNamespace(
+            encryption_key_file=str(key_path),
+            test_mode=False,
+            public_url="http://localhost:3000",
+        ),
     )
+
+    # Bind the wizard to a browser so the completion page below can be
+    # checked against the completing session's cookie.
+    setup_module._oobe_data["_session_token"] = "route-test-oobe-token"
 
     completed = await setup_step_6(FakeFormRequest({"confirmed": "on"}))
     assert completed.status_code == 302
     assert completed.headers["location"].startswith("/setup?step=7")
     assert key_path.exists()
     assert setup_module._oobe_data == {}
+
+    # The redirect target must actually render for the completing
+    # browser, even though is_oobe_completed() is now True.
+    def _step7_request(cookie_value):
+        headers = []
+        if cookie_value is not None:
+            headers.append(
+                (b"cookie", f"{setup_module._OOBE_COOKIE}={cookie_value}".encode())
+            )
+        return Request({
+            "type": "http", "method": "GET", "path": "/setup",
+            "headers": headers, "query_string": b"step=7",
+        })
+
+    page7 = await setup_wizard(_step7_request("route-test-oobe-token"), step=7)
+    assert page7.status_code == 200
+    assert b"Setup Complete" in page7.body
+
+    # A different browser (no cookie) is still bounced to the app.
+    bounced = await setup_wizard(_step7_request(None), step=7)
+    assert bounced.status_code == 302
+    assert bounced.headers["location"] == "/app"
 
     db = await get_database()
     cursor = await db.execute("SELECT COUNT(*) FROM organization")
@@ -276,7 +339,7 @@ async def test_oobe_session_binding_rejects_a_second_browser(test_db, monkeypatc
     import app.ui.setup as setup_module
     from fastapi import HTTPException
 
-    from app.ui.setup import _OOBE_COOKIE, setup_step_2, step_3_auth
+    from app.ui.setup import _OOBE_COOKIE, setup_step_2, step_3_auth, test_credentials, test_email
 
     setup_module._oobe_data.clear()
 
@@ -315,6 +378,20 @@ async def test_oobe_session_binding_rejects_a_second_browser(test_db, monkeypatc
     # A forged cookie is rejected.
     with pytest.raises(HTTPException) as exc:
         await step_3_auth(_req("not-the-token"))
+    assert exc.value.status_code == 403
+
+    # The test-credentials and test-email POSTs are bound too.
+    class _ForeignFormRequest(FakeFormRequest):
+        @property
+        def cookies(self) -> dict:
+            return {}
+
+    with pytest.raises(HTTPException) as exc:
+        await test_credentials(_ForeignFormRequest({"client_id": "x", "client_secret": "y"}))
+    assert exc.value.status_code == 403
+
+    with pytest.raises(HTTPException) as exc:
+        await test_email(_ForeignFormRequest({"smtp_host": "smtp.example.com"}))
     assert exc.value.status_code == 403
 
     # The original browser, carrying the bound token, proceeds to the

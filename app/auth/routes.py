@@ -163,6 +163,12 @@ async def oauth_callback(
             detail="Invalid or expired state parameter"
         )
 
+    if state_data.get("type") != "login":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid state type"
+        )
+
     redirect_uri = get_redirect_uri(request, "/auth/callback")
 
     try:
@@ -274,7 +280,7 @@ async def oauth_callback(
             httponly=True,
             secure=session_cookie_secure(),
             samesite="lax",
-            max_age=60 * 60 * 24 * 7  # 7 days
+            max_age=settings.session_expire_days * 86400  # matches the JWT expiry
         )
 
         return response

@@ -2,6 +2,7 @@
 
 import json
 import logging
+import sqlite3
 from datetime import datetime
 from typing import Optional
 
@@ -159,14 +160,24 @@ async def connect_personal_calendars(
             )
             continue
 
-        # Create the personal calendar connection (no color needed)
-        cursor = await db.execute(
-            """INSERT INTO client_calendars
-               (user_id, oauth_token_id, google_calendar_id, display_name, calendar_type)
-               VALUES (?, ?, ?, ?, 'personal')
-               RETURNING id""",
-            (user.id, request.token_id, calendar_id, display_name)
-        )
+        # Create the personal calendar connection (no color needed).
+        # The already-connected check above runs BEFORE the slow Google
+        # verify call, so a concurrent connect of the same calendar can
+        # slip past it — the partial UNIQUE index on active
+        # (user_id, google_calendar_id) is the real guard.
+        try:
+            cursor = await db.execute(
+                """INSERT INTO client_calendars
+                   (user_id, oauth_token_id, google_calendar_id, display_name, calendar_type)
+                   VALUES (?, ?, ?, ?, 'personal')
+                   RETURNING id""",
+                (user.id, request.token_id, calendar_id, display_name)
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Calendar already connected: {calendar_id}"
+            )
         row = await cursor.fetchone()
         new_id = row["id"]
 

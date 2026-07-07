@@ -123,9 +123,36 @@ async def test_oobe_completes_from_empty_database(test_db, tmp_path, monkeypatch
     assert "encryption_key_b64" in setup_module._oobe_data
 
     # --- Step 6 commit ------------------------------------------------
+    # Capture the wizard's session token first: the commit clears
+    # _oobe_data, and the step-7 page is only served to the browser
+    # carrying this token.
+    completing_cookie = setup_module._oobe_data["_session_token"]
     r6 = await setup_step_6(_form_request({"confirmed": "on"}))
     assert r6.status_code == 302
     assert r6.headers["location"].startswith("/setup?step=7")
+
+    # --- Step 7: the redirect target must actually render --------------
+    # is_oobe_completed() is True now, but the completed-check exempts
+    # step 7 for the browser that just committed.
+    from starlette.requests import Request
+    page7 = await setup_wizard(
+        Request({
+            "type": "http", "method": "GET", "path": "/setup",
+            "headers": [(
+                b"cookie",
+                f"{setup_module._OOBE_COOKIE}={completing_cookie}".encode(),
+            )],
+            "query_string": b"step=7",
+        }),
+        step=7,
+    )
+    assert page7.status_code == 200
+    assert b"Setup Complete" in page7.body
+
+    # Any other browser (no cookie) still bounces to the app.
+    other = await setup_wizard(_get_request("/setup"), step=7)
+    assert other.status_code == 302
+    assert other.headers["location"] == "/app"
 
     # --- Post-conditions ---------------------------------------------
     # Encryption key file written, owner-only (0600).

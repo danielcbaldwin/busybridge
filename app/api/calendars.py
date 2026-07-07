@@ -1,6 +1,8 @@
 """Calendar management API endpoints."""
 
+import json
 import logging
+import sqlite3
 from datetime import datetime
 from typing import Optional
 
@@ -185,14 +187,23 @@ async def connect_client_calendar(
     all_colors = [str(i) for i in range(1, 12)]
     color_id = next((c for c in all_colors if c not in used_colors), all_colors[0])
 
-    # Create the calendar connection
-    cursor = await db.execute(
-        """INSERT INTO client_calendars
-           (user_id, oauth_token_id, google_calendar_id, display_name, color_id)
-           VALUES (?, ?, ?, ?, ?)
-           RETURNING id""",
-        (user.id, request.token_id, request.calendar_id, display_name, color_id)
-    )
+    # Create the calendar connection.  A concurrent connect of the same
+    # calendar can interleave between the duplicate check above and
+    # this INSERT — the partial UNIQUE index on active
+    # (user_id, google_calendar_id) is the real guard.
+    try:
+        cursor = await db.execute(
+            """INSERT INTO client_calendars
+               (user_id, oauth_token_id, google_calendar_id, display_name, color_id)
+               VALUES (?, ?, ?, ?, ?)
+               RETURNING id""",
+            (user.id, request.token_id, request.calendar_id, display_name, color_id)
+        )
+    except sqlite3.IntegrityError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Calendar already connected"
+        )
     row = await cursor.fetchone()
     calendar_id = row["id"]
 
@@ -208,7 +219,7 @@ async def connect_client_calendar(
     await db.execute(
         """INSERT INTO sync_log (user_id, calendar_id, action, status, details)
            VALUES (?, ?, 'connect', 'success', ?)""",
-        (user.id, calendar_id, f'{{"calendar_id": "{request.calendar_id}"}}')
+        (user.id, calendar_id, json.dumps({"calendar_id": request.calendar_id}))
     )
     await db.commit()
 
@@ -294,14 +305,17 @@ async def trigger_calendar_sync(
             detail="Calendar not found"
         )
 
-    # Settling delay matches the legacy trigger so Google's
+    # Settling delay matches the ledger trigger so Google's
     # cross-session eventual consistency has time to propagate.
-    _MANUAL_SYNC_SETTLE = 25
-    from app.ledger.triggers import enqueue_manual
+    from app.ledger.triggers import MANUAL_SETTLING_DELAY, enqueue_manual
     await enqueue_manual(
         db, user_id=user.id, source_hint=f"client:{calendar_id}",
     )
-    return {"status": "ok", "message": "Sync triggered", "settle_seconds": _MANUAL_SYNC_SETTLE}
+    return {
+        "status": "ok",
+        "message": "Sync triggered",
+        "settle_seconds": int(MANUAL_SETTLING_DELAY.total_seconds()),
+    }
 
 
 @router.get("/{calendar_id}/sync-progress")
