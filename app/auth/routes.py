@@ -5,7 +5,7 @@ import secrets
 from typing import Optional
 from urllib.parse import urlencode, urljoin
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
 
 from app.auth.google import (
@@ -151,8 +151,10 @@ async def oauth_callback(
     """Handle OAuth callback."""
     if error:
         logger.error(f"OAuth error: {error} - {error_description}")
+        # URL-encode: the error value comes from the query string, so a
+        # raw '&', '#' or space must not be interpolated into the URL.
         return RedirectResponse(
-            url=f"/app/login?error={error}",
+            url="/app/login?" + urlencode({"error": error}),
             status_code=status.HTTP_302_FOUND
         )
 
@@ -293,10 +295,27 @@ async def oauth_callback(
         )
 
 
+def _browser_login_redirect(exc: HTTPException) -> RedirectResponse:
+    """Turn a session-expiry 401 into a login redirect.
+
+    ``/auth/connect-client`` and ``/auth/connect-personal`` are plain
+    ``<a href>`` links in the dashboard; raw 401 JSON is the wrong
+    answer for a browser click, so mirror the UI routes' behaviour
+    (see ``app.ui.routes``) and send the user to the login page.
+    Anything other than a 401 propagates unchanged.
+    """
+    if exc.status_code != status.HTTP_401_UNAUTHORIZED:
+        raise exc
+    return RedirectResponse(url="/app/login", status_code=status.HTTP_302_FOUND)
+
+
 @router.get("/connect-client")
 async def connect_client(request: Request):
     """Initiate OAuth for connecting a client calendar."""
-    user = await get_current_user(request)
+    try:
+        user = await get_current_user(request)
+    except HTTPException as exc:
+        return _browser_login_redirect(exc)
 
     try:
         client_id, _ = await get_oauth_credentials()
@@ -335,8 +354,9 @@ async def connect_client_callback(
     """Handle OAuth callback for client calendar connection."""
     if error:
         logger.error(f"Client OAuth error: {error} - {error_description}")
+        # URL-encode the attacker-influenced 'error' value.
         return RedirectResponse(
-            url=f"/app?error=client_connect_failed&reason={error}",
+            url="/app?" + urlencode({"error": "client_connect_failed", "reason": error}),
             status_code=status.HTTP_302_FOUND
         )
 
@@ -419,7 +439,10 @@ async def connect_client_callback(
 @router.get("/connect-personal")
 async def connect_personal(request: Request):
     """Initiate OAuth for connecting a personal calendar."""
-    user = await get_current_user(request)
+    try:
+        user = await get_current_user(request)
+    except HTTPException as exc:
+        return _browser_login_redirect(exc)
 
     try:
         client_id, _ = await get_oauth_credentials()
@@ -457,8 +480,9 @@ async def connect_personal_callback(
     """Handle OAuth callback for personal calendar connection."""
     if error:
         logger.error(f"Personal OAuth error: {error} - {error_description}")
+        # URL-encode the attacker-influenced 'error' value.
         return RedirectResponse(
-            url=f"/app?error=personal_connect_failed&reason={error}",
+            url="/app?" + urlencode({"error": "personal_connect_failed", "reason": error}),
             status_code=status.HTTP_302_FOUND
         )
 
@@ -523,14 +547,13 @@ async def connect_personal_callback(
 
 
 @router.post("/logout")
-async def logout(response: Response):
-    """Log out the current user."""
+async def logout():
+    """Log out the current user.
+
+    POST-only: the CSRF origin middleware exempts safe methods, so a
+    GET logout would be triggerable cross-site (e.g. via an <img>
+    tag).  The templates submit a small POST form instead of a link.
+    """
     response = RedirectResponse(url="/app/login", status_code=status.HTTP_302_FOUND)
     response.delete_cookie(SESSION_COOKIE_NAME)
     return response
-
-
-@router.get("/logout")
-async def logout_get(response: Response):
-    """Log out the current user (GET for convenience)."""
-    return await logout(response)

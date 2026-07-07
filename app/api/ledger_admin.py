@@ -105,6 +105,24 @@ async def list_permanent_failures(
 # ---------------------------------------------------------------------------
 # Admin operations
 # ---------------------------------------------------------------------------
+async def _verify_user_exists(db, user_id: int) -> None:
+    """404 unless ``user_id`` names a real user.
+
+    Mirrors ``app.api.admin.trigger_user_sync``'s guard.  Without it,
+    ``sync-now`` 500s on the sync_requests FK, while the row-count-0
+    ops (resume / full-resync / retry-failed / cleanup-and-pause)
+    silently report success for a user that doesn't exist.
+    """
+    row = await (await db.execute(
+        "SELECT 1 FROM users WHERE id = ?", (user_id,),
+    )).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+
 async def _verify_calendar_owner(
     db, user_id: int, client_calendar_id: int,
 ) -> None:
@@ -172,6 +190,7 @@ async def cleanup_and_pause(
     outbox drains the deletes, and sync_paused stays True until the
     admin explicitly resumes."""
     db = await get_database()
+    await _verify_user_exists(db, user_id)
     await admin_ops.cleanup_and_pause(db, user_id=user_id)
     return {"status": "cleanup_and_pause_scheduled"}
 
@@ -184,6 +203,7 @@ async def resume_sync(
     """Resume a previously paused user.  No data movement; the
     periodic scheduler will pick them up on its next tick."""
     db = await get_database()
+    await _verify_user_exists(db, user_id)
     await admin_ops.resume_sync(db, user_id=user_id)
     return {"status": "resumed"}
 
@@ -197,6 +217,7 @@ async def full_resync(
     reconcile re-fetches everything; ledger upserts dedupe so no
     Google writes happen unless content actually changed."""
     db = await get_database()
+    await _verify_user_exists(db, user_id)
     await admin_ops.full_resync(db, user_id=user_id)
     return {"status": "sync_tokens_cleared"}
 
@@ -212,6 +233,7 @@ async def retry_failed(
     next reconcile retries the write.  Pair with ``sync-now`` or
     ``reconcile-now`` to drain immediately."""
     db = await get_database()
+    await _verify_user_exists(db, user_id)
     n = await admin_ops.retry_permanent_failures(
         db, user_id=user_id, projection_id=projection_id,
     )
@@ -248,6 +270,7 @@ async def sync_now(
     picks it up after the settling delay (25s)."""
     from app.ledger.triggers import enqueue_manual
     db = await get_database()
+    await _verify_user_exists(db, user_id)
     await enqueue_manual(db, user_id=user_id, source_hint=source_hint)
     return {"status": "enqueued"}
 

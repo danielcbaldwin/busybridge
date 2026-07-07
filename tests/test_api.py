@@ -88,7 +88,10 @@ def test_auth_login_redirect(client):
 
 
 def test_auth_logout(client):
-    """Test auth logout."""
-    response = client.get("/auth/logout", follow_redirects=False)
+    """Test auth logout (POST-only; GET is CSRF-able so it 405s)."""
+    response = client.post("/auth/logout", follow_redirects=False)
     assert response.status_code == 302
     assert "/login" in response.headers.get("location", "")
+
+    get_response = client.get("/auth/logout", follow_redirects=False)
+    assert get_response.status_code == 405

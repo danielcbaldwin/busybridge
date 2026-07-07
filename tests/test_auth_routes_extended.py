@@ -410,14 +410,22 @@ async def test_oauth_callback_preserves_existing_refresh_token_when_missing(test
 
 @pytest.mark.asyncio
 async def test_logout_routes():
-    """Logout routes should redirect to login and clear cookie."""
-    from app.auth.routes import logout, logout_get
+    """Logout should redirect to login, clear the cookie, and be POST-only."""
+    from app.auth import routes as auth_routes
+    from app.auth.routes import logout, router
 
-    response = await logout(None)
+    response = await logout()
     assert response.status_code == 302
     assert response.headers["location"] == "/app/login"
     assert "session=\"\"" in response.headers.get("set-cookie", "")
 
-    response_get = await logout_get(None)
-    assert response_get.status_code == 302
-    assert response_get.headers["location"] == "/app/login"
+    # The GET variant was removed: the CSRF origin middleware exempts
+    # safe methods, so a GET logout was triggerable cross-site.
+    assert not hasattr(auth_routes, "logout_get")
+    logout_methods = {
+        method
+        for route in router.routes
+        if getattr(route, "path", "") == "/auth/logout"
+        for method in (route.methods or set())
+    }
+    assert logout_methods == {"POST"}

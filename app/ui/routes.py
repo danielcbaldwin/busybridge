@@ -376,12 +376,18 @@ async def select_calendar_page(
     if not token:
         return RedirectResponse(url="/app?error=invalid_token", status_code=status.HTTP_302_FOUND)
 
+    # The ownership check above validated token_id, not the free-form
+    # `email` query param — trusting the param here would list another
+    # account's calendars against the checked token.  Use the verified
+    # token row's account email for the fetch (and for display).
+    account_email = token["google_account_email"]
+
     # Get calendars from the account
     calendars = []
     try:
         from app.auth.google import fetch_calendar_list
 
-        for cal in await fetch_calendar_list(user.id, email):
+        for cal in await fetch_calendar_list(user.id, account_email):
             # backgroundColor is interpolated into a CSS style
             # attribute in the template — validate it is a plain hex
             # colour so a hostile value cannot break out of the rule.
@@ -412,7 +418,7 @@ async def select_calendar_page(
     return templates.TemplateResponse(request, "select_calendar.html", context={
         "user": user,
         "token_id": token_id,
-        "email": email,
+        "email": account_email,
         "calendars": calendars,
         "calendar_type": calendar_type,
         "connected_ids": connected_ids,

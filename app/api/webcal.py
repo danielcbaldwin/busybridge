@@ -309,11 +309,6 @@ async def create_webcal_subscription(
         )
     try:
         content, etag = await fetch_ics_feed(url)
-        if content is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Could not fetch ICS feed from this URL",
-            )
     except ValueError:
         # SSRF blocked (e.g. redirect to internal IP)
         raise HTTPException(
@@ -331,6 +326,15 @@ async def create_webcal_subscription(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="The URL did not return a valid ICS calendar feed.",
+        )
+
+    # Checked outside the try: raising this 400 inside it would be
+    # swallowed by the generic handler above and re-labelled as a
+    # parse failure.
+    if content is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Could not fetch ICS feed from this URL",
         )
 
     if existing:

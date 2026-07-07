@@ -58,9 +58,11 @@
                     <div class="hidden md:block">
                         <div class="ml-4 flex items-center md:ml-6">
                             <span class="text-indigo-100 text-sm mr-4">{{ user.email }}</span>
-                            <a href="/auth/logout" class="text-indigo-100 hover:text-white text-sm">
-                                <i class="fas fa-sign-out-alt mr-1"></i>Logout
-                            </a>
+                            <form method="post" action="/auth/logout" class="inline">
+                                <button type="submit" class="text-indigo-100 hover:text-white text-sm">
+                                    <i class="fas fa-sign-out-alt mr-1"></i>Logout
+                                </button>
+                            </form>
                         </div>
                     </div>
                     <div class="md:hidden">
@@ -82,9 +84,11 @@
                 </div>
                 <div class="border-t border-indigo-500 px-4 py-3">
                     <p class="text-sm text-indigo-200 truncate">{{ user.email }}</p>
-                    <a href="/auth/logout" class="mt-2 block text-sm text-indigo-100 hover:text-white">
-                        <i class="fas fa-sign-out-alt mr-1"></i>Logout
-                    </a>
+                    <form method="post" action="/auth/logout" class="mt-2 block">
+                        <button type="submit" class="text-sm text-indigo-100 hover:text-white">
+                            <i class="fas fa-sign-out-alt mr-1"></i>Logout
+                        </button>
+                    </form>
                 </div>
             </div>
         </nav>
