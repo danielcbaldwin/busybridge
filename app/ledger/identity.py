@@ -225,6 +225,59 @@ def derive_instance_google_event_id(
     return f"{parent_google_event_id}_{dt.strftime('%Y%m%dT%H%M%SZ')}"
 
 
+def is_busybridge_event(
+    event: dict,
+    *,
+    sync_tag: Optional[str] = None,
+    managed_prefix: Optional[str] = None,
+) -> bool:
+    """One shared predicate: "was this Google event written by BusyBridge?"
+
+    Used by both the backup snapshot (``app/sync/backup.py`` via the
+    legacy client's ``is_our_event``) and the ICS "clean" export
+    (``app/sync/ics_export.py``), which previously carried drifted
+    copies and disagreed about legacy prefix-titled events.
+
+    Four signals (any one is sufficient):
+
+    * Deterministic ledger ID (:func:`is_managed_google_event_id`;
+      the primary post-cutover signal).
+    * ``extendedProperties.private.bb_proj_id`` (defence-in-depth
+      stamp the ledger payload renderer applies; see
+      ``app.ledger.payload.EP_PROJ_ID``).
+    * Legacy sync-tag extended property — pass the configured tag
+      name as ``sync_tag`` (``settings.calendar_sync_tag``); skipped
+      when omitted.
+    * Legacy summary prefix — pass the configured prefix as
+      ``managed_prefix`` (``settings.managed_event_prefix``); skipped
+      when omitted.  Recognises events from older versions that
+      didn't stamp extended properties.
+
+    The tag/prefix are parameters (not read from settings here) so
+    this module stays configuration-free; callers supply them from
+    their own settings object.
+    """
+    if is_managed_google_event_id(event.get("id")):
+        return True
+
+    ext_props = event.get("extendedProperties") or {}
+    private_props = ext_props.get("private") or {}
+
+    if private_props.get("bb_proj_id"):
+        return True
+
+    if sync_tag and private_props.get(sync_tag) == "true":
+        return True
+
+    prefix = (managed_prefix or "").strip().lower()
+    if prefix:
+        summary = (event.get("summary") or "").strip().lower()
+        if summary.startswith(prefix):
+            return True
+
+    return False
+
+
 def is_managed_google_event_id(event_id: Optional[str]) -> bool:
     """True if ``event_id`` looks like a deterministic ID we issued.
 

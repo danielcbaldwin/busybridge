@@ -493,39 +493,19 @@ def _unique_entry_name(name: str, used: set[str]) -> str:
 def _is_busybridge_event(event: dict) -> bool:
     """Check if an event was written by BusyBridge.
 
-    Recognises three signals:
-    * Deterministic ledger ID (``bb`` + 13 base32hex chars; the
-      primary post-cutover signal).
-    * ``extendedProperties.private.bb_proj_id`` (defence-in-depth
-      stamp the ledger payload renderer applies; see
-      ``app.ledger.payload.EP_PROJ_ID``).
-    * Legacy ``calendar_sync_tag`` extended property (events
-      written by the pre-cutover engine).
-    * Legacy summary prefix (events from older versions that
-      didn't stamp extended properties).
+    Delegates to the single shared predicate in
+    :func:`app.ledger.identity.is_busybridge_event` (same signals as
+    the backup snapshot's ``is_our_event``, so the clean export and
+    the ZIP snapshot can never disagree).
     """
-    from app.ledger.identity import is_managed_google_event_id
-
-    if is_managed_google_event_id(event.get("id")):
-        return True
+    from app.ledger.identity import is_busybridge_event
 
     settings = get_settings()
-    ext_props = event.get("extendedProperties", {})
-    private_props = ext_props.get("private", {})
-
-    if private_props.get("bb_proj_id"):
-        return True
-
-    if private_props.get(settings.calendar_sync_tag) == "true":
-        return True
-
-    prefix = (settings.managed_event_prefix or "").strip().lower()
-    if prefix:
-        summary = (event.get("summary") or "").strip().lower()
-        if summary.startswith(prefix):
-            return True
-
-    return False
+    return is_busybridge_event(
+        event,
+        sync_tag=settings.calendar_sync_tag,
+        managed_prefix=settings.managed_event_prefix,
+    )
 
 
 # ---------------------------------------------------------------------------

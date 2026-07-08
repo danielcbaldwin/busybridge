@@ -276,6 +276,70 @@ class TestUniqueEntryName:
 
 
 # ---------------------------------------------------------------------------
+# _is_busybridge_event — shared predicate agreement
+# ---------------------------------------------------------------------------
+
+
+def _managed_id() -> str:
+    from app.ledger.identity import derive_google_event_id
+
+    return derive_google_event_id(123)
+
+
+class TestBusyBridgePredicateAgreement:
+    """The ICS clean export and the backup snapshot must classify
+    events identically — both delegate to
+    app.ledger.identity.is_busybridge_event."""
+
+    @pytest.mark.parametrize(
+        "event, expected",
+        [
+            # Deterministic managed ledger ID
+            (lambda s: {"id": _managed_id()}, True),
+            # bb_proj_id defence-in-depth stamp
+            (lambda s: {
+                "id": "randomid123",
+                "extendedProperties": {"private": {"bb_proj_id": "42"}},
+            }, True),
+            # Legacy sync-tag extended property
+            (lambda s: {
+                "id": "randomid456",
+                "extendedProperties": {"private": {s.calendar_sync_tag: "true"}},
+            }, True),
+            # Legacy prefix-titled event (no extended properties at all)
+            (lambda s: {
+                "id": "randomid789",
+                "summary": f"{s.managed_event_prefix} Busy",
+            }, True),
+            # Unmanaged event
+            (lambda s: {
+                "id": "randomid000",
+                "summary": "Dentist appointment",
+                "extendedProperties": {"private": {"someone_elses_tag": "true"}},
+            }, False),
+        ],
+        ids=["managed-id", "bb_proj_id", "sync-tag", "prefix-title", "unmanaged"],
+    )
+    def test_ics_export_and_backup_snapshot_agree(self, event, expected):
+        from app.config import get_settings
+        from app.sync.google_calendar import GoogleCalendarClient
+        from app.sync.ics_export import _is_busybridge_event
+
+        settings = get_settings()
+        event = event(settings)
+
+        # Backup snapshot path: client method
+        client = object.__new__(GoogleCalendarClient)
+        client.settings = settings
+        via_backup = client.is_our_event(event)
+
+        # ICS clean-export path: module helper
+        via_ics = _is_busybridge_event(event)
+
+        assert via_backup == via_ics == expected
+
+
+# ---------------------------------------------------------------------------
 # create_ics_backup
 # ---------------------------------------------------------------------------
 

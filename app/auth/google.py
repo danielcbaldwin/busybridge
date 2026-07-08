@@ -370,12 +370,19 @@ async def fetch_calendar_list(user_id: int, email: str) -> list[dict]:
     """List a Google account's calendars.
 
     Uses refresh-capable credentials and a timeout-bounded service,
-    and runs the blocking ``execute()`` off the event loop with
+    and runs the blocking call off the event loop with
     :func:`asyncio.to_thread` — safe to call from an async route.
+    Executes through the shared retry + rate-limit wrapper so these
+    calls honour the same global quota and transient-error handling
+    as every other Google call in the app.
     """
+    # Late import: app/sync/google_calendar.py imports helpers from
+    # this module, so keep the dependency one-way at import time.
+    from app.sync.google_calendar import execute_with_retry
+
     service = await get_calendar_service_for_user(user_id, email)
     result = await asyncio.to_thread(
-        lambda: service.calendarList().list().execute()
+        execute_with_retry, service.calendarList().list()
     )
     return result.get("items", [])
 
@@ -385,11 +392,14 @@ async def fetch_calendar(
 ) -> dict:
     """Fetch one calendar's metadata; raises if it is inaccessible.
 
-    Same guarantees as :func:`fetch_calendar_list` — timeout-bounded
-    and offloaded off the event loop."""
+    Same guarantees as :func:`fetch_calendar_list` — timeout-bounded,
+    offloaded off the event loop, and executed through the shared
+    retry + rate-limit wrapper."""
+    from app.sync.google_calendar import execute_with_retry
+
     service = await get_calendar_service_for_user(user_id, email)
     return await asyncio.to_thread(
-        lambda: service.calendars().get(calendarId=calendar_id).execute()
+        execute_with_retry, service.calendars().get(calendarId=calendar_id)
     )
 
 

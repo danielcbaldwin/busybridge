@@ -1,11 +1,25 @@
-"""Google Calendar API wrapper."""
+"""Minimal legacy Google Calendar client — backup / ICS export only.
+
+This module is the surviving remnant of the pre-ledger sync engine.
+Its ONLY production consumers are :mod:`app.sync.backup` and
+:mod:`app.sync.ics_export`, which use :class:`AsyncGoogleCalendarClient`
+for two things:
+
+* ``list_events`` — full-range event snapshots of a calendar.
+* ``is_our_event`` — classifying events as BusyBridge-managed
+  (delegates to :func:`app.ledger.identity.is_busybridge_event`).
+
+Do NOT add new callers.  New code must use the ledger stack's client
+(``app/ledger/real_google_client.py`` via ``app/ledger/async_google.py``
+and ``app/ledger/google_router.py``) instead.
+"""
 
 import asyncio
 import functools
 import logging
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional
 
 from google.oauth2.credentials import Credentials
@@ -87,8 +101,69 @@ class _RateLimiter:
                 self._backoff_until = target
 
 
+# Process-wide limiter shared by every GoogleCalendarClient instance
+# (and by app/auth/google.py's fetch_* helpers).  backup.py and
+# ics_export.py construct one client per calendar, so a per-instance
+# limiter would multiply the documented cap by the calendar count —
+# the limiter MUST be module-level to actually enforce a global rate.
+# Created lazily so importing this module never requires settings.
+# Tests may swap it out by monkeypatching ``_rate_limiter``.
+_rate_limiter: Optional[_RateLimiter] = None
+_rate_limiter_init_lock = threading.Lock()
+
+
+def _get_rate_limiter() -> _RateLimiter:
+    """Return the shared limiter, creating it from settings on first use."""
+    global _rate_limiter
+    if _rate_limiter is None:
+        with _rate_limiter_init_lock:
+            if _rate_limiter is None:
+                rate = get_settings().google_api_rate_limit_per_second
+                _rate_limiter = _RateLimiter(
+                    rate=rate, burst=max(1, int(rate)),
+                )
+    return _rate_limiter
+
+
+def execute_with_retry(request, max_retries: int = 5, base_delay: float = 1.0):
+    """Execute a Google API request with rate limiting and exponential backoff.
+
+    Rate-limits all outgoing requests through the shared module-level
+    limiter to stay within Google's per-user quota.  Retries on
+    rate-limit errors (403 rateLimitExceeded, 429) and transient server
+    errors (500, 502, 503) with exponential backoff.  All other errors
+    (400, 401, 403 permission-denied, 404, etc.) fail immediately.
+    """
+    limiter = _get_rate_limiter()
+    for attempt in range(max_retries + 1):
+        limiter.acquire()
+        try:
+            return request.execute()
+        except HttpError as e:
+            is_rate_limit = _is_rate_limit_error(e)
+            is_server_error = e.resp.status in _RETRYABLE_SERVER_STATUSES
+
+            if not (is_rate_limit or is_server_error) or attempt == max_retries:
+                raise
+
+            if is_rate_limit:
+                # Longer backoff for rate limits; also pause other requests
+                delay = min(base_delay * (2 ** (attempt + 2)), 60)
+                limiter.backoff(delay)
+            else:
+                delay = min(base_delay * (2 ** attempt), 30)
+
+            logger.warning(
+                "Google API %s%s (attempt %d/%d), retrying in %.1fs",
+                e.resp.status,
+                " rate-limited" if is_rate_limit else "",
+                attempt + 1, max_retries, delay,
+            )
+            time.sleep(delay)
+
+
 class GoogleCalendarClient:
-    """Wrapper around Google Calendar API."""
+    """Read-only wrapper around Google Calendar API for backup/export."""
 
     def __init__(self, access_token=None, *, credentials=None, settings=None, timeout: int = 30):
         """
@@ -113,85 +188,39 @@ class GoogleCalendarClient:
         from app.auth.google import build_calendar_service
         self.service = build_calendar_service(self.credentials, timeout=timeout)
         self.settings = settings or get_settings()
-        self._rate_limiter = _RateLimiter()
-
-    def _get_rate_limiter(self) -> _RateLimiter:
-        """Return the rate limiter, creating one if __init__ was bypassed."""
-        try:
-            return self._rate_limiter
-        except AttributeError:
-            self._rate_limiter = _RateLimiter()
-            return self._rate_limiter
 
     def _execute_with_retry(self, request, max_retries: int = 5, base_delay: float = 1.0):
-        """Execute a Google API request with rate limiting and exponential backoff.
-
-        Rate-limits all outgoing requests to stay within Google's per-user
-        quota (~10 req/s).  Retries on rate-limit errors (403 rateLimitExceeded,
-        429) and transient server errors (500, 502, 503) with exponential
-        backoff.  All other errors (400, 401, 403 permission-denied, 404, etc.)
-        fail immediately.
-        """
-        limiter = self._get_rate_limiter()
-        for attempt in range(max_retries + 1):
-            limiter.acquire()
-            try:
-                return request.execute()
-            except HttpError as e:
-                is_rate_limit = _is_rate_limit_error(e)
-                is_server_error = e.resp.status in _RETRYABLE_SERVER_STATUSES
-
-                if not (is_rate_limit or is_server_error) or attempt == max_retries:
-                    raise
-
-                if is_rate_limit:
-                    # Longer backoff for rate limits; also pause other requests
-                    delay = min(base_delay * (2 ** (attempt + 2)), 60)
-                    limiter.backoff(delay)
-                else:
-                    delay = min(base_delay * (2 ** attempt), 30)
-
-                logger.warning(
-                    "Google API %s%s (attempt %d/%d), retrying in %.1fs",
-                    e.resp.status,
-                    " rate-limited" if is_rate_limit else "",
-                    attempt + 1, max_retries, delay,
-                )
-                time.sleep(delay)
+        """Execute a request via the shared retry + rate-limit wrapper."""
+        return execute_with_retry(
+            request, max_retries=max_retries, base_delay=base_delay,
+        )
 
     def list_events(
         self,
         calendar_id: str,
-        sync_token: Optional[str] = None,
         time_min: Optional[datetime] = None,
         time_max: Optional[datetime] = None,
         max_results: int = 2500,
         single_events: bool = False,
     ) -> dict:
-        """
-        List events from a calendar.
+        """List events from a calendar over a time range (full sync).
 
-        If sync_token is provided, does incremental sync.
-        Otherwise, does full sync with time range.
+        Defaults to last month → next year when no range is given.
         """
         try:
+            # Full sync - get events from last month to next year
+            if not time_min:
+                time_min = datetime.utcnow() - timedelta(days=30)
+            if not time_max:
+                time_max = datetime.utcnow() + timedelta(days=365)
+
             request_params = {
                 "calendarId": calendar_id,
                 "maxResults": max_results,
                 "singleEvents": single_events,
+                "timeMin": time_min.isoformat() + "Z",
+                "timeMax": time_max.isoformat() + "Z",
             }
-
-            if sync_token:
-                request_params["syncToken"] = sync_token
-            else:
-                # Full sync - get events from last month to next year
-                if not time_min:
-                    time_min = datetime.utcnow() - timedelta(days=30)
-                if not time_max:
-                    time_max = datetime.utcnow() + timedelta(days=365)
-
-                request_params["timeMin"] = time_min.isoformat() + "Z"
-                request_params["timeMax"] = time_max.isoformat() + "Z"
 
             all_events = []
             page_token = None
@@ -209,17 +238,10 @@ class GoogleCalendarClient:
                 if not page_token:
                     break
 
-            return {
-                "events": all_events,
-                "next_sync_token": result.get("nextSyncToken"),
-            }
+            return {"events": all_events}
 
         except HttpError as e:
-            if e.resp.status == 410:
-                # Sync token expired, need full sync
-                logger.info(f"Sync token expired for calendar {calendar_id}")
-                return {"events": [], "sync_token_expired": True}
-            elif e.resp.status == 403:
+            if e.resp.status == 403:
                 # Permission denied - calendar access revoked
                 logger.error(f"Permission denied for calendar {calendar_id}")
                 raise PermissionError(f"Access to calendar {calendar_id} was revoked")
@@ -236,517 +258,23 @@ class GoogleCalendarClient:
             logger.error(f"Network error fetching events for calendar {calendar_id}: {type(e).__name__}")
             raise
 
-    def list_cancelled_instances(self, calendar_id: str, recurring_event_id: str) -> list[dict]:
-        """Return cancelled instances of a recurring event.
-
-        Uses the ``events().instances()`` endpoint with ``showDeleted=True``
-        and filters for ``status == 'cancelled'``.  Each returned dict
-        contains at minimum ``originalStartTime`` which can be fed to
-        ``derive_instance_event_id`` to construct the instance ID on a
-        different recurring event (e.g. a busy-block copy).
-        """
-        try:
-            all_items: list[dict] = []
-            page_token = None
-            while True:
-                params: dict = {
-                    "calendarId": calendar_id,
-                    "eventId": recurring_event_id,
-                    "showDeleted": True,
-                    "maxResults": 250,
-                }
-                if page_token:
-                    params["pageToken"] = page_token
-                result = self._execute_with_retry(
-                    self.service.events().instances(**params),
-                )
-                all_items.extend(result.get("items", []))
-                page_token = result.get("nextPageToken")
-                if not page_token:
-                    break
-            return [i for i in all_items if i.get("status") == "cancelled"]
-        except HttpError as e:
-            if e.resp.status in (404, 410):
-                return []
-            raise
-        except Exception:
-            return []
-
-    def get_event(self, calendar_id: str, event_id: str) -> Optional[dict]:
-        """Get a single event."""
-        try:
-            return self._execute_with_retry(
-                self.service.events().get(
-                    calendarId=calendar_id,
-                    eventId=event_id,
-                ),
-            )
-        except HttpError as e:
-            if e.resp.status == 404:
-                return None
-            raise
-
-    def find_by_origin(
-        self,
-        calendar_id: str,
-        origin_id: str,
-        bb_type: Optional[str] = None,
-    ) -> list[dict]:
-        """Find events we created for a specific origin event ID.
-
-        Uses Google Calendar's privateExtendedProperty filter for an
-        efficient server-side query.  Returns all non-cancelled matches.
-        """
-        try:
-            params: dict = {
-                "calendarId": calendar_id,
-                "privateExtendedProperty": f"bb_origin_id={origin_id}",
-                "showDeleted": False,
-                "maxResults": 50,
-                "singleEvents": False,
-            }
-            if bb_type:
-                params["privateExtendedProperty"] = [
-                    f"bb_origin_id={origin_id}",
-                    f"bb_type={bb_type}",
-                ]
-            result = self._execute_with_retry(
-                self.service.events().list(**params),
-            )
-            return [
-                e for e in result.get("items", [])
-                if e.get("status") != "cancelled"
-            ]
-        except HttpError as e:
-            if e.resp.status in (404, 403):
-                return []
-            raise
-        except Exception:
-            return []
-
-    def list_our_events(
-        self,
-        calendar_id: str,
-        time_min: Optional[str] = None,
-        time_max: Optional[str] = None,
-    ) -> list[dict]:
-        """List all events we created (have our sync tag) on a calendar."""
-        try:
-            params: dict = {
-                "calendarId": calendar_id,
-                "privateExtendedProperty": f"{self.settings.calendar_sync_tag}=true",
-                "showDeleted": False,
-                "maxResults": 2500,
-                "singleEvents": False,
-            }
-            if time_min:
-                params["timeMin"] = time_min
-            if time_max:
-                params["timeMax"] = time_max
-
-            all_events = []
-            page_token = None
-            while True:
-                if page_token:
-                    params["pageToken"] = page_token
-                result = self._execute_with_retry(
-                    self.service.events().list(**params),
-                )
-                all_events.extend(
-                    e for e in result.get("items", [])
-                    if e.get("status") != "cancelled"
-                )
-                page_token = result.get("nextPageToken")
-                if not page_token:
-                    break
-            return all_events
-        except HttpError as e:
-            if e.resp.status in (404, 403):
-                return []
-            raise
-
-    def search_events(
-        self,
-        calendar_id: str,
-        query: str,
-        max_results: int = 2500,
-        single_events: bool = True,
-    ) -> list[dict]:
-        """
-        Search events by free-text query.
-
-        Uses pagination and returns all matching items from Google.
-        """
-        try:
-            request_params = {
-                "calendarId": calendar_id,
-                "q": query,
-                "maxResults": max_results,
-                "singleEvents": single_events,
-                "showDeleted": False,
-            }
-
-            all_events = []
-            page_token = None
-
-            while True:
-                if page_token:
-                    request_params["pageToken"] = page_token
-
-                result = self._execute_with_retry(
-                    self.service.events().list(**request_params),
-                )
-                all_events.extend(result.get("items", []))
-
-                page_token = result.get("nextPageToken")
-                if not page_token:
-                    break
-
-            return all_events
-
-        except HttpError as e:
-            if e.resp.status == 403:
-                logger.error(f"Permission denied searching events for calendar {calendar_id}")
-                raise PermissionError(f"Access to calendar {calendar_id} was revoked")
-            if e.resp.status == 404:
-                logger.warning(f"Calendar {calendar_id} not found during event search")
-                raise FileNotFoundError(f"Calendar {calendar_id} not found")
-            logger.error(f"HTTP error {e.resp.status} searching events for calendar {calendar_id}")
-            raise
-        except Exception as e:
-            logger.error(f"Network error searching events for calendar {calendar_id}: {type(e).__name__}")
-            raise
-
-    def create_event(
-        self,
-        calendar_id: str,
-        event_data: dict,
-        send_notifications: bool = False,
-        send_updates: str = "none",
-    ) -> dict:
-        """Create an event on a calendar."""
-        # Add our sync tag to identify events we created
-        if "extendedProperties" not in event_data:
-            event_data["extendedProperties"] = {}
-        if "private" not in event_data["extendedProperties"]:
-            event_data["extendedProperties"]["private"] = {}
-        event_data["extendedProperties"]["private"][self.settings.calendar_sync_tag] = "true"
-
-        return self._execute_with_retry(
-            self.service.events().insert(
-                calendarId=calendar_id,
-                body=event_data,
-                sendNotifications=send_notifications,
-                sendUpdates=send_updates,
-                conferenceDataVersion=1,
-            ),
-        )
-
-    def update_event(
-        self,
-        calendar_id: str,
-        event_id: str,
-        event_data: dict,
-        send_notifications: bool = False,
-        send_updates: str = "none",
-    ) -> dict:
-        """Update an event."""
-        # Re-stamp our sync tag -- events().update() is a full replacement,
-        # so without this the extendedProperties (and our tag) get stripped.
-        if "extendedProperties" not in event_data:
-            event_data["extendedProperties"] = {}
-        if "private" not in event_data["extendedProperties"]:
-            event_data["extendedProperties"]["private"] = {}
-        event_data["extendedProperties"]["private"][self.settings.calendar_sync_tag] = "true"
-
-        return self._execute_with_retry(
-            self.service.events().update(
-                calendarId=calendar_id,
-                eventId=event_id,
-                body=event_data,
-                sendNotifications=send_notifications,
-                sendUpdates=send_updates,
-                conferenceDataVersion=1,
-            ),
-        )
-
-    def patch_event(
-        self,
-        calendar_id: str,
-        event_id: str,
-        event_patch: dict,
-        send_notifications: bool = False,
-        send_updates: str = "none",
-    ) -> dict:
-        """Patch (partial update) an event."""
-        return self._execute_with_retry(
-            self.service.events().patch(
-                calendarId=calendar_id,
-                eventId=event_id,
-                body=event_patch,
-                sendNotifications=send_notifications,
-                sendUpdates=send_updates,
-                conferenceDataVersion=1,
-            ),
-        )
-
-    def delete_event(
-        self,
-        calendar_id: str,
-        event_id: str,
-        send_notifications: bool = False,
-    ) -> bool:
-        """Delete an event."""
-        try:
-            self._execute_with_retry(
-                self.service.events().delete(
-                    calendarId=calendar_id,
-                    eventId=event_id,
-                    sendNotifications=send_notifications,
-                ),
-            )
-            return True
-        except HttpError as e:
-            if e.resp.status == 404:
-                # Already deleted
-                return True
-            if e.resp.status == 410:
-                # Event was deleted (gone)
-                return True
-            raise
-
-    def batch_delete_events(
-        self,
-        calendar_id: str,
-        event_ids: list[str],
-        batch_size: int = 50,
-    ) -> tuple[int, list[str]]:
-        """Delete multiple events in batch requests.
-
-        Returns (deleted_count, failed_event_ids).
-        404/410 responses are treated as success (already gone).
-        Includes throttling and retry to avoid Google API rate limits.
-        """
-        import time
-
-        deleted = 0
-        failed: list[str] = []
-
-        for i in range(0, len(event_ids), batch_size):
-            chunk = event_ids[i : i + batch_size]
-
-            # Throttle between chunks to avoid rate limits
-            if i > 0:
-                time.sleep(1)
-
-            chunk_ok, chunk_fail = self._execute_batch_delete_chunk(
-                calendar_id, chunk,
-            )
-
-            # Retry failed events from this chunk individually with backoff
-            if chunk_fail:
-                time.sleep(2)
-                for eid in chunk_fail:
-                    try:
-                        self.service.events().delete(
-                            calendarId=calendar_id, eventId=eid,
-                        ).execute()
-                        chunk_ok += 1
-                    except HttpError as e:
-                        if e.resp.status in (403, 404, 410):
-                            # 403 = no delete permission (not our event), skip
-                            # 404/410 = already gone
-                            chunk_ok += 1
-                        else:
-                            logger.warning(
-                                "Retry delete failed for %s: HTTP %s %s",
-                                eid, e.resp.status, e.resp.reason,
-                            )
-                            failed.append(eid)
-                    except Exception as e:
-                        logger.warning("Retry delete failed for %s: %s", eid, e)
-                        failed.append(eid)
-
-            deleted += chunk_ok
-
-        return deleted, failed
-
-    def _execute_batch_delete_chunk(
-        self,
-        calendar_id: str,
-        chunk: list[str],
-    ) -> tuple[int, list[str]]:
-        """Execute a single batch delete chunk. Returns (ok_count, failed_ids)."""
-        chunk_results: dict[str, bool] = {}
-
-        def _make_callback(eid: str):
-            def _cb(request_id, response, exception):
-                if exception is None:
-                    chunk_results[eid] = True
-                elif isinstance(exception, HttpError) and exception.resp.status in (403, 404, 410):
-                    chunk_results[eid] = True  # 403=no permission, 404/410=already gone
-                else:
-                    chunk_results[eid] = False
-            return _cb
-
-        batch = self.service.new_batch_http_request()
-        for eid in chunk:
-            batch.add(
-                self.service.events().delete(
-                    calendarId=calendar_id, eventId=eid,
-                ),
-                callback=_make_callback(eid),
-            )
-
-        try:
-            batch.execute()
-        except Exception:
-            # Entire batch failed — mark unprocessed as failed
-            for eid in chunk:
-                if eid not in chunk_results:
-                    chunk_results[eid] = False
-
-        ok = sum(1 for v in chunk_results.values() if v)
-        fail = [eid for eid, v in chunk_results.items() if not v]
-        return ok, fail
-
     def is_our_event(self, event: dict) -> bool:
         """Check if an event was written by BusyBridge.
 
-        Three signals (any one is sufficient):
-        * Deterministic ledger ID (post-cutover writes).
-        * ``extendedProperties.private.bb_proj_id`` (ledger
-          defence-in-depth stamp).
-        * Legacy ``calendar_sync_tag`` extended property
-          (pre-cutover writes that may still exist in backups).
+        Delegates to the single shared predicate in
+        :func:`app.ledger.identity.is_busybridge_event` so the backup
+        snapshot and the ICS "clean" export can never disagree about
+        what counts as ours.
         """
         # Late import to avoid a hard dependency from app/sync/ →
         # app/ledger/ (the latter is the post-cutover home).
-        from app.ledger.identity import is_managed_google_event_id
+        from app.ledger.identity import is_busybridge_event
 
-        if is_managed_google_event_id(event.get("id")):
-            return True
-        ext_props = event.get("extendedProperties", {})
-        private_props = ext_props.get("private", {})
-        if private_props.get("bb_proj_id"):
-            return True
-        return private_props.get(self.settings.calendar_sync_tag) == "true"
-
-    def list_calendars(self) -> list[dict]:
-        """List all calendars the user has access to."""
-        result = self._execute_with_retry(
-            self.service.calendarList().list(),
+        return is_busybridge_event(
+            event,
+            sync_tag=self.settings.calendar_sync_tag,
+            managed_prefix=self.settings.managed_event_prefix,
         )
-        return result.get("items", [])
-
-    def get_calendar(self, calendar_id: str) -> Optional[dict]:
-        """Get calendar metadata."""
-        try:
-            return self._execute_with_retry(
-                self.service.calendars().get(calendarId=calendar_id),
-            )
-        except HttpError as e:
-            if e.resp.status == 404:
-                return None
-            raise
-
-
-def _build_timed_dt(src: dict) -> dict:
-    """Build a dateTime start/end dict, preserving the source timezone correctly.
-
-    If the source has a named ``timeZone`` field, it is passed through as-is.
-    If the ``dateTime`` ends with ``Z`` (UTC), we explicitly label it as UTC.
-    If the ``dateTime`` carries a fixed offset (e.g. ``-05:00``) but no named
-    timezone, we omit the ``timeZone`` field entirely so that Google Calendar
-    uses the embedded offset rather than defaulting to UTC.  This is critical
-    for recurring events: setting ``timeZone: "UTC"`` would anchor the
-    recurrence pattern to UTC wall-clock time, causing every instance to drift
-    by one hour after a DST transition.
-    """
-    dt = src.get("dateTime")
-    tz = src.get("timeZone")
-    result: dict = {"dateTime": dt}
-    if tz:
-        result["timeZone"] = tz
-    elif dt and dt.endswith("Z"):
-        result["timeZone"] = "UTC"
-    # Fixed-offset dateTime (e.g. "…-05:00"): omit timeZone and let Google
-    # honour the embedded offset for RRULE expansion.
-    return result
-
-
-def derive_instance_event_id(parent_event_id: str, original_start_time: dict) -> str:
-    """Construct the Google Calendar instance event ID for one occurrence.
-
-    Google formats recurring-event instance IDs as::
-
-        "<parentId>_<utcTimestamp>"
-
-    where *utcTimestamp* is ``YYYYMMDDTHHmmssZ`` for timed events or
-    ``YYYYMMDD`` for all-day events.
-
-    Args:
-        parent_event_id: The ``id`` of the parent recurring event.
-        original_start_time: The ``originalStartTime`` dict returned by the
-            Google Calendar API for the instance (contains either a ``date``
-            or a ``dateTime`` field).
-
-    Returns:
-        The full instance event ID string.
-
-    Raises:
-        ValueError: If *original_start_time* has neither ``date`` nor
-            ``dateTime``.
-    """
-    if "date" in original_start_time:
-        date_suffix = original_start_time["date"].replace("-", "")
-        return f"{parent_event_id}_{date_suffix}"
-
-    dt_str = original_start_time.get("dateTime", "")
-    if not dt_str:
-        raise ValueError(
-            "originalStartTime has neither 'date' nor 'dateTime': "
-            f"{original_start_time!r}"
-        )
-
-    if dt_str.endswith("Z"):
-        dt = datetime.fromisoformat(dt_str[:-1]).replace(tzinfo=timezone.utc)
-    else:
-        dt = datetime.fromisoformat(dt_str)
-
-    dt_utc = dt.astimezone(timezone.utc)
-    suffix = dt_utc.strftime("%Y%m%dT%H%M%S") + "Z"
-    return f"{parent_event_id}_{suffix}"
-
-
-def can_user_edit_event(event: dict, user_email: str) -> bool:
-    """
-    Determine if user can edit this event.
-
-    User can edit if:
-    - They are the organizer
-    - guestsCanModify is true
-    - They have writer access
-    """
-    # Check if user is organizer
-    organizer = event.get("organizer", {})
-    if organizer.get("email", "").lower() == user_email.lower():
-        return True
-    if organizer.get("self"):
-        return True
-
-    # Check guestsCanModify
-    if event.get("guestsCanModify"):
-        return True
-
-    # For events where user is the creator
-    creator = event.get("creator", {})
-    if creator.get("email", "").lower() == user_email.lower():
-        return True
-    if creator.get("self"):
-        return True
-
-    return False
 
 
 class AsyncGoogleCalendarClient:
@@ -758,13 +286,7 @@ class AsyncGoogleCalendarClient:
     """
 
     # Methods that perform network I/O and must run in a thread.
-    _IO_METHODS = frozenset({
-        "list_events", "list_cancelled_instances", "get_event",
-        "find_by_origin", "list_our_events", "search_events",
-        "create_event", "update_event", "patch_event",
-        "delete_event", "batch_delete_events",
-        "list_calendars", "get_calendar",
-    })
+    _IO_METHODS = frozenset({"list_events"})
 
     def __init__(self, *args, **kwargs):
         self._sync = GoogleCalendarClient(*args, **kwargs)

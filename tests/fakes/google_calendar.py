@@ -238,9 +238,12 @@ class _InstancePageState:
 def derive_instance_event_id(parent_event_id: str, original_start_time: dict) -> str:
     """Construct the Google instance event ID for one occurrence.
 
-    Mirrors the helper in ``app/sync/google_calendar.py`` so tests
-    can construct deterministic instance IDs without depending on
-    production code.
+    Thin adapter over the PRODUCTION helper
+    :func:`app.ledger.identity.derive_instance_google_event_id` — the
+    fake must derive instance IDs exactly the way the ledger does, so
+    it delegates instead of carrying its own copy that could drift.
+    This function only translates the Google-API-shaped
+    ``originalStartTime`` dict into the production signature.
 
     Args:
         parent_event_id: ``id`` of the parent recurring event.
@@ -251,20 +254,21 @@ def derive_instance_event_id(parent_event_id: str, original_start_time: dict) ->
         ``"<parent>_YYYYMMDD"`` for all-day events,
         ``"<parent>_YYYYMMDDTHHMMSSZ"`` for timed events.
     """
+    from app.ledger.identity import derive_instance_google_event_id
+
     if "date" in original_start_time:
-        return f"{parent_event_id}_{original_start_time['date'].replace('-', '')}"
+        return derive_instance_google_event_id(
+            parent_event_id, original_start_time["date"], is_all_day=True,
+        )
     dt_str = original_start_time.get("dateTime")
     if not dt_str:
         raise ValueError(
             "originalStartTime has neither 'date' nor 'dateTime': "
             f"{original_start_time!r}"
         )
-    if dt_str.endswith("Z"):
-        dt = datetime.fromisoformat(dt_str[:-1]).replace(tzinfo=UTC)
-    else:
-        dt = isoparse(dt_str)
-    dt_utc = dt.astimezone(UTC)
-    return f"{parent_event_id}_{dt_utc.strftime('%Y%m%dT%H%M%S')}Z"
+    return derive_instance_google_event_id(
+        parent_event_id, dt_str, is_all_day=False,
+    )
 
 
 def _validate_client_id(event_id: str) -> None:
