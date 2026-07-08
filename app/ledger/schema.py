@@ -294,6 +294,21 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
     )
     await db.commit()
 
+    # One-time repair: origin writebacks only ever target CLIENT
+    # sources (personal calendars are read-only; the planner never
+    # creates a writeback projection for them), but an earlier main-
+    # ingest path armed the flag regardless of source type.  A flag on
+    # a non-client row can never be cleared by a delivered patch, so it
+    # sits armed forever — observed in production as personal-source
+    # rows pending since May.  Idempotent; a no-op on healthy data.
+    await db.execute(
+        """UPDATE ledger_events
+              SET origin_writeback_pending = 0
+            WHERE origin_writeback_pending = 1
+              AND source_type != 'client'"""
+    )
+    await db.commit()
+
     # affected_ledger_events was first shipped with a
     # (user_id, ledger_event_id) primary key, which made a re-enqueue
     # of the same event an INSERT-OR-IGNORE no-op — a lost update.
