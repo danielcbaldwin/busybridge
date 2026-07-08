@@ -604,9 +604,14 @@ async def _fetch_all_user_calendars(user_id: int) -> tuple[list[dict], list[str]
 # ---------------------------------------------------------------------------
 
 def get_ics_backup_dir() -> str:
-    """Return the ICS backup directory, creating it if necessary."""
-    base = os.environ.get("BACKUP_PATH", "/data/backups")
-    path = os.path.join(base, "ics")
+    """Return the ICS backup directory, creating it if necessary.
+
+    Lives under the DB-backup root so BACKUP_PATH is read in exactly
+    one place (backup.get_backup_dir) and the two paths cannot drift.
+    """
+    from app.sync.backup import get_backup_dir
+
+    path = os.path.join(get_backup_dir(), "ics")
     os.makedirs(path, exist_ok=True)
     return path
 

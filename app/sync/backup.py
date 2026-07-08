@@ -47,6 +47,11 @@ UTC = timezone.utc
 
 def get_backup_dir() -> str:
     """Return the backup directory, creating it if necessary."""
+    # Read live from the environment (not Settings): tests monkeypatch
+    # BACKUP_PATH per-case, and the cached Settings object would pin the
+    # value from process start.  This is the ONE place the variable is
+    # read — everything else (including the ICS export dir) derives
+    # from this helper.
     path = os.environ.get("BACKUP_PATH", "/data/backups")
     os.makedirs(path, exist_ok=True)
     return path
