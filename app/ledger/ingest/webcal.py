@@ -36,6 +36,19 @@ from typing import Any, Awaitable, Callable, Optional
 import aiosqlite
 from icalendar import Calendar as ICalCalendar
 
+try:  # zoneinfo is stdlib on 3.9+
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - defensive
+    ZoneInfo = None  # type: ignore[assignment]
+
+try:
+    # icalendar ships Microsoft's Windows-timezone -> Olson/IANA table
+    # (e.g. "W. Europe Standard Time" -> "Europe/Berlin").  Feeds from
+    # Outlook/Exchange commonly use these as TZIDs.
+    from icalendar.timezone.windows_to_olson import WINDOWS_TO_OLSON
+except Exception:  # pragma: no cover - defensive
+    WINDOWS_TO_OLSON = {}
+
 from app.ledger.identity import (
     canonical_uid_for_instance,
     canonical_uid_webcal_stable,
@@ -288,15 +301,29 @@ def _vevent_to_dict(comp) -> dict:
         dtstart, dtend, comp.get("DURATION"),
     )
 
+    # The zone naive local times in this VEVENT (floating UNTIL,
+    # floating RECURRENCE-ID) are interpreted in: the DTSTART's own
+    # tzinfo when present (works for VTIMEZONE-derived custom TZIDs
+    # too), else UTC — a floating DTSTART is itself treated as UTC by
+    # ``_normalize_times``, so its companions must resolve the same
+    # way or their instants diverge from the series grid.
+    event_tz = None
+    if dtstart is not None and isinstance(dtstart.dt, datetime):
+        event_tz = dtstart.dt.tzinfo or UTC
+
     # RRULE + EXDATE + RDATE all belong in the `recurrence` array
     # Google materialises instances from.  Dropping EXDATE would
     # leave a ghost busy block on every excluded occurrence.
-    recurrence_rule = _extract_recurrence(comp)
+    recurrence_rule = _extract_recurrence(
+        comp, event_tz=event_tz, is_all_day=is_all_day,
+    )
 
     # A VEVENT carrying RECURRENCE-ID is a single-occurrence override
     # of the series with the same UID — a modified or cancelled
     # instance, not a standalone event.
-    recurrence_id = _format_recurrence_id(comp.get("RECURRENCE-ID"))
+    recurrence_id = _format_recurrence_id(
+        comp.get("RECURRENCE-ID"), fallback_tz=event_tz,
+    )
 
     transparency = (str(comp.get("TRANSP", "OPAQUE")) or "OPAQUE").upper()
     show_as = "free" if transparency == "TRANSPARENT" else "busy"
@@ -321,7 +348,9 @@ def _vevent_to_dict(comp) -> dict:
     }
 
 
-def _extract_recurrence(comp) -> Optional[list[str]]:
+def _extract_recurrence(
+    comp, *, event_tz=None, is_all_day: bool = False,
+) -> Optional[list[str]]:
     """Collect RRULE / EXDATE / RDATE lines for the Google
     ``recurrence`` array.  Each property may appear more than once
     (common for EXDATE).
@@ -330,7 +359,12 @@ def _extract_recurrence(comp) -> Optional[list[str]]:
     ``item.to_ical()`` alone drops ``;VALUE=DATE`` / ``;TZID=...``,
     turning an all-day exclusion into an invalid line and a
     zoned one into a floating time that excludes the wrong instant —
-    Google gets these lines verbatim as its ``recurrence`` array."""
+    Google gets these lines verbatim as its ``recurrence`` array.
+
+    RRULE lines on TIMED events are post-processed so UNTIL is RFC
+    5545 compliant (see ``_rrule_until_to_utc``): Google rejects the
+    whole series (HTTP 400, a permanent poison-pill) when UNTIL is a
+    local/floating datetime under a zoned DTSTART."""
     lines: list[str] = []
     for key in ("RRULE", "EXDATE", "RDATE"):
         val = comp.get(key)
@@ -341,30 +375,87 @@ def _extract_recurrence(comp) -> Optional[list[str]]:
             try:
                 # Full RFC 5545 content line WITH parameters, e.g.
                 # ``EXDATE;TZID=America/New_York:20260217T090000``.
-                lines.append(str(comp.content_line(key, item)))
+                line = str(comp.content_line(key, item))
             except Exception:
                 if hasattr(item, "to_ical"):
                     try:
-                        lines.append(
-                            f"{key}:" + item.to_ical().decode("ascii")
-                        )
+                        line = f"{key}:" + item.to_ical().decode("ascii")
                     except Exception:
-                        lines.append(f"{key}:" + str(item))
+                        line = f"{key}:" + str(item)
                 else:
-                    lines.append(f"{key}:" + str(item))
+                    line = f"{key}:" + str(item)
+            if key == "RRULE" and not is_all_day:
+                line = _rrule_until_to_utc(line, event_tz or UTC)
+            lines.append(line)
     return lines or None
 
 
-def _format_recurrence_id(rid) -> Optional[str]:
+# UNTIL in an RRULE content line: date part, optional time part,
+# optional trailing Z.
+_RRULE_UNTIL_RE = re.compile(
+    r"(UNTIL=)(\d{8})(?:T(\d{6})(Z?))?", re.IGNORECASE,
+)
+
+
+def _rrule_until_to_utc(line: str, tz) -> str:
+    """Rewrite a non-compliant UNTIL on a TIMED event's RRULE to UTC.
+
+    RFC 5545: when DTSTART is zoned, a DATE-TIME UNTIL MUST be UTC
+    (trailing ``Z``).  Google enforces this and 400s the whole insert —
+    the series then never mirrors.  Two repairs:
+
+    * naive datetime UNTIL (``UNTIL=20261221T090000``) — interpret it
+      in the event's resolved zone and rewrite as ``...T...Z``;
+    * date-only UNTIL on a timed event — expand to the END of that
+      local day (23:59:59 local, then UTC), so the final day's
+      occurrence is not wrongly truncated (a bare date would otherwise
+      be read as local/UTC midnight, cutting the last instance).
+
+    A compliant ``...Z`` UNTIL and all-day events pass through
+    unchanged (callers skip all-day)."""
+    def repl(m: re.Match) -> str:
+        if m.group(4):  # already UTC (trailing Z) — compliant
+            return m.group(0)
+        try:
+            if m.group(3):
+                local = datetime.strptime(
+                    m.group(2) + m.group(3), "%Y%m%d%H%M%S",
+                ).replace(tzinfo=tz)
+            else:
+                local = datetime.strptime(m.group(2), "%Y%m%d").replace(
+                    hour=23, minute=59, second=59, tzinfo=tz,
+                )
+            return m.group(1) + local.astimezone(UTC).strftime(
+                "%Y%m%dT%H%M%SZ",
+            )
+        except Exception:
+            return m.group(0)
+    return _RRULE_UNTIL_RE.sub(repl, line)
+
+
+def _format_recurrence_id(rid, fallback_tz=None) -> Optional[str]:
     """Normalise a RECURRENCE-ID property to the same string shape
-    used for ``recurrence_instance_original_start``."""
+    used for ``recurrence_instance_original_start``.
+
+    A NAIVE (floating) RECURRENCE-ID names the occurrence by the
+    series' local wall-clock, so it is interpreted in ``fallback_tz``
+    (the parent DTSTART's resolved tzinfo) and converted to UTC.
+    Reading it as UTC would target an instant off by the zone offset —
+    the override/cancellation then never matches the real occurrence
+    and is silently lost.  True-UTC (``Z``) and TZID-carrying values
+    are aware and convert as before."""
     if rid is None:
         return None
     dt = getattr(rid, "dt", None)
     if dt is None:
         return None
     if isinstance(dt, datetime):
-        d = dt.astimezone(UTC) if dt.tzinfo else dt.replace(tzinfo=UTC)
+        if dt.tzinfo is not None:
+            d = dt.astimezone(UTC)
+        elif fallback_tz is not None:
+            d = dt.replace(tzinfo=fallback_tz).astimezone(UTC)
+        else:
+            d = dt.replace(tzinfo=UTC)
         return d.strftime("%Y-%m-%dT%H:%M:%SZ")
     return dt.isoformat()  # date-only → YYYY-MM-DD
 
@@ -428,14 +519,141 @@ def _iana_tz_name(dt) -> Optional[str]:
     icalendar parses ``DTSTART;TZID=America/New_York:...`` into a
     ``zoneinfo.ZoneInfo`` whose ``.key`` is the IANA name.  A UTC /
     fixed-offset / floating time has no ``.key`` — return ``None`` so
-    the renderer falls back to UTC."""
+    the renderer falls back to UTC.
+
+    A CUSTOM/LOCALIZED TZID (e.g. ``Mitteleuropaeische Zeit`` from a
+    German Outlook export) parses into a VTIMEZONE-derived tzinfo with
+    no ``.key`` either; returning ``None`` for those silently anchors
+    the series' RRULE on a fixed UTC grid that drifts an hour at every
+    DST change — the user shows free during real meetings.  Resolve
+    those to a real IANA zone instead (see ``_resolve_non_iana_tz``)."""
     tz = getattr(dt, "tzinfo", None)
     if tz is None:
         return None
     key = getattr(tz, "key", None)
-    # "UTC" is not a drift-prone zone — treat it as "no zone" so the
-    # renderer's UTC fallback applies and the column stays NULL.
-    return None if key == "UTC" else key
+    if key is not None:
+        # "UTC" is not a drift-prone zone — treat it as "no zone" so the
+        # renderer's UTC fallback applies and the column stays NULL.
+        return None if key == "UTC" else key
+    # datetime.timezone instances (timezone.utc / fixed offsets from
+    # ``...Z`` or ``±HH:MM`` stamps) carry no wall-clock rules to
+    # preserve — keep the historical UTC fallback for those.
+    if isinstance(tz, timezone):
+        return None
+    return _resolve_non_iana_tz(tz, dt)
+
+
+# Localized Windows/Outlook TZID display names seen in real feeds that
+# WINDOWS_TO_OLSON (English names only) misses.  Deliberately short:
+# the offset-probe fallback below covers the long tail; these just give
+# a deterministic answer for the most common European Outlook locales.
+# Keys are casefolded.
+_LOCALIZED_TZID_ALIASES = {
+    # German Outlook ("W. Europe Standard Time" localized), with and
+    # without the umlaut transliteration.
+    "mitteleuropäische zeit": "Europe/Berlin",
+    "mitteleuropaeische zeit": "Europe/Berlin",
+    "mitteleuropäische sommerzeit": "Europe/Berlin",
+    "mitteleuropaeische sommerzeit": "Europe/Berlin",
+    # French Outlook ("Romance Standard Time" localized).
+    "heure d'europe centrale": "Europe/Paris",
+    "heure de l'europe centrale": "Europe/Paris",
+    # Spanish Outlook ("Romance Standard Time" localized).
+    "hora de europa central": "Europe/Madrid",
+    "hora estándar de europa central": "Europe/Madrid",
+}
+
+# Shortlist for the offset-probe fallback: common zones ordered so the
+# first (January-offset, July-offset) match wins.  Zones that share
+# both probe offsets (Berlin/Paris/Madrid, ...) are interchangeable for
+# grid purposes — they produce identical instants for every occurrence
+# — so picking the first is safe even though the city may be "wrong".
+_OFFSET_PROBE_ZONES = (
+    "Europe/London",
+    "Europe/Berlin",
+    "Europe/Helsinki",
+    "Europe/Moscow",
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Phoenix",
+    "America/Los_Angeles",
+    "America/Sao_Paulo",
+    "Asia/Kolkata",
+    "Asia/Shanghai",
+    "Asia/Tokyo",
+    "Australia/Sydney",
+    "Pacific/Auckland",
+)
+
+
+def _resolve_non_iana_tz(tz, dt) -> Optional[str]:
+    """Best-effort IANA name for a VTIMEZONE-derived (non-IANA) tzinfo.
+
+    Resolution order:
+
+    1. icalendar's Windows->Olson table on the raw TZID string
+       (``W. Europe Standard Time`` -> ``Europe/Berlin``);
+    2. a small alias table for localized Outlook TZID names;
+    3. derive from the VTIMEZONE's actual behaviour: probe the
+       tzinfo's utcoffset at two instants (mid-January and mid-July of
+       the event's year — opposite sides of every DST transition) and
+       match the (winter, summer) offset pair against a shortlist of
+       common zones.  An offset-pair match pins down the zone's entire
+       wall-clock grid for practical purposes, which is exactly what
+       the RRULE expansion needs;
+    4. give up with a WARNING naming the TZID (visible failure) and
+       return ``None`` — the caller keeps the historical UTC fallback.
+    """
+    # The raw TZID string: dateutil's VTIMEZONE tzinfo (_tzicalvtz)
+    # stores it as ``_tzid``; other implementations may use ``zone``.
+    tzid = getattr(tz, "_tzid", None) or getattr(tz, "zone", None)
+    if tzid:
+        tzid = str(tzid)
+        if tzid.casefold() in ("utc", "etc/utc", "gmt", "z"):
+            return None  # same "no zone" treatment as key == "UTC"
+        for candidate in (
+            # A custom VTIMEZONE may still carry a genuine IANA TZID
+            # (e.g. a pytz-style tzinfo exposing ``.zone``).
+            tzid if _is_valid_zone(tzid) else None,
+            WINDOWS_TO_OLSON.get(tzid),
+            _LOCALIZED_TZID_ALIASES.get(tzid.strip().casefold()),
+        ):
+            if candidate and _is_valid_zone(candidate):
+                return candidate
+    year = getattr(dt, "year", None) or datetime.now(UTC).year
+    if ZoneInfo is not None:
+        jan = datetime(year, 1, 15, 12, 0)
+        jul = datetime(year, 7, 15, 12, 0)
+        try:
+            offsets = (tz.utcoffset(jan), tz.utcoffset(jul))
+        except Exception:
+            offsets = (None, None)
+        if None not in offsets:
+            for name in _OFFSET_PROBE_ZONES:
+                try:
+                    z = ZoneInfo(name)
+                except Exception:  # pragma: no cover - tzdata gap
+                    continue
+                if (z.utcoffset(jan), z.utcoffset(jul)) == offsets:
+                    return name
+    logger.warning(
+        "webcal: could not resolve TZID %r to an IANA zone; recurring "
+        "events in it will expand on a fixed UTC grid and may drift "
+        "across DST changes.",
+        tzid,
+    )
+    return None
+
+
+def _is_valid_zone(name: str) -> bool:
+    if ZoneInfo is None:  # pragma: no cover - defensive
+        return False
+    try:
+        ZoneInfo(name)
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------

@@ -187,16 +187,132 @@ def occurrence_key(value: Optional[str], *, is_all_day: bool) -> Optional[str]:
 # and does not change the all-day boundary (the date is what matters).
 _UNTIL_DATETIME_RE = re.compile(r"(UNTIL=)(\d{8})T\d{6}Z?", re.IGNORECASE)
 
+# The reverse shapes — a date-only or naive-datetime UNTIL under an AWARE
+# dtstart — also make dateutil raise, and the callers below swallow that
+# into a permanent ``None`` (indeterminate): the planner's cancel-all
+# pruning and split-orphan detection then stay disabled for that series
+# FOREVER.  These regexes drive the aware-side repairs.
+_UNTIL_ANY_RE = re.compile(r"(UNTIL=)(\d{8})(?:T(\d{6})(Z?))?", re.IGNORECASE)
+_NAIVE_DT_VALUE_RE = re.compile(r"^(\d{8})T(\d{6})$")
+_DATE_VALUE_RE = re.compile(r"^\d{8}$")
+_AWARE_Z_VALUE_RE = re.compile(r"^(\d{8}T\d{6})Z$")
+_TZID_PARAM_RE = re.compile(r";TZID=[^;:]*", re.IGNORECASE)
+
+
+def _utc_stamp(dt: datetime) -> str:
+    return dt.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _split_prop(line: str) -> tuple[str, str, str]:
+    """``EXDATE;TZID=X:v1,v2`` -> ``("EXDATE", ";TZID=X", "v1,v2")``."""
+    head, _, values = line.partition(":")
+    name, sep, params = head.partition(";")
+    return name.upper(), (sep + params if sep else ""), values
+
 
 def _align_recurrence_for_dtstart(
     recurrence_lines: list[str], dtstart: datetime,
 ) -> list[str]:
-    if dtstart.tzinfo is not None:
-        return recurrence_lines
-    return [
-        _UNTIL_DATETIME_RE.sub(lambda m: m.group(1) + m.group(2), line)
-        for line in recurrence_lines
-    ]
+    """Repair awareness mismatches between recurrence lines and dtstart.
+
+    dateutil refuses to expand a rule whose UNTIL / EXDATE / RDATE
+    awareness disagrees with the dtstart's.  Both directions occur in
+    real feeds; each is rewritten to agree with the dtstart so one bad
+    line cannot kill expansion for the whole series:
+
+    * naive (all-day) dtstart: datetime UNTIL -> its date part; aware
+      (``Z`` / TZID) EXDATE/RDATE values -> naive wall-times.
+    * aware dtstart: date-only UNTIL -> end of that day (23:59:59) in
+      the dtstart's zone, as UTC ``Z``; naive datetime UNTIL ->
+      interpreted in the dtstart's zone, as UTC ``Z``; naive
+      EXDATE/RDATE values -> localised in the dtstart's zone (a
+      date-only value uses the dtstart's wall-clock time so the
+      exclusion actually hits that day's occurrence).
+    """
+    if dtstart.tzinfo is None:
+        aligned = []
+        for line in recurrence_lines:
+            line = _UNTIL_DATETIME_RE.sub(
+                lambda m: m.group(1) + m.group(2), line,
+            )
+            name, params, values = _split_prop(line)
+            if name in ("EXDATE", "RDATE") and values:
+                # Aware values under a naive dtstart: strip the TZID
+                # param and any trailing Z so values parse naive.  For
+                # an all-day grid the wall date is what matters.
+                params = _TZID_PARAM_RE.sub("", params)
+                values = ",".join(
+                    _AWARE_Z_VALUE_RE.sub(r"\1", v.strip())
+                    for v in values.split(",")
+                )
+                line = name + params + ":" + values
+            aligned.append(line)
+        return aligned
+
+    tz = dtstart.tzinfo
+    aligned = []
+    for line in recurrence_lines:
+        name, params, values = _split_prop(line)
+        if name == "RRULE":
+            line = _UNTIL_ANY_RE.sub(
+                lambda m: _aware_until_repl(m, tz), line,
+            )
+        elif (
+            name in ("EXDATE", "RDATE")
+            and values
+            and "TZID=" not in params.upper()
+            and "VALUE=PERIOD" not in params.upper()
+        ):
+            new_values, changed = [], False
+            for v in (p.strip() for p in values.split(",")):
+                m = _NAIVE_DT_VALUE_RE.match(v)
+                if m:
+                    local = datetime.strptime(
+                        v, "%Y%m%dT%H%M%S",
+                    ).replace(tzinfo=tz)
+                    new_values.append(_utc_stamp(local))
+                    changed = True
+                    continue
+                if _DATE_VALUE_RE.match(v):
+                    # Date-only exclusion on a timed series: target that
+                    # day's occurrence at the series' wall-clock time.
+                    d = datetime.strptime(v, "%Y%m%d").replace(
+                        hour=dtstart.hour,
+                        minute=dtstart.minute,
+                        second=dtstart.second,
+                        tzinfo=tz,
+                    )
+                    new_values.append(_utc_stamp(d))
+                    changed = True
+                    continue
+                new_values.append(v)  # already Z-stamped / unknown
+            if changed:
+                # Values are now UTC datetimes; a stale VALUE=DATE
+                # param would make dateutil parse them wrong.
+                params = re.sub(
+                    r";VALUE=DATE(?=;|$)", "", params, flags=re.IGNORECASE,
+                )
+                line = name + params + ":" + ",".join(new_values)
+        aligned.append(line)
+    return aligned
+
+
+def _aware_until_repl(m: re.Match, tz) -> str:
+    """UNTIL rewrite for an aware dtstart (see caller docstring)."""
+    if m.group(4):  # already UTC ``Z`` — awareness-consistent
+        return m.group(0)
+    try:
+        if m.group(3):
+            local = datetime.strptime(
+                m.group(2) + m.group(3), "%Y%m%d%H%M%S",
+            ).replace(tzinfo=tz)
+        else:
+            local = datetime.strptime(m.group(2), "%Y%m%d").replace(
+                hour=23, minute=59, second=59, tzinfo=tz,
+            )
+        return m.group(1) + _utc_stamp(local)
+    except Exception:
+        return m.group(0)
 
 
 def expand_occurrences(
