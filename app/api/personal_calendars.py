@@ -3,7 +3,6 @@
 import json
 import logging
 import sqlite3
-from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status

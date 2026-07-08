@@ -1,13 +1,12 @@
 """OOBE (Out-of-Box Experience) setup wizard routes."""
 
 import asyncio
-import json
 import logging
 import os
 import secrets
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -17,14 +16,17 @@ from app.database import get_database, is_oobe_completed, set_setting
 from app.encryption import (
     generate_encryption_key,
     key_to_base64,
-    EncryptionManager,
     init_encryption_manager,
 )
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/setup", tags=["setup"])
 
-templates = Jinja2Templates(directory="app/ui/templates")
+# Anchored to this file's directory (like app/main.py does for static)
+# so template resolution does not depend on the process CWD.
+templates = Jinja2Templates(
+    directory=os.path.join(os.path.dirname(__file__), "templates")
+)
 
 # Temporary storage for OOBE data.  Single-process by design; the
 # wizard binds it to one browser via the _session_token below so a
@@ -44,9 +46,6 @@ _oobe_completed_token: Optional[str] = None
 # Serialises the first-request bind so two concurrent first visitors
 # cannot both mint a session token.
 _oobe_lock = asyncio.Lock()
-
-# Default path for service account key inside the container
-SA_KEY_PATH = "/secrets/sa-key.json"
 
 
 async def _reject_if_oobe_done() -> None:
@@ -144,8 +143,6 @@ async def setup_wizard(
     request: Request,
     step: int = 1,
     error: Optional[str] = None,
-    sa: Optional[str] = None,
-    sa_email: Optional[str] = None,
 ):
     """OOBE setup wizard."""
     if await is_oobe_completed():

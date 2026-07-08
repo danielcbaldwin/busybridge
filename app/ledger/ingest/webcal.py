@@ -16,11 +16,12 @@ matter:
    the ledger; the planner decides whether their projections
    should be present.
 
-The fetch step is parametrised: a `fetch_ics` callable accepts
-``(url, if_none_match)`` and returns ``(status, etag, body)``.
-In tests we drive it from an in-memory dict; in production we'd
-use httpx with SSRF guards from the existing
-``app/sync/webcal_sync.py``.
+The fetch step is parametrised: a ``fetch`` callable (see
+``FetchHook`` below) accepts ``(url, if_none_match)`` and returns
+a dict with ``status`` / ``etag`` / ``body`` keys.  In tests we
+drive it from an in-memory dict; in production the hook wraps the
+SSRF-guarded httpx fetch in ``app/utils/ics_fetch.py`` (wired up
+in ``app/ledger/runtime.py``).
 """
 
 from __future__ import annotations
@@ -202,7 +203,6 @@ async def ingest_webcal_subscription(
     # for >= 2 poll intervals, flips to cancelled.
     # Production schema stores poll_interval_minutes; some test
     # schemas use poll_interval_seconds.  Tolerate either.
-    keys = state.keys() if hasattr(state, "keys") else []
     if "poll_interval_minutes" in keys and state["poll_interval_minutes"]:
         poll_interval = int(state["poll_interval_minutes"]) * 60
     elif "poll_interval_seconds" in keys and state["poll_interval_seconds"]:

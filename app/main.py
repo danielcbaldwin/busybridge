@@ -20,11 +20,22 @@ from app.config import get_settings
 from app.database import close_database, get_database
 
 # Configure logging.  stdout always; a rotating file handler when
-# the log directory is writable.
+# the log directory is writable.  Honours LOG_LEVEL (settings are
+# already loadable here — get_settings() is imported above and is
+# called at import time further down for log_dir); fall back to INFO
+# if settings can't load so a bad env var never makes the app
+# un-importable.
 _log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
+try:
+    _log_level = getattr(
+        logging, get_settings().log_level.upper(), logging.INFO,
+    )
+except Exception:
+    _log_level = logging.INFO
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=_log_level,
     format=_log_format,
     handlers=[logging.StreamHandler(sys.stdout)],
 )
@@ -254,8 +265,9 @@ async def lifespan(app: FastAPI):
     # Optional: BB_FAKE_GOOGLE=1 boots the app with the in-memory
     # FakeGoogleCalendar wired into the ledger runtime.  Useful for
     # end-to-end smoke tests against a running uvicorn (no real
-    # Google credentials required).  Strictly opt-in.
-    if os.environ.get("BB_FAKE_GOOGLE") == "1":
+    # Google credentials required).  Strictly opt-in — never enable
+    # in production.
+    if get_settings().bb_fake_google:
         try:
             from app.ledger.runtime import set_google_client_factory
             from tests.fakes.google_calendar import FakeGoogleCalendar
@@ -481,7 +493,7 @@ async def health_check():
 # ---------------------------------------------------------------------------
 # Debug endpoints — only mounted when BB_FAKE_GOOGLE=1
 # ---------------------------------------------------------------------------
-if os.environ.get("BB_FAKE_GOOGLE") == "1":
+if get_settings().bb_fake_google:
     @app.post("/_fake/calendars/{calendar_id}/events")
     @limiter.exempt
     async def _fake_insert_event(calendar_id: str, body: dict):

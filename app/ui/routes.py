@@ -1,21 +1,26 @@
 """UI page routes."""
 
 import logging
+import os
 import re
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from app.auth.session import get_current_user, get_current_user_optional, User
+from app.auth.session import get_current_user_optional
 from app.config import get_settings, get_test_mode_home_allowlist
 from app.database import get_database, get_setting, is_oobe_completed
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["ui"])
 
-templates = Jinja2Templates(directory="app/ui/templates")
+# Anchored to this file's directory (like app/main.py does for static)
+# so template resolution does not depend on the process CWD.
+templates = Jinja2Templates(
+    directory=os.path.join(os.path.dirname(__file__), "templates")
+)
 
 # A Google calendar's backgroundColor is rendered into a CSS style
 # attribute; only a plain #rgb / #rrggbb(aa) hex value is allowed

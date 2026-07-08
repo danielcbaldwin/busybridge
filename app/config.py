@@ -71,6 +71,11 @@ class Settings(BaseSettings):
     test_mode: bool = False
     test_mode_allowed_home_emails: str = ""
     test_mode_allowed_client_emails: str = ""
+    # BB_FAKE_GOOGLE=1 boots the app with the in-memory
+    # FakeGoogleCalendar wired into the ledger runtime and mounts the
+    # /_fake/* debug endpoints (see app/main.py).  Testing only — never
+    # enable in production.
+    bb_fake_google: bool = False
 
     # Rate limiting
     rate_limit_per_minute: int = 60
@@ -96,7 +101,6 @@ class Settings(BaseSettings):
     # Sync settings
     sync_interval_minutes: int = 5
     webhook_renewal_hours: int = 6
-    consistency_check_hours: int = 1
     # How often the content-audit job runs (re-verifies ingested source
     # content against Google to catch drift incremental sync can't see —
     # the create-then-rename race).  Cheap (a few list calls/run), so it

@@ -18,7 +18,7 @@ services:
       # to your real https:// origin in production — the session
       # cookie's Secure flag is derived from this scheme.
       - PUBLIC_URL=${PUBLIC_URL:-http://localhost:8033}
-      - LOG_LEVEL=info
+      - LOG_LEVEL=${LOG_LEVEL:-info}
       - TZ=America/New_York
       # TEST_MODE quick switch:
       # - Set TEST_MODE=true
@@ -29,7 +29,6 @@ services:
       - TEST_MODE_ALLOWED_HOME_EMAILS=${TEST_MODE_ALLOWED_HOME_EMAILS:-}
       - TEST_MODE_ALLOWED_CLIENT_EMAILS=${TEST_MODE_ALLOWED_CLIENT_EMAILS:-}
       - MANAGED_EVENT_PREFIX=${MANAGED_EVENT_PREFIX:-[BusyBridge]}
-      - SERVICE_ACCOUNT_KEY_FILE=${SERVICE_ACCOUNT_KEY_FILE:-}
       # Phase-1 organizer-delete propagation: off (default) | shadow | on.
       # See DELETE_PROPAGATION_PLAN.md.
       - DELETE_PROPAGATION_MODE=${DELETE_PROPAGATION_MODE:-off}

@@ -4,9 +4,10 @@ For each event Google delivers, decide:
 
 1. Is it one of our writes (a busy block / projection)?  If so,
    skip — we don't want to mirror our own output.
-2. Is it a rescheduled-parent ``_R`` case?  Look up the existing
-   ledger row by stripped base ID and re-key its
-   ``source_event_id`` to the new one.
+2. Is it a ``<base>_R<date>`` "this and following" segment?  It is
+   ingested as its OWN recurring series — we deliberately do NOT
+   re-key the base series onto it (see the comment in
+   ``_ingest_one_event`` for why re-keying was removed).
 3. Otherwise: upsert the ledger row, bumping ``version`` only if a
    material field changed.
 
@@ -57,17 +58,17 @@ async def ingest_client_calendar(
 ) -> dict:
     """Run one ingest pass for one client calendar.
 
-    Returns counters: ``{seen, created, updated, rekeyed, skipped, cancelled}``.
-    Affected ``ledger_event.id``s are written into the
-    ``reconcile_requests.sources_json`` so the reconciler picks
-    them up for planning.
+    Returns counters: ``{seen, created, updated, skipped, cancelled,
+    failed}``.  Affected ``ledger_event.id``s are appended to the
+    ``affected_ledger_events`` queue (via ``_record_affected``) so the
+    reconciler picks them up for planning.
     """
     google = as_async_google(google)
     state = await _get_or_create_sync_state(db, client_calendar_id)
     sync_token: Optional[str] = state["sync_token"]
     counters = {
         "seen": 0, "created": 0, "updated": 0,
-        "rekeyed": 0, "skipped": 0, "cancelled": 0, "failed": 0,
+        "skipped": 0, "cancelled": 0, "failed": 0,
     }
     affected_ledger_ids: list[int] = []
 
@@ -1052,42 +1053,27 @@ def _user_is_organizer(
     return organizer in owned
 
 
-# Fields hashed via a normalised form rather than their raw value.
-# The raw conferenceData JSON varies between Google reads (entry-point
-# order / volatile sub-fields), so hashing it verbatim makes every Meet
-# event look "changed" on every sync — an endless version-bump →
-# re-plan → re-send churn.  Instead we hash a stable SIGNATURE (the
-# conference id + the actual entry-point URIs, sorted): a genuine
-# Meet-link change IS detected and re-synced, the serialisation noise
-# is not.  htmlLink is stable and display-only, so it is dropped from
-# change detection entirely.  Both are still stored and rendered in full.
+# Fields excluded from the content hash.
 #
-# start_at / end_at are excluded for the same reason: Google returns the
-# same instant in different timezone offsets across reads / accounts (a
+# conference_data_json is dropped from change detection ENTIRELY (see
+# the comment in ``_content_hash``): even a normalised signature of the
+# blob churns across Google reads, so a Meet-link change is instead
+# propagated solely by ``_resolve_conference``'s two-consecutive-reads
+# debounce.  htmlLink is stable and display-only, so it too is dropped
+# from change detection.
+#
+# start_at / end_at are excluded because Google returns the same
+# instant in different timezone offsets across reads / accounts (a
 # user travelling will see "+02:00" one pass and "-04:00" the next), so
 # the raw string churns even though the moment in time is unchanged.
-# We hash a canonical UTC instant instead.  Display-time values stay
-# whatever Google last delivered — only change DETECTION is normalised.
+# ``_content_hash`` hashes a canonical UTC instant instead.  Display-
+# time values stay whatever Google last delivered — only change
+# DETECTION is normalised.  All excluded fields are still stored and
+# rendered in full.
 _HASH_EXCLUDE = frozenset({
     "conference_data_json", "source_html_link",
     "start_at", "end_at",
 })
-
-
-def _conference_signature(conf_json: Optional[str]) -> str:
-    """Stable identity of a conferenceData blob — its conference id and
-    the sorted set of entry-point URIs — ignoring ordering and volatile
-    sub-fields.  Falls back to the raw value if it isn't parseable."""
-    if not conf_json:
-        return ""
-    try:
-        data = json.loads(conf_json)
-    except (TypeError, ValueError):
-        return conf_json
-    uris = sorted(
-        (ep.get("uri") or "") for ep in (data.get("entryPoints") or [])
-    )
-    return (data.get("conferenceId") or "") + "|" + "|".join(uris)
 
 
 def _conference_id(conf_json: Optional[str]) -> Optional[str]:

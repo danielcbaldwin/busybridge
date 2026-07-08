@@ -1,8 +1,12 @@
 """Ingest paths: source-of-truth → ledger upserts.
 
-One module per source kind.  Each runs
-inside a single DB transaction that includes the sync-token
-update — partial failures cannot lose events.
+One module per source kind.  The connection runs in autocommit
+(see app/database.py), so a pass is NOT one enclosing transaction;
+instead the sync-token update is deliberately the LAST durable
+write of a pass, so a crash mid-pass simply re-ingests from the
+old token next time (idempotent) — partial failures cannot lose
+events.  See app/ledger/ingest/client.py's module docstring for
+the full rationale.
 """
 
 from app.ledger.ingest.client import ingest_client_calendar

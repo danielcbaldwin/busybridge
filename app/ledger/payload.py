@@ -30,7 +30,7 @@ import hashlib
 import json
 from typing import Any, Optional
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 
 # State constants — keep in sync with planner.py.
 PRESENT_FULL = "present_full"
@@ -40,8 +40,13 @@ PRESENT_FULL_RSVP_ONLY = "present_full_rsvp_only"
 ABSENT = "absent"
 
 LOCK_PREFIX = "🔒 "
-BUSY_SUMMARY = "Busy"
-PERSONAL_BUSY_SUMMARY = "Busy (personal)"
+# Busy-block title fallbacks, sourced from the Settings field defaults
+# (app/config.py: busy_block_title / personal_busy_block_title) so the
+# historical rendered values have a single source of truth.  Used by
+# _busy_title() / _personal_busy_title() when the settings object lacks
+# the fields (e.g. a stubbed settings in tests).
+BUSY_SUMMARY = Settings.model_fields["busy_block_title"].default
+PERSONAL_BUSY_SUMMARY = Settings.model_fields["personal_busy_block_title"].default
 
 # Guest-list block appended to a main copy's description (v1 parity).
 _ATTENDEE_LIST_LIMIT = 15

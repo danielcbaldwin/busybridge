@@ -21,6 +21,7 @@ python-jose[cryptography]==3.5.0
 aiosmtplib==5.1.0
 aiosqlite==0.22.1
 slowapi==0.1.9
-itsdangerous==2.2.0
 icalendar==7.1.0
-recurring-ical-events==3.8.2
+# Imported directly by app/ledger/recurrence.py (dateutil.rrule),
+# so pinned explicitly rather than relied on transitively.
+python-dateutil==2.9.0.post0

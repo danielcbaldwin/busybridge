@@ -164,7 +164,7 @@ async def receive_google_calendar_webhook(
     # debounce rather than the scheduler's 30s tick.
     try:
         from app.ledger.runtime import reconcile_user_by_id
-        from app.ledger.triggers import enqueue_webhook
+        from app.ledger.triggers import WEBHOOK_DEBOUNCE, enqueue_webhook
         from app.utils.tasks import create_background_task
         if channel["calendar_type"] == "main":
             hint = "main"
@@ -175,16 +175,17 @@ async def receive_google_calendar_webhook(
         user_id = channel["user_id"]
         await enqueue_webhook(db, user_id=user_id, source_hint=hint)
 
-        # Sleep ~5s, then drain.  Run as a background task so the
-        # webhook ack is fast; the sleep gives Google's eventual-
-        # consistency window time to settle before we ingest.  At most
-        # one such task per user is in flight — a webhook arriving
-        # while one is pending folds into the debounced request above.
+        # Sleep out the debounce window, then drain.  Run as a
+        # background task so the webhook ack is fast; the sleep gives
+        # Google's eventual-consistency window time to settle before we
+        # ingest.  At most one such task per user is in flight — a
+        # webhook arriving while one is pending folds into the
+        # debounced request above.
         if _claim_webhook_drain(user_id):
             async def _delayed_drain(uid: int) -> None:
                 import asyncio
                 try:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(WEBHOOK_DEBOUNCE.total_seconds())
                     await reconcile_user_by_id(uid)
                 except Exception:
                     logger.exception(

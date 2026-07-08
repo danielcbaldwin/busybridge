@@ -39,7 +39,6 @@ def _settings(**overrides):
         "sync_interval_minutes": 5,
         "enable_webhooks": True,
         "webhook_renewal_hours": 6,
-        "consistency_check_hours": 1,
         "content_audit_minutes": 10,
         "token_refresh_minutes": 30,
         "alert_process_minutes": 1,

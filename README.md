@@ -362,6 +362,7 @@ credentials and SMTP live in the database, not here.
 | `TEST_MODE` | Gmail-safe testing mode (see below) | `false` |
 | `TEST_MODE_ALLOWED_HOME_EMAILS` | Home-login email allowlist | _(none)_ |
 | `TEST_MODE_ALLOWED_CLIENT_EMAILS` | Client-connect email allowlist | _(none)_ |
+| `BB_FAKE_GOOGLE` | Boot with the in-memory fake Google Calendar wired in and mount the `/_fake/*` debug endpoints. **Testing only — never enable in production.** | `false` |
 
 > `TZ` is an OS/container variable (not a setting); `docker-compose.yml` sets it
 > to `America/New_York`, so the daily cron jobs run in US Eastern by default.
@@ -667,7 +668,7 @@ webcal subscriptions, admin, the ledger admin surface under `/api/admin/ledger`)
 | Encryption | AES-256-GCM (`cryptography`) |
 | Sessions | `python-jose` (JWT) |
 | Email | `aiosmtplib` |
-| ICS | `icalendar` + `recurring-ical-events` |
+| ICS | `icalendar` |
 | Rate limiting | SlowAPI (HTTP) + a custom token bucket (Google) |
 | Frontend | Jinja2 + htmx + Alpine.js + Tailwind (vendored, no CDN) |
 

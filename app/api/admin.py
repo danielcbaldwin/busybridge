@@ -1,9 +1,7 @@
 """Admin API endpoints."""
 
-import json
 import logging
 import os
-from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -643,14 +641,16 @@ async def trigger_consistency_check(
     user_id: Optional[int] = None,
     admin: User = Depends(require_admin),
 ):
-    """Run (or preview) the consistency check.
+    """Report the current consistency-check divergence counts.
 
     Under the ledger architecture consistency is structurally
     enforced by the planner + outbox: divergences
     between desired and applied projection state ARE the
     inconsistencies, and they're reconciled automatically every
     drain tick.  This endpoint therefore reports — but does not
-    "fix" — the current divergence count.
+    "fix" — the current divergence count.  It is read-only either
+    way; ``dry_run`` is accepted for backwards compatibility and
+    merely echoed in the response.
 
     For active repair, use POST ``/admin/ledger/users/{id}/sync-now``
     (enqueue a reconcile) or

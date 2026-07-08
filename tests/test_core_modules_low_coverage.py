@@ -151,7 +151,7 @@ async def test_main_health_exception_handler_favicon_and_lifespan(monkeypatch, t
     async def close_db():
         calls["close"] += 1
 
-    monkeypatch.setattr(main, "get_settings", lambda: SimpleNamespace(public_url="http://localhost:3000", database_path=":memory:", encryption_key_file=str(key_file)))
+    monkeypatch.setattr(main, "get_settings", lambda: SimpleNamespace(public_url="http://localhost:3000", database_path=":memory:", encryption_key_file=str(key_file), bb_fake_google=False))
     monkeypatch.setattr(main, "get_database", ok_db)
     monkeypatch.setattr(main, "close_database", close_db)
     monkeypatch.setattr("app.config.get_encryption_key", lambda: b"2" * 32)

@@ -23,7 +23,12 @@ async def app_with_fake_google(test_db, monkeypatch):
     are registered, return the configured TestClient.
     """
     monkeypatch.setenv("BB_FAKE_GOOGLE", "1")
-    # Reload the module so the `if os.environ.get("BB_FAKE_GOOGLE") == "1"`
+    # get_settings() is lru_cached — clear it so the reload below sees
+    # bb_fake_google=True (and clear again in teardown so later tests
+    # get settings rebuilt without the env var).
+    from app.config import get_settings
+    get_settings.cache_clear()
+    # Reload the module so the `if get_settings().bb_fake_google`
     # branch at import time fires this time.
     import app.main as main_mod
     importlib.reload(main_mod)
@@ -103,6 +108,10 @@ async def app_with_fake_google(test_db, monkeypatch):
                 os.remove(path)
             except FileNotFoundError:
                 pass
+        # Drop the cached settings built with BB_FAKE_GOOGLE=1; the
+        # monkeypatched env var is undone right after this fixture, so
+        # the next get_settings() call rebuilds clean settings.
+        get_settings.cache_clear()
 
 
 def test_security_headers_and_vendored_assets(app_with_fake_google):

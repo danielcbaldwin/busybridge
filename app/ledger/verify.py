@@ -11,10 +11,11 @@ Two checks:
   exists and is not cancelled.  For every projection the ledger
   believes is ``absent``, confirm Google agrees (or never had
   it).  Divergences are returned, not fixed.
-* :func:`preview_user` — run an ingest + plan + diff pass with
-  the outbox left UNDRAINED, then return the pending outbox
-  operations: the exact list of writes the system *would* make.
-  Pure read; nothing is sent to Google.
+* :func:`app.ledger.reconciler.reconcile_user` with
+  ``dry_run=True`` — run an ingest + plan + diff pass with the
+  outbox left undrained, then return the pending outbox
+  operations (``preview_operations``): the exact list of writes
+  the system *would* make.  Nothing is sent to Google.
 
 Both are safe to run against production / real Google at any
 time — they never mutate Google state.

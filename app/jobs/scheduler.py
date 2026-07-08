@@ -19,7 +19,7 @@ def setup_scheduler() -> AsyncIOScheduler:
     settings = get_settings()
 
     _scheduler = AsyncIOScheduler()
-    enable_ledger_jobs = getattr(settings, "enable_ledger_jobs", False)
+    enable_ledger_jobs = settings.enable_ledger_jobs
 
     # Legacy/rollback periodic sync shim.  In ledger mode, the
     # dedicated ledger jobs below own enqueue + drain; scheduling this

@@ -8,7 +8,6 @@ from pydantic import BaseModel
 
 from app.auth.session import get_current_user, User
 from app.database import get_database, get_setting, set_setting
-from app.encryption import decrypt_value, encrypt_value
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["users"])

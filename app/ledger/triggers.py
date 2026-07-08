@@ -48,7 +48,9 @@ async def enqueue_webhook(
     into one reconcile pass.
 
     ``source_hint`` is a short string like ``"client:7"`` or
-    ``"main"`` the reconciler can pass to selective ingest.
+    ``"main"``.  It is accepted for the caller's benefit only and is
+    never persisted or acted on — the reconciler always reconciles
+    every source (see ``_upsert_request`` for why).
     """
     await _upsert_request(
         db,
@@ -84,7 +86,11 @@ async def enqueue_manual(
     now: Optional[datetime] = None,
 ) -> None:
     """User clicked the Sync button.  Wait the settling delay so
-    any in-flight Google writes have time to land."""
+    any in-flight Google writes have time to land.
+
+    ``source_hint`` is accepted for the caller's benefit only and is
+    never persisted or acted on — the reconciler always reconciles
+    every source (see ``_upsert_request`` for why)."""
     await _upsert_request(
         db,
         user_id=user_id,
@@ -180,11 +186,13 @@ async def claim_due_request(
     # or its in-flight claim is older than STALE_CLAIM_TIMEOUT (a
     # crashed process never released it).
     #
-    # sources_json is deliberately NOT cleared here.  It carries the
-    # integer ledger-event ids an admin mutation staged via
-    # _append_affected; the reconciler's _consume_affected_ledger_ids
-    # is the sole consumer and clears it once the rows are planned.
-    # Clearing it at claim time silently dropped scheduled admin work.
+    # sources_json is deliberately NOT cleared here.  It is a legacy
+    # column that may still carry integer ledger-event ids staged by
+    # pre-cutover code; new writes go to the affected_ledger_events
+    # table instead (see record_affected_events), which the
+    # reconciler's _read_affected_ledger_rows / _clear_affected_
+    # ledger_rows consume once the rows are planned.  Clearing
+    # sources_json at claim time silently dropped scheduled admin work.
     cursor = await db.execute(
         """UPDATE reconcile_requests
               SET in_flight = 1,
@@ -297,10 +305,11 @@ async def _upsert_request(
     periodic-timer path) preserves the earliest schedule so we
     don't postpone work indefinitely.
 
-    ``sources_json`` is deliberately NOT written here.  That column is
-    owned by the ingest layer (``ingest.client._record_affected``) and
-    admin ops (``admin_ops._append_affected``), which store *integer
-    ledger-event ids*.  This trigger path used to merge a *string*
+    ``sources_json`` is deliberately NOT written here.  That legacy
+    column once carried the *integer ledger-event ids* staged by the
+    ingest layer and admin ops (both now append to the
+    ``affected_ledger_events`` table via ``record_affected_events``
+    instead).  This trigger path used to merge a *string*
     ``source_hint`` into the same column — and a later
     ``sorted(set(prior + [hint]))`` would then raise ``TypeError`` the
     moment ints and strings coexisted.  The hint is kept in the

@@ -80,9 +80,7 @@ def production_rate_limiter() -> _AsyncRateLimiter:
     if _production_limiter is None:
         from app.config import get_settings
 
-        rate = getattr(
-            get_settings(), "google_api_rate_limit_per_second", 6.0,
-        )
+        rate = get_settings().google_api_rate_limit_per_second
         _production_limiter = _AsyncRateLimiter(rate)
     return _production_limiter
 

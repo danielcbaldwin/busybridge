@@ -192,7 +192,7 @@ async def _classify_and_handle(
     # the dry-run and be drained by the next normal reconcile).
     if not dry_run:
         await _schedule_orphan_delete(
-            db, google,
+            db,
             user_id=user_id,
             target_google_calendar_id=target_google_calendar_id,
             target_calendar_db_id=target_calendar_db_id,
@@ -204,7 +204,6 @@ async def _classify_and_handle(
 
 async def _schedule_orphan_delete(
     db: aiosqlite.Connection,
-    google: GoogleClient,
     *,
     user_id: int,
     target_google_calendar_id: str,
@@ -219,7 +218,7 @@ async def _schedule_orphan_delete(
     and a projection whose ``google_event_id`` is set to the orphan
     we want gone.  The next reconcile diff produces a delete.
     """
-    when = datetime.now(UTC).isoformat()
+    when = (now or datetime.now(UTC)).isoformat()
     canonical = f"orphan:{user_id}:{target_google_calendar_id}:{event_id}"
     cursor = await db.execute(
         """INSERT OR IGNORE INTO ledger_events
