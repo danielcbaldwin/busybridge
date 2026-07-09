@@ -219,3 +219,146 @@ async def test_no_origin_projection_for_a_locked_event_without_an_rsvp():
     )).fetchall()
     assert all(r["desired_state"] != "present_full_rsvp_only" for r in rows)
     await s.close()
+
+
+async def test_pending_rsvp_survives_source_reingest():
+    """THE decline-erasure regression (reproduced pre-fix): a decline
+    made on main lives only in ``user_rsvp_status`` + the pending flag;
+    if the source is re-ingested before the writeback drains (organizer
+    edit, rate-limit backoff, the 10-minute content audit), client
+    ingest used to overwrite the column from the source's stale value —
+    the pending patch was then superseded by one rendered from the
+    reverted row and the decline vanished end-to-end, silently.
+
+    Mirror-of-source must not overwrite user intent: the local RSVP is
+    preserved while the flag is armed, and the eventually-delivered
+    patch carries the decline even though the organizer moved the
+    meeting in between.
+    """
+    s = Scenario()
+    try:
+        s.given_calendar("main")
+        s.given_calendar("client_a")
+        await s.given_user("alice", main="main", clients=["client_a"])
+        _client_event_with_attendees(s, "client_a", "teamsunc00002")
+        await s.run_reconciler_until_quiescent("alice", max_passes=4)
+
+        # Alice declines on the main copy.
+        main_copy = s.assert_event_exists("main", summary="Team sync")
+        s.update_event(
+            "main", main_copy["id"],
+            attendees=[{"email": "alice@example.com", "self": True,
+                        "responseStatus": "declined"}],
+        )
+        # ONE pass: main ingest sees the decline and arms the writeback.
+        # Block the drain from delivering it this pass by pausing sync
+        # AFTER planning... simplest deterministic lever: capture the flag
+        # state, then simulate the organizer's edit landing before the next
+        # reconcile delivers the patch.
+        db = s._db
+        await s.run_ingest_only("alice") if hasattr(s, "run_ingest_only") else None
+
+        # Portable path: run a full pass (the patch may deliver), then
+        # explicitly re-arm the exact wedged production state: RSVP stored
+        # locally, flag set, patch not yet delivered.
+        await s.run_reconciler("alice")
+        row = await (await db.execute(
+            "SELECT id, user_rsvp_status FROM ledger_events "
+            "WHERE source_event_id = 'teamsunc00002'")).fetchone()
+        assert row is not None
+        await db.execute(
+            "UPDATE ledger_events SET user_rsvp_status = 'declined', "
+            "origin_writeback_pending = 1 WHERE id = ?", (row["id"],))
+        # The organizer resets alice to needsAction on the SOURCE and moves
+        # the meeting (a genuine source-side content change).
+        s.update_event(
+            "client_a", "teamsunc00002",
+            start="2026-02-02T11:00:00Z", end="2026-02-02T11:30:00Z",
+            attendees=[{"email": "alice@example.com", "self": True,
+                        "responseStatus": "needsAction"},
+                       {"email": "bob@example.com",
+                        "responseStatus": "accepted"}],
+        )
+        await db.commit()
+
+        await s.run_reconciler_until_quiescent("alice", max_passes=5)
+
+        # The local decline survived the re-ingest...
+        row = await (await db.execute(
+            "SELECT user_rsvp_status, origin_writeback_pending FROM ledger_events "
+            "WHERE id = ?", (row["id"],))).fetchone()
+        assert row["user_rsvp_status"] == "declined", (
+            "source re-ingest clobbered the pending decline"
+        )
+        # ...and was delivered to the origin despite the concurrent edit.
+        origin = s.google.get_event(s.cal("client_a"), "teamsunc00002")
+        alice = _attendee(origin, "alice@example.com")
+        assert alice is not None and alice["responseStatus"] == "declined", (
+            f"decline lost; origin attendees={origin.get('attendees')}"
+        )
+        # Bob's response (from the fresher source array) is intact.
+        bob = _attendee(origin, "bob@example.com")
+        assert bob is not None and bob["responseStatus"] == "accepted"
+    finally:
+        await s.close()
+
+
+async def test_apply_event_to_ledger_preserves_pending_rsvp_unit():
+    """Unit-level discriminator for the clobber itself: with the
+    pending flag armed, a source re-read carrying a stale
+    responseStatus must not overwrite the local decline (while other
+    fields — time, other guests' responses — update normally)."""
+    from app.ledger.ingest.client import _apply_event_to_ledger
+
+    s = Scenario()
+    try:
+        s.given_calendar("main")
+        s.given_calendar("client_a")
+        await s.given_user("alice", main="main", clients=["client_a"])
+        _client_event_with_attendees(s, "client_a", "teamsunc00003")
+        await s.run_reconciler_until_quiescent("alice", max_passes=4)
+
+        db = s._db
+        row = await (await db.execute(
+            "SELECT id FROM ledger_events WHERE source_event_id = 'teamsunc00003'"
+        )).fetchone()
+        await db.execute(
+            "UPDATE ledger_events SET user_rsvp_status = 'declined', "
+            "origin_writeback_pending = 1 WHERE id = ?", (row["id"],))
+        await db.commit()
+
+        # Source re-read: organizer moved the meeting; alice's entry on the
+        # source is stale needsAction; bob newly declined.
+        changed = await _apply_event_to_ledger(
+            db,
+            ledger_event_id=int(row["id"]),
+            event={
+                "id": "teamsunc00003",
+                "etag": "e-new",
+                "updated": "2026-02-01T12:00:00Z",
+                "summary": "Team sync",
+                "status": "confirmed",
+                "start": {"dateTime": "2026-02-02T11:00:00Z", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-02-02T11:30:00Z", "timeZone": "UTC"},
+                "organizer": {"email": "alice@example.com"},
+                "attendees": [
+                    {"email": "alice@example.com", "self": True,
+                     "responseStatus": "needsAction"},
+                    {"email": "bob@example.com", "responseStatus": "declined"},
+                ],
+            },
+            user_email="alice@example.com",
+        )
+        assert changed is True
+
+        after = await (await db.execute(
+            "SELECT user_rsvp_status, start_at, attendees_json "
+            "FROM ledger_events WHERE id = ?", (row["id"],))).fetchone()
+        # Intent preserved...
+        assert after["user_rsvp_status"] == "declined"
+        # ...content still mirrors the source...
+        assert after["start_at"].startswith("2026-02-02T11:00")
+        # ...and the fresher attendee array (bob's new decline) was taken.
+        assert '"declined"' in (after["attendees_json"] or "")
+    finally:
+        await s.close()

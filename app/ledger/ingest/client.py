@@ -712,6 +712,13 @@ async def _ingest_instance(
         )
         return "created", int(cursor.lastrowid)
 
+    # Same intent-preservation rule as _apply_event_to_ledger: an
+    # undelivered instance-level RSVP (origin_writeback_pending) must
+    # survive a source re-read — this is THE "decline one occurrence"
+    # path the writeback exists for.
+    if bool(existing["origin_writeback_pending"]):
+        fields = dict(fields)
+        fields["user_rsvp_status"] = existing["user_rsvp_status"]
     new_hash = _content_hash(fields)
     old_hash = _content_hash_from_row(existing)
     conf_json, conf_pending, conf_changed = _resolve_conference(existing, fields)
@@ -869,6 +876,21 @@ async def _apply_event_to_ledger(
         "SELECT * FROM ledger_events WHERE id = ?",
         (ledger_event_id,),
     )).fetchone()
+    # A pending origin writeback is USER INTENT (an RSVP made on main
+    # that has not yet been delivered to the source).  Mirror-of-source
+    # must not overwrite intent: taking the source's stale
+    # responseStatus here erased the decline end-to-end — this UPDATE
+    # reverted the column, the pending patch was then superseded at
+    # enqueue by one rendered from the reverted row, and nothing ever
+    # re-derived the RSVP (reproduced; also observed wedged in
+    # production).  The source's attendees_json is still accepted (it
+    # carries OTHER guests' fresher responses); the render-time
+    # _rsvp_attendees override reasserts the user's own entry from
+    # user_rsvp_status.  The outbox clears the flag after delivery,
+    # after which the next ingest syncs the confirmed value normally.
+    if bool(existing["origin_writeback_pending"]):
+        fields = dict(fields)
+        fields["user_rsvp_status"] = existing["user_rsvp_status"]
     when = datetime.now(UTC).isoformat()
 
     if skip_if_older and _read_is_stale(event, existing):
