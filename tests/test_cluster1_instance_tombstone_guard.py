@@ -241,3 +241,85 @@ async def test_400_when_confirming_get_fails_does_not_retire(test_db):
     proj = await _proj(db, proj_id)
     assert proj["desired_state"] == "present_full"
     assert proj["google_event_id"] is not None
+
+
+@pytest.mark.asyncio
+async def test_retire_is_durable_across_parent_replans(test_db):
+    """The retire must survive the next replan of the instance row.
+
+    Regression: the retire converged only the PROJECTION while the
+    instance ledger row stayed 'active', so the next parent edit
+    replanned the child back to desired=present and the whole
+    UPDATE(400) -> confirming GET -> retire round repeated — per target
+    calendar, on every parent change, forever (observed daily in
+    production logs).  The retire now cancels the ledger row itself, so
+    the planner forces ABSENT on every future replan.
+    """
+    from app.ledger.planner import plan_for_ledger_event
+
+    db = test_db
+    op, proj_id, user_id = await _seed(
+        db, parent_canonical_uid="client:6:base_R20260519T150000")
+    g = _FakeGoogle({"id": "x", "status": "cancelled", "recurringEventId": None})
+
+    result = await _do_update(
+        db, g, op, "cal-google-id", {"summary": "X", "status": "confirmed"},
+        now=datetime.now(UTC),
+    )
+    assert result == "superseded"
+
+    proj = await _proj(db, proj_id)
+    le = await (await db.execute(
+        "SELECT status, cancelled_at, version FROM ledger_events WHERE id=?",
+        (proj["ledger_event_id"],),
+    )).fetchone()
+    assert le["status"] == "cancelled"
+    assert le["cancelled_at"] is not None
+
+    # The row is queued so sibling projections replan to absent too.
+    affected = await (await db.execute(
+        "SELECT ledger_event_id FROM affected_ledger_events WHERE user_id=?",
+        (user_id,),
+    )).fetchall()
+    assert int(proj["ledger_event_id"]) in {int(r["ledger_event_id"]) for r in affected}
+
+    # THE regression: replanning the row (what a parent edit triggers via
+    # _replan_instance_children) must NOT resurrect desired=present.
+    await plan_for_ledger_event(db, ledger_event_id=int(proj["ledger_event_id"]))
+    proj = await _proj(db, proj_id)
+    assert proj["desired_state"] == "absent"
+    # And it stays quiescent — no diverged work, no new op next pass.
+    diverged = await _diverged_projections(db, user_id=user_id)
+    assert proj_id not in {int(r["id"]) for r in diverged}
+
+
+@pytest.mark.asyncio
+async def test_retire_leaves_already_cancelled_row_alone(test_db):
+    """A retire on a row that is already cancelled must not bump its
+    version or re-queue it (idempotent across repeated 400 rounds)."""
+    db = test_db
+    op, proj_id, user_id = await _seed(
+        db, parent_canonical_uid="client:6:base_R20260519T150000")
+    proj = await _proj(db, proj_id)
+    await db.execute(
+        "UPDATE ledger_events SET status='cancelled', version=7 WHERE id=?",
+        (proj["ledger_event_id"],),
+    )
+    await db.commit()
+    g = _FakeGoogle({"id": "x", "status": "cancelled", "recurringEventId": None})
+
+    result = await _do_update(
+        db, g, op, "cal-google-id", {"summary": "X", "status": "confirmed"},
+        now=datetime.now(UTC),
+    )
+    assert result == "superseded"
+    le = await (await db.execute(
+        "SELECT version FROM ledger_events WHERE id=?",
+        (proj["ledger_event_id"],),
+    )).fetchone()
+    assert le["version"] == 7  # untouched
+    affected = await (await db.execute(
+        "SELECT COUNT(*) n FROM affected_ledger_events WHERE user_id=?",
+        (user_id,),
+    )).fetchone()
+    assert affected["n"] == 0

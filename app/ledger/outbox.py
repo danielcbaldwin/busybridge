@@ -695,7 +695,8 @@ async def _retire_orphaned_instance_tombstone(
         return False
     # Only an instance projection can hit the _R-split id-drift tombstone.
     row = await (await db.execute(
-        """SELECT e.parent_canonical_uid
+        """SELECT e.id AS ledger_event_id, e.user_id, e.status,
+                  e.parent_canonical_uid
              FROM ledger_projections p
              JOIN ledger_events e ON e.id = p.ledger_event_id
             WHERE p.id = ?""",
@@ -726,6 +727,38 @@ async def _retire_orphaned_instance_tombstone(
             WHERE id = ?""",
         (now.isoformat(), int(proj["id"])),
     )
+    # Persist the verdict on the LEDGER ROW too, not just this projection.
+    # The tombstone GET is positive proof the bounded master no longer
+    # generates this occurrence, so the instance row's true state is
+    # cancelled.  Leaving it 'active' re-armed the loop this function
+    # exists to stop: the next parent replan overwrote desired_state back
+    # to present (planner._upsert_projection), the diff re-derived the id,
+    # and every parent edit cost UPDATE(400) + confirming GET + retire —
+    # per target calendar, forever (observed daily in production).  With
+    # the row cancelled the planner forces ABSENT for every target on all
+    # future replans.  Safety: if the source ever re-delivers this
+    # occurrence live under the same parent, client ingest's
+    # modified-instance path resurrects status='active' and the mirror
+    # returns — a wrong retire self-heals.
+    if row["status"] == "active":
+        await db.execute(
+            """UPDATE ledger_events
+                  SET status = 'cancelled',
+                      cancelled_at = ?,
+                      updated_at = ?,
+                      version = version + 1
+                WHERE id = ? AND status = 'active'""",
+            (now.isoformat(), now.isoformat(), int(row["ledger_event_id"])),
+        )
+        # Queue the row for replan so the SIBLING projections (other
+        # target calendars churning on the same orphaned occurrence)
+        # converge to absent on the next pass instead of each burning
+        # their own 400+GET+retire round.
+        await db.execute(
+            """INSERT INTO affected_ledger_events
+                  (user_id, ledger_event_id) VALUES (?, ?)""",
+            (int(row["user_id"]), int(row["ledger_event_id"])),
+        )
     await db.commit()
     await _mark_superseded(
         db, op,

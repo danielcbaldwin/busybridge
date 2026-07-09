@@ -355,7 +355,7 @@ async def _ingest_one_event(
     # re-assert our canonical payload (revert-on-drift, now uniform
     # on client targets too).
     proj_match = await (await db.execute(
-        """SELECT id, google_etag FROM ledger_projections
+        """SELECT id, google_etag, desired_state FROM ledger_projections
             WHERE google_event_id = ?
             LIMIT 1""",
         (event_id,),
@@ -464,6 +464,15 @@ async def _maybe_revert_client_drift(
     ``events.update`` that 404s and poison-pills.
     """
     if event.get("status") == "cancelled":
+        # Our OWN deletion echoes back as exactly this tombstone: when
+        # the projection's desired state is already absent (a cancelled
+        # occurrence's busy block, a retired copy), the cancelled event
+        # is the expected result of our delete, not user tampering.
+        # Resetting it would re-arm a redundant delete every time the
+        # tombstone is re-listed (self-write echo).  Only a block we
+        # WANT present gets the re-create reset.
+        if proj_match["desired_state"] == "absent":
+            return
         await db.execute(
             """UPDATE ledger_projections
                   SET current_state = 'absent',

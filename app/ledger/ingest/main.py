@@ -819,6 +819,30 @@ async def _maybe_apply_main_edit_back(
             when, ledger_event_id,
         ),
     )
+    # The main copy now differs from its canonical render (whether the
+    # edit is being propagated, partially propagated, or reverted), so
+    # it must be re-delivered.  Signal that EXPLICITLY by un-converging
+    # the main projection: the planner skips content-identical replans,
+    # so on the revert path (nothing applied → ledger content unchanged
+    # → hash unchanged) the version bump above alone would never
+    # diverge the row and the drifted copy would stay wrong forever.
+    # When the edit is being PROPAGATED the origin-writeback projection
+    # is un-converged too, so the diff re-evaluates it while the
+    # pending flag is armed — either patching the source or, when the
+    # rendered writeback is hash-identical (the edit netted out),
+    # taking the converged no-op path that clears the flag.
+    await db.execute(
+        """UPDATE ledger_projections
+              SET applied_ledger_version = NULL,
+                  updated_at = ?
+            WHERE ledger_event_id = ?
+              AND (target_kind = 'main'
+                   OR (? AND target_kind = 'client'
+                       AND target_calendar_id =
+                           (SELECT source_calendar_id FROM ledger_events
+                             WHERE id = ?)))""",
+        (when, ledger_event_id, propagating, ledger_event_id),
+    )
     if propagating:
         return "main_edit_propagated"
     return "main_drift_reverted"
@@ -931,6 +955,21 @@ async def _mark_main_drift_reverted(
               SET version = version + 1,
                   updated_at = ?
             WHERE id = ?""",
+        (when, ledger_event_id),
+    )
+    # Re-assertion is signalled EXPLICITLY by un-converging the main
+    # projection (mirroring client ingest's drift revert), not by the
+    # version bump above: the planner deliberately skips replans whose
+    # desired state/hash are unchanged, so a bare bump would no longer
+    # diverge the row and the drifted copy would never be re-delivered.
+    # Keeping google_event_id: a MOVED copy heals via events.update; a
+    # DELETED copy's update 404s and the outbox 404 handler clears the
+    # id and replans into a re-create.
+    await db.execute(
+        """UPDATE ledger_projections
+              SET applied_ledger_version = NULL,
+                  updated_at = ?
+            WHERE ledger_event_id = ? AND target_kind = 'main'""",
         (when, ledger_event_id),
     )
 

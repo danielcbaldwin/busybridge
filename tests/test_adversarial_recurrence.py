@@ -208,20 +208,12 @@ async def _two_client_alice(s: Scenario):
 # FINDING-1 — the key churn detector.  A reconcile pass with NO source
 # change must enqueue 0 ops; after an instance cancellation it does not.
 # ---------------------------------------------------------------------------
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "FINDING-1: self-write echo churn — the reconcile after an "
-        "instance cancellation converged enqueues 2 redundant delete ops "
-        "(one per target) repeating deletes that already landed, because "
-        "main ingest re-ingests BusyBridge's own tombstone "
-        "(app/ledger/ingest/main.py:582-598), the planner bumps "
-        "desired_ledger_version on a no-change replan "
-        "(app/ledger/planner.py:476-490), and the diff enqueues on bare "
-        "version mismatch (app/ledger/diff.py:277-282).  Bounded: counts "
-        "settle as [2, 0, 0, ...]."
-    ),
-)
+# FINDING-1 is FIXED and this is now a hard regression test: the planner
+# skips content-identical replans (both _upsert_projection and
+# _mark_implicit_absent), deliberate re-assertion signals explicitly by
+# nulling applied_* stamps, and client ingest no longer resets a
+# converged-absent projection when our own deletion tombstone echoes
+# back.  A reconcile pass with no source change enqueues exactly 0 ops.
 async def test_finding1_second_reconcile_after_instance_cancel_not_zero_ops():
     async with scenario() as s:
         await _two_client_alice(s)

@@ -450,7 +450,7 @@ async def _upsert_projection(
 
     existing = await (await db.execute(
         """SELECT id, applied_ledger_version, desired_ledger_version,
-                  desired_payload_hash
+                  desired_payload_hash, desired_state
              FROM ledger_projections
             WHERE ledger_event_id = ?
               AND target_kind = ?
@@ -473,10 +473,37 @@ async def _upsert_projection(
             ),
         )
     else:
-        # Bump desired_ledger_version regardless of whether the hash
-        # changed; that way the diff step can see "ledger has moved
-        # past what's applied" and re-evaluate.
-        #
+        # Content-identical replan → leave the row untouched.  Bumping
+        # desired_ledger_version when neither the state nor the hash
+        # changed created version-only divergence: the diff re-selected
+        # the row and enqueued a byte-identical op on the pass after
+        # every replan (the "self-write echo" — one redundant Google
+        # write per target per instance-level change, and the revive
+        # half of the retire/revive loop).  Deliberate re-assertion
+        # does not rely on this bump: every revert/heal path signals
+        # explicitly by nulling the projection's applied_* stamps
+        # (client ingest's drift revert, main ingest's
+        # _mark_main_drift_reverted, the outbox 404 handler), which
+        # diverges the row regardless of versions.
+        # Exception: the ORIGIN-WRITEBACK projection of a row whose
+        # pending flag is armed must always get a diff visit — the diff
+        # either fires the patch or, when the rendered writeback is
+        # hash-identical (the main edit netted out), takes the converged
+        # no-op path that DISARMS the flag.  Skipping it would leave the
+        # flag set forever, arming a stale writeback against the next
+        # genuine source-side change.
+        is_armed_origin = (
+            bool(ledger_row["origin_writeback_pending"])
+            and target_kind == "client"
+            and ledger_row["source_calendar_id"] is not None
+            and target_calendar_id == int(ledger_row["source_calendar_id"])
+        )
+        if (
+            existing["desired_state"] == desired_state
+            and existing["desired_payload_hash"] == desired_hash
+            and not is_armed_origin
+        ):
+            return
         # A genuine desired change (hash differs) also un-sticks a
         # poison-pilled projection: the failed payload is now moot, so
         # clear permanently_failed and let the diff retry.  Without
@@ -510,7 +537,8 @@ async def _mark_implicit_absent(
     ledger_version: int,
 ) -> None:
     rows = await (await db.execute(
-        """SELECT id, target_kind, target_calendar_id
+        """SELECT id, target_kind, target_calendar_id,
+                  desired_state, desired_payload_hash, permanently_failed
              FROM ledger_projections
             WHERE ledger_event_id = ?""",
         (ledger_event_id,),
@@ -519,6 +547,22 @@ async def _mark_implicit_absent(
     for row in rows:
         key = (row["target_kind"], row["target_calendar_id"])
         if key in keep:
+            continue
+        # Already absent-desired and not stuck → leave the row untouched,
+        # mirroring _upsert_projection's content-identical skip.  Bumping
+        # desired_ledger_version here re-diverged every converged-absent
+        # instance projection each time its (cancelled) ledger row was
+        # re-touched — e.g. main ingest consuming BusyBridge's own
+        # tombstone — enqueueing a redundant delete per target (the
+        # self-write echo).  A permanently_failed row still gets the
+        # update: clearing the flag + bumping is what lets a poisoned
+        # absent-desired delete retry (its hash can never change, so no
+        # other path would ever un-stick it).
+        if (
+            row["desired_state"] == ABSENT
+            and row["desired_payload_hash"] == "absent"
+            and not row["permanently_failed"]
+        ):
             continue
         await db.execute(
             """UPDATE ledger_projections
