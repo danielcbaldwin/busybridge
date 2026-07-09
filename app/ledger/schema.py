@@ -259,6 +259,15 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
         "ALTER TABLE outbox_operations ADD COLUMN desired_payload_hash TEXT",
         "ALTER TABLE ledger_projections "
         "ADD COLUMN google_id_generation INTEGER NOT NULL DEFAULT 0",
+        # Episode base for the id-generation ceiling: the ceiling
+        # compares (generation - floor), and a successful create sets
+        # floor = generation.  Routine absent->present toggles each burn
+        # one generation by design (delete leaves a tombstone at the old
+        # id), so a LIFETIME cap falsely bricked long-lived recurring
+        # events; the pathology the ceiling exists for is 50 burned ids
+        # within a single convergence episode.
+        "ALTER TABLE ledger_projections "
+        "ADD COLUMN google_id_generation_floor INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE ledger_events ADD COLUMN start_timezone TEXT",
         "ALTER TABLE ledger_events ADD COLUMN end_timezone TEXT",
         "ALTER TABLE ledger_events "

@@ -467,11 +467,19 @@ async def _do_create(
         raise ValueError(f"create op {op['id']} has no payload")
     proj = await _get_projection(db, op["projection_id"])
     generation = int(proj["google_id_generation"] or 0)
+    # The ceiling is PER EPISODE: (generation - floor), where a
+    # successful create advances the floor.  Routine absent->present
+    # toggles burn one generation each by design (our own delete leaves
+    # a cancelled tombstone at the old id, so the recreate collides once
+    # and bumps) — a lifetime cap therefore falsely bricked long-lived
+    # flapping events (observed at generation 3000+ in production, with
+    # the admin retry insta-failing on the entry check below).
+    floor = int(proj["google_id_generation_floor"] or 0)
     body = dict(payload)
 
-    # Absolute ceiling: a resumed op whose persisted generation already
-    # reached the cap stops here rather than burning more ids.
-    if generation >= _MAX_TOTAL_ID_GENERATIONS:
+    # Ceiling: a resumed op whose persisted generation already burned a
+    # whole episode's worth of ids stops here rather than burning more.
+    if generation - floor >= _MAX_TOTAL_ID_GENERATIONS:
         await _give_up_burned_ids(db, op, generation=generation, now=now)
         return "failed_permanent"
 
@@ -505,7 +513,7 @@ async def _do_create(
                 # have hit the absolute ceiling, in which case give up and
                 # alert instead of burning ids forever.
                 generation += 1
-                if generation >= _MAX_TOTAL_ID_GENERATIONS:
+                if generation - floor >= _MAX_TOTAL_ID_GENERATIONS:
                     await _give_up_burned_ids(
                         db, op, generation=generation, now=now,
                     )
@@ -538,6 +546,17 @@ async def _do_create(
                     await _request_projection_replan(db, op["projection_id"])
                     return "superseded"
                 raise
+        # A converged create ends the ceiling episode: advance the floor
+        # to the generation that actually landed, so the NEXT episode
+        # (the next delete/recreate toggle) gets its own full budget
+        # instead of inheriting this one's burn count.
+        await db.execute(
+            """UPDATE ledger_projections
+                  SET google_id_generation = ?,
+                      google_id_generation_floor = ?
+                WHERE id = ?""",
+            (generation, generation, int(op["projection_id"])),
+        )
         await _record_success(
             db, op,
             google_event_id=result["id"],
@@ -1155,6 +1174,14 @@ async def _give_up_burned_ids(
     a real event that cannot be mirrored needs operator attention, not an
     unbounded id-burning loop.
     """
+    # Alert once per failure episode: a flapping event whose planner
+    # hash change clears permanently_failed and immediately re-fails
+    # would otherwise email the operator on every flap.
+    prior = await (await db.execute(
+        "SELECT permanently_failed FROM ledger_projections WHERE id = ?",
+        (int(op["projection_id"]),),
+    )).fetchone()
+    already_failed = bool(prior and prior["permanently_failed"])
     await db.execute(
         "UPDATE ledger_projections SET google_id_generation = ? WHERE id = ?",
         (int(generation), int(op["projection_id"])),
@@ -1166,6 +1193,8 @@ async def _give_up_burned_ids(
     )
     logger.error(error)
     await _mark_permanent_failure(db, op, error=error, http_status=None, now=now)
+    if already_failed:
+        return  # same episode, operator already alerted
     try:  # alerting must never break the drain
         from app.alerts.email import queue_alert
         await queue_alert(

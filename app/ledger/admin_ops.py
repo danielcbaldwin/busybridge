@@ -468,6 +468,13 @@ async def retry_permanent_failures(
                    attempts = 0,
                    next_attempt_at = NULL,
                    last_error = NULL,
+                   -- Reset the id-generation ceiling episode too: a
+                   -- give-up marked this projection failed BECAUSE
+                   -- (generation - floor) hit the cap, so a retry that
+                   -- left the floor behind would insta-fail on the
+                   -- _do_create entry check and re-alert, making this
+                   -- admin action a no-op loop.
+                   google_id_generation_floor = google_id_generation,
                    updated_at = ?
              WHERE id IN ({placeholders})""",
         [when, *proj_ids],
