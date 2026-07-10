@@ -303,6 +303,30 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
     )
     await db.commit()
 
+    # One-time backfill for the generation-ceiling episode floor.  The
+    # ALTER above defaults google_id_generation_floor to 0, but a
+    # database that predates the floor carries generations accumulated
+    # under the old lifetime-cap semantics (observed at 3000+ in
+    # production from routine absent->present toggles).  Left at
+    # floor=0, every such HEALTHY projection would insta-fail the
+    # per-episode ceiling (generation - floor >= cap) on its next
+    # present toggle — a false permanent failure plus an operator alert
+    # each time.  Start those rows on a fresh episode.  Rows already
+    # marked permanently_failed are deliberately left for the admin
+    # retry action, which resets their floor itself.  Idempotent: after
+    # the backfill (and under the new code, always) an unfailed row's
+    # gap stays below the cap, so the WHERE never matches again.
+    # The literal 50 mirrors outbox._MAX_TOTAL_ID_GENERATIONS (not
+    # imported here: schema must stay import-light and the value is
+    # frozen into upgraded databases at migration time anyway).
+    await db.execute(
+        """UPDATE ledger_projections
+              SET google_id_generation_floor = google_id_generation
+            WHERE google_id_generation - google_id_generation_floor >= 50
+              AND permanently_failed = 0"""
+    )
+    await db.commit()
+
     # One-time repair: origin writebacks only ever target CLIENT
     # sources (personal calendars are read-only; the planner never
     # creates a writeback projection for them), but an earlier main-
