@@ -46,6 +46,7 @@ from app.ledger.recurrence import (
 )
 from app.ledger.payload import (
     render_payload,
+    strip_copy_summary_prefixes,
     strip_full_copy_metadata,
 )
 from app.ledger.ingest.client import (
@@ -506,7 +507,11 @@ async def _ingest_managed_recurring_instance(
         """SELECT e.id AS ledger_event_id, e.canonical_uid,
                   e.source_type, e.source_calendar_id, e.source_event_id,
                   e.is_recurring, e.parent_canonical_uid,
-                  e.user_can_edit, e.organizer_email, e.attendees_json
+                  e.user_can_edit, e.organizer_email, e.attendees_json,
+                  e.user_rsvp_status, e.summary, e.description, e.location,
+                  e.start_at, e.end_at, e.start_timezone, e.end_timezone,
+                  e.is_all_day, e.show_as, e.visibility, e.color_id,
+                  e.conference_data_json, e.source_html_link
              FROM ledger_projections p
              JOIN ledger_events e ON e.id = p.ledger_event_id
             WHERE p.google_event_id = ?
@@ -598,17 +603,124 @@ async def _ingest_managed_recurring_instance(
     # Move / edit.  The dragged copy is opaque about edit-rights: its
     # rendered shape carries neither the real organizer nor
     # guestsCanModify.  Take edit-rights / organizer / attendees from
-    # the SOURCE series; take the moved time and (for full copies) the
-    # detail from the event.
+    # the SOURCE series, and mirror _maybe_apply_main_edit_back's
+    # per-category policy EXACTLY:
+    #
+    #   * RSVP   — the user's own attendee response; always writable
+    #              back to a client source, editable or not.
+    #   * time   — written back only for an editable client source.
+    #   * detail — likewise (summary/description/location).
+    #
+    # A disallowed category is NOT stored: the instance row keeps the
+    # canonical (source) value for it, and the main projection is
+    # explicitly un-converged so the diff re-delivers the canonical
+    # occurrence and reverts the drift on main — the parent path's
+    # revert semantics.  (Pre-fix this path stored the RENDERED copy's
+    # fields with no gating: declining one occurrence of a locked
+    # meeting wrote the lock-emoji title into the REAL source event —
+    # and the main copy then rendered a double lock — while dragging
+    # one occurrence of a locked meeting MOVED the real source meeting.)
+    original_start, instance_is_all_day = _instance_original_start(event)
+    inst_canonical = canonical_uid_for_instance(
+        parent["canonical_uid"], original_start,
+    )
+    existing = await (await db.execute(
+        """SELECT * FROM ledger_events
+            WHERE user_id = ? AND canonical_uid = ?""",
+        (user_id, inst_canonical),
+    )).fetchone()
+
+    # Baseline = what this occurrence canonically looks like: the
+    # already-ingested instance row when one exists, else the parent
+    # series' values at the occurrence's own slot.
+    if existing is not None:
+        base = existing
+        base_start, base_end = existing["start_at"], existing["end_at"]
+        base_all_day = bool(existing["is_all_day"])
+    else:
+        base = parent
+        base_start, base_end = _occurrence_slot(
+            parent, original_start, instance_is_all_day,
+        )
+        base_all_day = instance_is_all_day
+
+    # Classify the edit against the baseline.  The copy's summary /
+    # description carry rendered artifacts (lock prefix, guest-list
+    # footer, managed tag) — strip them before comparing or storing,
+    # so they can never leak into the ledger or back onto the source.
+    new_rsvp = _extract_self_rsvp(event, user_email, owned_emails=owned_emails)
+    new_start, new_end, new_start_tz, new_end_tz, new_all_day = (
+        _extract_start_end(event)
+    )
+    new_is_all_day = bool(new_all_day)
+    new_summary = strip_copy_summary_prefixes(event.get("summary"))
+    new_description = strip_full_copy_metadata(event.get("description"))
+    new_location = event.get("location")
+
+    rsvp_changed = (
+        new_rsvp is not None and new_rsvp != base["user_rsvp_status"]
+    )
+    time_changed = (
+        new_start is not None
+        and (
+            _canonical_instant(new_start, new_is_all_day)
+            != _canonical_instant(base_start, base_all_day)
+            or _canonical_instant(new_end, new_is_all_day)
+            != _canonical_instant(base_end, base_all_day)
+        )
+    )
+    detail_changed = (
+        (new_summary or "") != (base["summary"] or "")
+        or (new_description or "") != (base["description"] or "")
+        or (new_location or "") != (base["location"] or "")
+    )
+    if not (rsvp_changed or time_changed or detail_changed):
+        # Nothing material — our own rendered copy read back.
+        return "our_writes_skipped", None
+
+    # Same gates as the parent path: RSVP for any client source;
+    # time/detail only when the user can edit the source event.
+    # Personal and webcal sources are read-only — nothing propagates,
+    # and origin_writeback_pending must NEVER be armed for them.
+    source_is_client = parent["source_type"] == "client"
+    user_can_edit = bool(parent["user_can_edit"])
+    apply_rsvp = rsvp_changed and source_is_client
+    apply_time = time_changed and user_can_edit and source_is_client
+    apply_detail = detail_changed and user_can_edit and source_is_client
+    propagating = apply_rsvp or apply_time or apply_detail
+
     fields = _extract_event_fields(
         event, user_email=user_email, owned_emails=owned_emails,
     )
-    fields["user_can_edit"] = bool(parent["user_can_edit"])
+    fields["user_can_edit"] = user_can_edit
     fields["organizer_email"] = parent["organizer_email"]
     fields["attendees_json"] = parent["attendees_json"]
-    # The dragged copy carries our description tag + footer; strip both
-    # so the instance row (and any write-back to the source) stays clean.
-    fields["description"] = strip_full_copy_metadata(fields["description"])
+    fields["user_rsvp_status"] = (
+        new_rsvp if apply_rsvp else base["user_rsvp_status"]
+    )
+    if apply_detail:
+        fields["summary"] = new_summary
+        fields["description"] = new_description
+        fields["location"] = new_location
+    else:
+        fields["summary"] = base["summary"]
+        fields["description"] = base["description"]
+        fields["location"] = base["location"]
+    if not apply_time:
+        fields["start_at"] = base_start
+        fields["end_at"] = base_end
+        fields["start_timezone"] = base["start_timezone"]
+        fields["end_timezone"] = base["end_timezone"]
+        fields["is_all_day"] = base_all_day
+    # Cosmetic fields the rendered copy cannot speak for — take them
+    # from the source row so a later source-side ingest of the same
+    # occurrence hashes identically (no churn), and so the main copy's
+    # own htmlLink never overwrites the source's.
+    for col in (
+        "show_as", "visibility", "color_id",
+        "conference_data_json", "source_html_link",
+    ):
+        fields[col] = base[col]
 
     outcome, ledger_id = await _ingest_instance(
         db,
@@ -623,15 +735,33 @@ async def _ingest_managed_recurring_instance(
         fields=fields,
     )
 
+    # Disallowed drift on an EXISTING row stores values identical to
+    # the baseline — a content-identical replan the planner now skips
+    # (self-write-echo fix) — so the dragged copy on main would never
+    # be re-delivered.  Signal the revert explicitly, exactly like the
+    # parent path's disallowed-edit handling.  A NEW row needs no
+    # signal: its projections are freshly created (NULL applied hash)
+    # and diverge on their own.
+    unpropagated_drift = (
+        (time_changed and not apply_time)
+        or (detail_changed and not apply_detail)
+        or (rsvp_changed and not apply_rsvp)
+    )
+    if unpropagated_drift and existing is not None:
+        await _mark_main_drift_reverted(db, int(existing["id"]))
+
     # The change was made on main; the source event does not have it.
     # Flag the row so the origin-writeback patch fires even though the
     # instance's writeback projection is brand new (NULL applied hash).
     # Only on a real create/update — a no-op re-ingest must not re-arm
-    # a writeback that already drained.
+    # a writeback that already drained — and only when a category is
+    # actually being propagated (``propagating`` is only ever true for
+    # a CLIENT source: personal/webcal rows must never carry the flag,
+    # because no writeback ever fires for them to clear it).
     if (
         ledger_id is not None
         and outcome in ("created", "updated")
-        and parent["source_type"] == "client"
+        and propagating
     ):
         await db.execute(
             "UPDATE ledger_events SET origin_writeback_pending = 1 "
@@ -890,6 +1020,31 @@ def _extract_start_end(
             start.get("timeZone"), end.get("timeZone"), False,
         )
     return None, None, None, None, None
+
+
+def _occurrence_slot(
+    parent, original_start: str, is_all_day: bool,
+) -> tuple[str, str]:
+    """The canonical ``(start_at, end_at)`` of one un-modified
+    occurrence of ``parent``: the occurrence's original start plus the
+    series' own duration.  Used as the revert baseline when a main-side
+    instance edit's time category is not allowed to propagate.
+    Falls back to ``original_start`` for both ends when the parent's
+    stored times are unparsable (change detection still works — any
+    moved time differs from the slot)."""
+    start_dt = parse_instant(original_start, is_all_day=is_all_day)
+    parent_all_day = bool(parent["is_all_day"])
+    p_start = parse_instant(parent["start_at"], is_all_day=parent_all_day)
+    p_end = parse_instant(parent["end_at"], is_all_day=parent_all_day)
+    if start_dt is None or p_start is None or p_end is None:
+        return original_start, original_start
+    end_dt = start_dt + (p_end - p_start)
+    if is_all_day:
+        return original_start[:10], end_dt.date().isoformat()
+    return (
+        original_start,
+        end_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
 
 
 async def _mark_user_intentionally_deleted(

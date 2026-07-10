@@ -267,7 +267,21 @@ def _render_origin_writeback(row: dict) -> dict:
     both no-ops a field that was never set and propagates a genuine
     clear.
     """
-    body: dict[str, Any] = {
+    # A non-editable source event (the user is a plain attendee) may
+    # only receive the user's own RSVP: patching start/end or detail
+    # onto a meeting the user cannot edit either 403s or — worse, for
+    # calendars that accept it — rewrites the organizer's real event
+    # for every guest.  The ingest side stores canonical values for
+    # disallowed categories, but this render-time gate is the backstop
+    # that keeps a stale or mis-stored field from ever reaching the
+    # source.
+    if not row.get("user_can_edit"):
+        body: dict[str, Any] = {}
+        if row.get("user_rsvp_status"):
+            body["attendees"] = _rsvp_attendees(row)
+        return body
+
+    body = {
         "start": _start_dict(row),
         "end": _end_dict(row),
     }
@@ -490,6 +504,36 @@ def strip_full_copy_metadata(description: Optional[str]) -> Optional[str]:
         if footer.lstrip().startswith(_FOOTER_MARKERS):
             return desc[:idx] or None
     return desc
+
+
+def strip_copy_summary_prefixes(summary: Optional[str]) -> Optional[str]:
+    """Recover the source event's own title from a full copy on main by
+    removing the decorations the renderer prepends: the lock emoji
+    (``LOCK_PREFIX``, for a non-editable event) and — defensively — a
+    leading managed prefix.
+
+    Companion to :func:`strip_full_copy_metadata`, applied wherever a
+    managed copy's summary is read back into the ledger (the
+    managed-instance re-ingest path), so a rendered artifact can never
+    be stored as source truth or written back onto the user's real
+    source event.  (Production incident: declining ONE occurrence of a
+    locked recurring meeting stamped "🔒 " into the real source title,
+    and the main copy then rendered a double lock.)
+    """
+    if not summary:
+        return summary
+    out = summary
+    tag = managed_tag()
+    changed = True
+    while changed:
+        changed = False
+        if out.startswith(LOCK_PREFIX):
+            out = out[len(LOCK_PREFIX):]
+            changed = True
+        if tag and out.startswith(tag):
+            out = out[len(tag):].lstrip()
+            changed = True
+    return out
 
 
 def _tag_description(description: Optional[str]) -> Optional[str]:
