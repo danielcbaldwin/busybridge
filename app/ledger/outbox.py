@@ -43,6 +43,7 @@ from typing import Any, Optional
 
 import aiosqlite
 
+from app.config import get_settings
 from app.ledger.async_google import as_async_google
 from app.ledger.google_client import GoogleClient
 from app.ledger.identity import derive_google_event_id
@@ -912,6 +913,14 @@ async def _do_patch(
     are sent), so no other field of the source event is clobbered.
     A 404/410 (source event gone) is treated as success — there is
     nothing left to write back.
+
+    Notifications: this is the ONE write that may notify.  When the
+    ``writeback_notifications`` setting is on, the patch carries
+    ``sendUpdates='all'`` so the organizer receives Google's standard
+    accepted/declined email (and guests are notified of time/detail
+    changes on editable events) — exactly as if the user had responded
+    on the client calendar directly.  Every other outbox write targets
+    our own managed copies and stays silent unconditionally.
     """
     if payload is None:
         raise ValueError(f"patch op {op['id']} has no payload")
@@ -928,8 +937,18 @@ async def _do_patch(
     if led is None or not led["source_event_id"]:
         await _record_origin_writeback_applied(db, op, now=now)
         return "succeeded"
+    # Read the setting at EXECUTION time, not enqueue time: flipping
+    # it takes effect for already-queued writebacks on the next drain.
+    # A retried patch re-sends the notification — acceptable and
+    # bounded (the retry schedule is backed off, and a duplicate
+    # organizer email is far better than a silently-dropped RSVP), so
+    # no dedup machinery here.
+    send_updates = "all" if get_settings().writeback_notifications else None
     try:
-        await google.patch_event(cal_id, led["source_event_id"], payload)
+        await google.patch_event(
+            cal_id, led["source_event_id"], payload,
+            send_updates=send_updates,
+        )
     except Exception as e:
         if getattr(e, "status", None) in (404, 410):
             await _record_origin_writeback_applied(db, op, now=now)

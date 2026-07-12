@@ -366,6 +366,15 @@ class FakeGoogleCalendar:
         # this to a small number to force multi-page pagination without
         # having to create thousands of instances.
         self.instances_page_size: Optional[int] = None
+        # Test introspection: one entry per successful write —
+        # ``(operation, event_id, send_updates)`` — recording the
+        # ``sendUpdates`` disposition each call carried.  Only
+        # ``patch_event`` accepts a ``send_updates`` argument (mirroring
+        # the ledger's GoogleClient protocol); insert/update/delete have
+        # no such parameter and always log ``None`` (silent), so a test
+        # can assert exactly which writes would have triggered Google's
+        # standard attendee/organizer notification email.
+        self.send_updates_log: list[tuple[str, str, Optional[str]]] = []
 
     def _check_failures(self, operation: str, *, has_sync_token: bool = False) -> None:
         """Roll the failure injector for a pre-operation failure.
@@ -496,6 +505,9 @@ class FakeGoogleCalendar:
             conference_data=copy.deepcopy(body.get("conferenceData")),
         )
         cal.events[event_id] = ev
+        # insert_event has no send_updates parameter (the client layer
+        # keeps managed-copy creates silent unconditionally) — log None.
+        self.send_updates_log.append(("insert", event_id, None))
         self._check_post_write("insert")
         return ev.to_api_dict()
 
@@ -599,6 +611,8 @@ class FakeGoogleCalendar:
         ev.sequence += 1
         ev.etag = _new_etag()
         ev.change_seq = cal.change_counter
+        # update_event has no send_updates parameter (always silent).
+        self.send_updates_log.append(("update", event_id, None))
         self._check_post_write("update")
         return ev.to_api_dict()
 
@@ -608,11 +622,19 @@ class FakeGoogleCalendar:
         event_id: str,
         body: dict,
         if_match: Optional[str] = None,
+        send_updates: Optional[str] = None,
     ) -> dict:
         """Partial update.  Same If-Match semantics as ``update_event``.
 
         Like ``update_event``, this materialises an instance override
         on the fly when called with a derived recurring-instance ID.
+
+        ``send_updates`` mirrors the API's ``sendUpdates`` parameter
+        ('all' | 'externalOnly' | 'none'); it does not change stored
+        state, but each successful patch records ``(event_id,
+        send_updates)`` in :attr:`send_updates_log` so tests can assert
+        exactly which writes would have notified attendees.  ``None``
+        (omitted) is the historical silent default.
         """
         self._check_failures("patch")
         cal = self._require_calendar(calendar_id)
@@ -668,6 +690,9 @@ class FakeGoogleCalendar:
         ev.sequence += 1
         ev.etag = _new_etag()
         ev.change_seq = cal.change_counter
+        # The write has landed — record the notification disposition
+        # (a real post-write crash would still have sent the email).
+        self.send_updates_log.append(("patch", event_id, send_updates))
         self._check_post_write("patch")
         return ev.to_api_dict()
 
@@ -710,6 +735,8 @@ class FakeGoogleCalendar:
         ev.sequence += 1
         ev.etag = _new_etag()
         ev.change_seq = cal.change_counter
+        # delete_event has no send_updates parameter (always silent).
+        self.send_updates_log.append(("delete", event_id, None))
         self._check_post_write("delete")
 
     # ------------------------------------------------------------------

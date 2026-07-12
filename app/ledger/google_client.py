@@ -50,7 +50,18 @@ class GoogleClient(Protocol):
         event_id: str,
         body: dict,
         if_match: Optional[str] = None,
-    ) -> dict: ...
+        send_updates: Optional[str] = None,
+    ) -> dict:
+        """Field-scoped ``events.patch``.
+
+        ``send_updates`` maps to the API's ``sendUpdates`` parameter
+        (``'all'`` | ``'externalOnly'`` | ``'none'``).  ``None`` (the
+        default) keeps the historical silent behaviour.  Only the
+        origin-writeback patch ever passes a non-None value — see the
+        notification policy note in
+        :class:`~app.ledger.real_google_client.RealGoogleClient`.
+        """
+        ...
 
     def delete_event(
         self,

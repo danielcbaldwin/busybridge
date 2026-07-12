@@ -120,6 +120,15 @@ class RealGoogleClient:
     # ------------------------------------------------------------------
     # Events
     # ------------------------------------------------------------------
+    # NOTIFICATION POLICY: creates / updates / deletes of our own
+    # managed copies are silent UNCONDITIONALLY (``sendNotifications=
+    # False`` below) — those events have no real attendees, and
+    # convergence churn (re-renders, id-generation retries, cleanup)
+    # would otherwise spray notification email.  The one deliberate
+    # exception is the origin-writeback ``events.patch`` fired at the
+    # user's REAL source event, which may opt into Google's standard
+    # notifications via ``patch_event(..., send_updates=...)`` (gated
+    # by the ``writeback_notifications`` setting in the outbox).
     def insert_event(self, calendar_id: str, body: dict) -> dict:
         try:
             return self._service.events().insert(
@@ -165,15 +174,27 @@ class RealGoogleClient:
         event_id: str,
         body: dict,
         if_match: Optional[str] = None,
+        send_updates: Optional[str] = None,
     ) -> dict:
+        # ``send_updates`` maps to the current ``sendUpdates`` API
+        # parameter ('all' | 'externalOnly' | 'none').  The legacy
+        # ``sendNotifications`` is deprecated in favour of it, so the
+        # two are never sent on the same call: when the caller opts in
+        # we pass ONLY ``sendUpdates``; when omitted we keep the
+        # historical silent ``sendNotifications=False`` request shape
+        # unchanged.
+        params: dict = {
+            "calendarId": calendar_id,
+            "eventId": event_id,
+            "body": body,
+            "conferenceDataVersion": 1,
+        }
+        if send_updates is not None:
+            params["sendUpdates"] = send_updates
+        else:
+            params["sendNotifications"] = False
         try:
-            request = self._service.events().patch(
-                calendarId=calendar_id,
-                eventId=event_id,
-                body=body,
-                conferenceDataVersion=1,
-                sendNotifications=False,
-            )
+            request = self._service.events().patch(**params)
             _apply_if_match(request, if_match)
             return request.execute()
         except HttpError as e:
