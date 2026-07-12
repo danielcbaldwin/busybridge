@@ -186,18 +186,43 @@ def derive_google_event_id(projection_id: int, generation: int = 0) -> str:
 def derive_instance_google_event_id(
     parent_google_event_id: str,
     original_start_at: str,
-    is_all_day: bool,
+    is_all_day: bool = False,
 ) -> str:
     """Build the Google ID for an exception/instance of a recurring event.
 
     Google's instance ID format is ``<parent>_<stamp>`` where the
-    stamp is ``YYYYMMDD`` for all-day events or
-    ``YYYYMMDDTHHMMSSZ`` for timed events.  Used by the diff step
-    to pre-set ``ledger_projections.google_event_id`` on instance
-    projections so the outbox can ``events.update`` /
-    ``events.delete`` them directly.
+    stamp is ``YYYYMMDD`` for all-day series or ``YYYYMMDDTHHMMSSZ``
+    (UTC) for timed series.  Used by the diff step to pre-set
+    ``ledger_projections.google_event_id`` on instance projections so
+    the outbox can ``events.update`` / ``events.delete`` them
+    directly.
+
+    The stamp form is chosen from the SHAPE of ``original_start_at``
+    itself — a bare ``YYYY-MM-DD`` means the ORIGINAL slot was
+    all-day, anything with a time component means it was timed — and
+    NOT from the caller's row-level ``is_all_day`` flag.  Google keys
+    an instance id to the original occurrence slot, and the id does
+    not change when the user converts that single occurrence between
+    all-day and timed (both are ordinary Google UI/API actions).  The
+    occurrence row's display flag follows the OVERRIDE, so deriving
+    from it produced ``parent_20260310`` where Google actually held
+    ``parent_20260310T130000Z`` (and vice versa): every UPDATE then
+    404'd into a silent replan loop, and every DELETE was a
+    404-treated-as-success that left a phantom busy block behind.
+
+    ``is_all_day`` survives only as a fallback discriminator for an
+    EMPTY ``original_start_at`` (no shape to inspect); it preserves
+    the historical, degenerate-but-deterministic output for that
+    input and is ignored otherwise.
     """
-    if is_all_day:
+    if not original_start_at:
+        # Empty input has no shape to inspect — keep the historical
+        # flag-driven fallback outputs, byte-for-byte.
+        if is_all_day:
+            return f"{parent_google_event_id}_"
+        return f"{parent_google_event_id}_Z"
+    if "T" not in original_start_at:
+        # Bare date: the original slot was all-day.
         stamp = original_start_at.replace("-", "")
         # Defensive: ensure 8 digits.
         stamp = stamp[:8]

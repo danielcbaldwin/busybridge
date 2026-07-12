@@ -4,6 +4,13 @@ Google's per-instance event ID is ``<parent>_<YYYYMMDDTHHMMSSZ>``
 with the timestamp always in UTC.  The source ``originalStartTime``
 can carry any offset, so it must be parsed and converted — not
 string-stripped, which mangles a non-UTC offset into an invalid id.
+
+NOTE: the stamp form (``_YYYYMMDD`` vs ``_YYYYMMDDTHHMMSSZ``) is now
+chosen from the SHAPE of the original-start string itself; the
+``is_all_day`` argument these tests pass is only the fallback for an
+empty input.  Shape-vs-flag disagreement cases (a single occurrence
+converted between all-day and timed) live in
+tests/test_allday_instance_id_shape.py.
 """
 
 from __future__ import annotations

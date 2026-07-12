@@ -365,6 +365,46 @@ async def _ingest_one_event(
             await _maybe_revert_client_drift(db, proj_match, event)
         return "skipped", None
 
+    # 1b. Single-occurrence TAMPERING with one of OUR series.  When the
+    # client deletes or moves ONE occurrence of a busy-block series we
+    # wrote on their calendar, Google delivers ``<bb-id>_<stamp>`` with
+    # ``recurringEventId = <bb-id>`` (or, detached, with no
+    # recurringEventId at all).  Neither the exact projection lookup
+    # above (that stores the PARENT id — unless a modified-instance
+    # projection happens to exist at the derived id, which IS caught
+    # above and drift-reverted) nor ``is_managed_google_event_id`` (the
+    # ``_<stamp>`` suffix breaks the strict 13-char shape) recognises
+    # it, so this event used to fall through to the instance handler
+    # and MINT a phantom ledger row parented to
+    # ``canonical_uid_client(cal, '<bb-id>')`` — a canonical uid that
+    # can never exist — permanently diverging the diff.
+    #
+    # A missing busy block is a real correctness failure for a
+    # calendar-as-truth system, but re-asserting the PARENT series (the
+    # whole-series drift revert in _maybe_revert_client_drift) cannot
+    # heal a tampered occurrence: a moved/deleted instance is an
+    # exception ON the series, and ``events.update`` on the parent does
+    # not clear exceptions.  The true heal is an ``events.update`` on
+    # the derived instance id itself (the outbox's status:confirmed
+    # instance-revive idiom), but the outbox addresses events via a
+    # projection's ``google_event_id``, and an instance projection only
+    # exists for an instance ledger row — which is exactly the phantom
+    # row this path must never mint.  Until instance-level heal
+    # machinery exists: never mint, WARN naming the tampered
+    # occurrence, and count it, so tampering is visible instead of
+    # silently corrupting the ledger.
+    tampered_base = await _managed_series_instance_base(db, event)
+    if tampered_base is not None:
+        logger.warning(
+            "client ingest: occurrence %s of managed series %s on "
+            "client_calendar_id=%s was tampered with on the client "
+            "calendar (status=%s) — skipping without minting a ledger "
+            "row; the occurrence is NOT auto-healed (instance-level "
+            "heal machinery does not exist yet)",
+            event_id, tampered_base, client_calendar_id, status,
+        )
+        return "tampered_managed_instance", None
+
     # 2. Recurring-event INSTANCE (modified or cancelled).  Route
     #    to the instance handler — these get their own ledger row
     #    with parent_canonical_uid set so cancellations are sticky.
@@ -415,6 +455,27 @@ async def _ingest_one_event(
     # 3. Cancellations: flip to status=cancelled (don't delete the row).
     if status == "cancelled":
         if existing is None:
+            # No top-level row matches the full id — but the id may be
+            # a DETACHED cancelled instance exception (real Google
+            # sometimes drops ``recurringEventId``; see
+            # _maybe_ingest_detached_cancellation).  Attempt instance
+            # routing; a non-instance-shaped id, or one whose base has
+            # no parent ledger row, keeps the existing skip.
+            recovered = await _maybe_ingest_detached_cancellation(
+                db,
+                user_id=user_id,
+                user_email=user_email,
+                owned_emails=owned_emails,
+                event=event,
+                make_parent_canonical=lambda base: canonical_uid_client(
+                    client_calendar_id, base,
+                ),
+                source_type="client",
+                source_calendar_id=client_calendar_id,
+                skip_if_older=skip_if_older,
+            )
+            if recovered is not None:
+                return recovered
             return "skipped", None
         if existing["status"] == "cancelled":
             return "skipped", int(existing["id"])
@@ -494,6 +555,178 @@ async def _maybe_revert_client_drift(
                 WHERE id = ?""",
             (ev_etag, int(proj_match["id"])),
         )
+
+
+# ---------------------------------------------------------------------------
+# Instance-shaped event ids (``<base>_<stamp>``)
+# ---------------------------------------------------------------------------
+# Google derives a recurring instance's id as ``<base>_<stamp>`` where
+# the stamp is ``YYYYMMDDTHHMMSSZ`` (timed, UTC) or ``YYYYMMDD``
+# (all-day).  Strict on exactly those two forms — a ``_R<stamp>``
+# "this and following" segment id does not match (the ``R`` marker is
+# not a bare stamp), and the stamp must parse as a real calendar
+# date/datetime so an arbitrary id with a trailing run of digits is
+# never misread as an instance.
+_INSTANCE_SHAPED_ID_RE = re.compile(r"^(.+)_(\d{8}(?:T\d{6}Z)?)$")
+
+
+def _split_instance_shaped_id(
+    event_id: Optional[str],
+) -> Optional[tuple[str, str]]:
+    """Split a derived-instance-shaped Google event id.
+
+    Returns ``(base_id, stamp)`` when ``event_id`` matches
+    ``<base>_<YYYYMMDDTHHMMSSZ>`` or ``<base>_<YYYYMMDD>`` with a stamp
+    that parses as a real datetime/date; otherwise ``None``.  An
+    instance OF an ``_R`` segment (``<base>_R<stamp1>_<stamp2>``)
+    splits at the LAST underscore, keeping the segment id intact as
+    the base.
+    """
+    if not event_id:
+        return None
+    m = _INSTANCE_SHAPED_ID_RE.match(event_id)
+    if m is None:
+        return None
+    base_id, stamp = m.group(1), m.group(2)
+    try:
+        if "T" in stamp:
+            datetime.strptime(stamp, "%Y%m%dT%H%M%SZ")
+        else:
+            datetime.strptime(stamp, "%Y%m%d")
+    except ValueError:
+        return None
+    return base_id, stamp
+
+
+def _stamp_to_original_start(stamp: str) -> tuple[str, bool]:
+    """Translate an instance-id stamp into the occurrence's original
+    start: ``(original_start, is_all_day)``.
+
+    The timed stamp is always UTC by construction (Google derives it
+    from the occurrence's original slot converted to UTC — see
+    ``identity.derive_instance_google_event_id``), so the result is
+    the canonical ``YYYY-MM-DDTHH:MM:SSZ`` instant; the all-day form
+    maps to a bare ``YYYY-MM-DD`` date.
+    """
+    if "T" in stamp:
+        dt = datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ"), False
+    return datetime.strptime(stamp, "%Y%m%d").strftime("%Y-%m-%d"), True
+
+
+async def _managed_series_instance_base(
+    db: aiosqlite.Connection, event: dict,
+) -> Optional[str]:
+    """The base (series) id when ``event`` is an instance of one of
+    OUR managed series, else ``None``.
+
+    Checks the event's ``recurringEventId`` and, failing that, the
+    instance shape of its own id, against two ownership signals:
+    ``is_managed_google_event_id`` (ours by construction) and an exact
+    projection ``google_event_id`` match (defence-in-depth, mirroring
+    the top-level loop-prevention lookup).
+    """
+    candidates: list[str] = []
+    parent_id = event.get("recurringEventId")
+    if parent_id:
+        candidates.append(parent_id)
+    split = _split_instance_shaped_id(event.get("id"))
+    if split is not None and split[0] not in candidates:
+        candidates.append(split[0])
+    for base_id in candidates:
+        if is_managed_google_event_id(base_id):
+            return base_id
+        row = await (await db.execute(
+            """SELECT 1 FROM ledger_projections
+                WHERE google_event_id = ? LIMIT 1""",
+            (base_id,),
+        )).fetchone()
+        if row is not None:
+            return base_id
+    return None
+
+
+async def _maybe_ingest_detached_cancellation(
+    db: aiosqlite.Connection,
+    *,
+    user_id: int,
+    user_email: str,
+    event: dict,
+    make_parent_canonical: Callable[[str], str],
+    source_type: str,
+    source_calendar_id: Optional[int],
+    owned_emails: Optional[Iterable[str]] = None,
+    skip_if_older: bool = False,
+) -> Optional[tuple[str, Optional[int]]]:
+    """Recover a DETACHED cancelled recurring-instance exception.
+
+    Real Google sometimes delivers the cancellation of a recurring
+    occurrence WITHOUT ``recurringEventId`` — observed in production
+    when a series is split/truncated and an overridden occurrence
+    falls out of the now-bounded master's range: "Google keeps that id
+    only as a *cancelled* exception with no recurringEventId" (see
+    ``app.ledger.outbox._retire_orphaned_instance_tombstone``).  The
+    normal ``recurringEventId`` routing misses it, and the top-level
+    cancelled branch matches no canonical uid (that uid would embed
+    the full ``<base>_<stamp>`` id), so the cancellation was silently
+    dropped: the stale override outlived its series as a ghost busy
+    block / phantom meeting, and main-ingest's churn-breaker (which
+    trusts the still-ACTIVE source instance row) then actively
+    re-created the ghost mirror whenever it was removed.
+
+    Applies ONLY when the event id has the derived-instance shape AND
+    a parent ledger row already exists for the base id — a random
+    top-level event whose id merely contains an underscore must not be
+    misrouted, so anything else returns ``None`` and the caller keeps
+    the existing skip.  (Google's client-supplied-id alphabet cannot
+    even contain ``_``, so an id of this shape is Google-derived by
+    construction — the parent-row gate is belt and braces.)
+
+    A detached tombstone is usually skeletal: when it carries no
+    ``originalStartTime``, the id's stamp IS the occurrence's original
+    slot — parse it rather than letting ``_instance_original_start``
+    fall back to the event's own ``start``, which for a moved instance
+    holds the MOVED time, not the original slot (and would derive the
+    wrong instance canonical uid).
+
+    Returns the ``_ingest_instance`` outcome, or ``None`` when the
+    event is not a recoverable detached instance cancellation.
+    """
+    if event.get("recurringEventId"):
+        return None  # not detached — the normal instance routing owns it
+    split = _split_instance_shaped_id(event.get("id"))
+    if split is None:
+        return None
+    base_id, stamp = split
+    parent_canonical = make_parent_canonical(base_id)
+    parent = await (await db.execute(
+        """SELECT status FROM ledger_events
+            WHERE user_id = ? AND canonical_uid = ?""",
+        (user_id, parent_canonical),
+    )).fetchone()
+    if parent is None or parent["status"] == "released":
+        # No parent series in the ledger (or a retention-frozen one):
+        # keep the conservative skip.
+        return None
+    ost = event.get("originalStartTime") or {}
+    if "dateTime" not in ost and "date" not in ost:
+        original_start, all_day = _stamp_to_original_start(stamp)
+        event = dict(event)
+        event["originalStartTime"] = (
+            {"date": original_start} if all_day
+            else {"dateTime": original_start}
+        )
+    return await _ingest_instance(
+        db,
+        user_id=user_id,
+        user_email=user_email,
+        owned_emails=owned_emails,
+        event=event,
+        parent_canonical=parent_canonical,
+        source_type=source_type,
+        source_calendar_id=source_calendar_id,
+        skip_if_older=skip_if_older,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +855,30 @@ async def _ingest_instance(
     # Cancelled instance — sticky ledger row that survives parent
     # full-sync (since incremental sync surfaces the cancellation
     # once, and our row persists across future passes).
+    #
+    # is_all_day semantics (kept consistent with the modified-instance
+    # path below, which stores fields["is_all_day"]): the row's flag
+    # describes the occurrence AS DISPLAYED — the override's shape —
+    # because payload._start_dict/_end_dict key date-vs-dateTime
+    # rendering of start_at/end_at off it, and those columns hold the
+    # displayed values.  It is NOT the Google-id discriminator: the
+    # derived instance id follows the SHAPE of
+    # recurrence_instance_original_start (see
+    # identity.derive_instance_google_event_id), so an occurrence
+    # converted between all-day and timed keeps a stable id while the
+    # display flag tracks the override.  A cancellation stub usually
+    # carries no display fields, so: prefer the stub's own start shape
+    # when present, keep the existing row's flag on update (it already
+    # matches the stored start_at/end_at), and fall back to the
+    # original slot's shape only for a brand-new row.
     if status == "cancelled":
+        start = event.get("start") or {}
+        if "dateTime" in start:
+            display_is_all_day = False
+        elif "date" in start:
+            display_is_all_day = True
+        else:
+            display_is_all_day = None  # stub: no display shape supplied
         if existing is not None and existing["status"] == "cancelled":
             return "skipped", int(existing["id"])
         if existing is None:
@@ -640,7 +896,10 @@ async def _ingest_instance(
                 (
                     user_id, instance_canonical, parent_canonical,
                     source_type, source_calendar_id, source_event_id,
-                    original_start, instance_is_all_day,
+                    original_start,
+                    (display_is_all_day
+                     if display_is_all_day is not None
+                     else instance_is_all_day),
                     when, when, when, when,
                 ),
             )
@@ -652,7 +911,16 @@ async def _ingest_instance(
                       version = version + 1,
                       cancelled_at = ?, updated_at = ?, last_seen_at = ?
                 WHERE id = ?""",
-            (instance_is_all_day, when, when, when, int(existing["id"])),
+            (
+                # Preserve the row's displayed shape unless the stub
+                # explicitly carries one — overwriting with the
+                # ORIGINAL slot's shape desynced the flag from the
+                # stored start_at/end_at for converted occurrences.
+                (display_is_all_day
+                 if display_is_all_day is not None
+                 else existing["is_all_day"]),
+                when, when, when, int(existing["id"]),
+            ),
         )
         return "cancelled", int(existing["id"])
 

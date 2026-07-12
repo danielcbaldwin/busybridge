@@ -170,10 +170,19 @@ async def diff_and_enqueue_for_user(
                 # Parent hasn't been written yet; defer this instance
                 # to the next reconcile pass.
                 continue
+            # The stamp form (date vs datetime) is derived from the
+            # SHAPE of the original-slot string, matching how Google
+            # keys instance ids.  The row's is_all_day describes the
+            # occurrence AS DISPLAYED (the override's shape) and must
+            # NOT pick the stamp: an all-day occurrence converted to
+            # timed (or vice versa) would derive the wrong id — UPDATE
+            # 404-loops, DELETE false-succeeds leaving a phantom busy
+            # block.  The flag is passed only as the fallback for an
+            # empty original-start.
             derived = derive_instance_google_event_id(
                 parent_proj["google_event_id"],
                 proj["recurrence_instance_original_start"] or "",
-                bool(proj["is_all_day"]),
+                is_all_day=bool(proj["is_all_day"]),
             )
             # Pre-set google_event_id on the instance projection so
             # the outbox's update/delete code path can find it.

@@ -57,6 +57,7 @@ from app.ledger.ingest.client import (
     _ingest_instance,
     _instance_original_start,
     _is_recurring_parent,
+    _maybe_ingest_detached_cancellation,
     _record_affected,
     _stamp_ical_uid,
     scan_full_sync_recurring_cancellations,
@@ -397,6 +398,29 @@ async def _ingest_one_main_event(
 
     if status == "cancelled":
         if existing is None:
+            # Same routing gap as client ingest: real Google sometimes
+            # delivers a cancelled instance exception DETACHED (no
+            # recurringEventId) — see
+            # client._maybe_ingest_detached_cancellation for the
+            # production evidence.  Attempt instance routing against a
+            # NATIVE main series.  The parent-row gate also keeps a
+            # detached exception of a MANAGED copy (base = bb-id) out
+            # of the native lineage: no main_native ledger row ever
+            # exists for a bb-id, so those still skip.
+            recovered = await _maybe_ingest_detached_cancellation(
+                db,
+                user_id=user_id,
+                user_email=user_email,
+                owned_emails=owned_emails,
+                event=event,
+                make_parent_canonical=lambda base: canonical_uid_main_native(
+                    user_id, base,
+                ),
+                source_type="main_native",
+                source_calendar_id=None,
+            )
+            if recovered is not None:
+                return recovered
             return "skipped", None
         if existing["status"] == "cancelled":
             return "skipped", int(existing["id"])
@@ -561,8 +585,13 @@ async def _ingest_managed_recurring_instance(
     src_series_id = parent["source_event_id"]
     if parent["source_type"] == "client" and src_series_id:
         original_start, instance_is_all_day = _instance_original_start(event)
+        # The stamp form follows the SHAPE of original_start (how
+        # Google keys instance ids); instance_is_all_day is only the
+        # fallback for an empty original_start.  A single occurrence
+        # converted between all-day and timed keeps its original-slot
+        # id shape.
         source_event_id = derive_instance_google_event_id(
-            src_series_id, original_start, instance_is_all_day,
+            src_series_id, original_start, is_all_day=instance_is_all_day,
         )
 
     if status == "cancelled":

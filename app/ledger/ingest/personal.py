@@ -32,6 +32,7 @@ from app.ledger.ingest.client import (
     _extract_event_fields,
     _ingest_instance,
     _is_recurring_parent,
+    _maybe_ingest_detached_cancellation,
     _record_affected,
     _stamp_ical_uid,
     scan_full_sync_recurring_cancellations,
@@ -242,6 +243,26 @@ async def _ingest_one(
 
     if status == "cancelled":
         if existing is None:
+            # Same routing gap as client ingest: real Google sometimes
+            # delivers a cancelled instance exception DETACHED (no
+            # recurringEventId) — see
+            # client._maybe_ingest_detached_cancellation for the
+            # production evidence.  Attempt instance routing; anything
+            # else keeps the existing skip.
+            recovered = await _maybe_ingest_detached_cancellation(
+                db,
+                user_id=user_id,
+                user_email=user_email,
+                owned_emails=owned_emails,
+                event=event,
+                make_parent_canonical=lambda base: canonical_uid_personal(
+                    personal_calendar_id, base,
+                ),
+                source_type="personal",
+                source_calendar_id=personal_calendar_id,
+            )
+            if recovered is not None:
+                return recovered
             return "skipped", None
         if existing["status"] == "cancelled":
             return "skipped", int(existing["id"])

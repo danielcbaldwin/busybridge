@@ -739,6 +739,46 @@ class FakeGoogleCalendar:
         self.send_updates_log.append(("delete", event_id, None))
         self._check_post_write("delete")
 
+    def detach_cancelled_instance(
+        self, calendar_id: str, instance_id: str,
+    ) -> dict:
+        """Turn a recurring-instance override into a DETACHED cancelled
+        tombstone: ``status='cancelled'`` with NO ``recurringEventId``
+        and no ``originalStartTime``.
+
+        Models a real-Google behaviour the fake previously could not
+        (fake-fidelity gap #1): when a series is split or truncated so
+        the master no longer generates one of its overridden
+        occurrences, Google keeps that derived id only as a *cancelled*
+        exception with no ``recurringEventId`` — see
+        ``app.ledger.outbox._retire_orphaned_instance_tombstone`` for
+        the production observation.  ``delete_event`` always keeps the
+        parent linkage, so the detached form was untestable.
+
+        Cancels the override (materialising it first when the id still
+        names a live derivable occurrence), strips the parent linkage,
+        and bumps the change cursor so incremental sync delivers the
+        detached tombstone.  Test simulation helper — not part of the
+        Google API surface.
+        """
+        cal = self._require_calendar(calendar_id)
+        ev = cal.events.get(instance_id)
+        if ev is None:
+            ev = self._materialize_instance_override(cal, instance_id)
+            if ev is None:
+                raise _not_found(
+                    f"event {instance_id} not found on {calendar_id}"
+                )
+        cal.change_counter += 1
+        ev.status = "cancelled"
+        ev.recurring_event_id = None
+        ev.original_start_time = None
+        ev.updated = _to_iso_utc(self._clock.now())
+        ev.sequence += 1
+        ev.etag = _new_etag()
+        ev.change_seq = cal.change_counter
+        return ev.to_api_dict()
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -1548,6 +1588,16 @@ def _parse_instance_id(
 
     The stamp is either ``YYYYMMDD`` (all-day) or
     ``YYYYMMDDTHHMMSSZ`` (timed UTC).
+
+    STRICT like real Google: the stamp form is keyed to the PARENT
+    series' shape — an all-day series issues ``_YYYYMMDD`` ids and a
+    timed series ``_YYYYMMDDTHHMMSSZ`` ids, even when an individual
+    occurrence has been overridden to the other display form.  A
+    timed stamp against an all-day parent (or a date stamp against a
+    timed parent) names no instance and must 404 rather than happily
+    materialise.  The earlier laxness here was exactly why the ledger
+    deriving wrong-shape ids for timed<->all-day-converted occurrences
+    stayed green in tests while 404ing against real Google.
     """
     m = _INSTANCE_SUFFIX_RE.search(event_id)
     if not m:
@@ -1556,6 +1606,11 @@ def _parse_instance_id(
     parent_id = event_id[: m.start()]
     parent = cal.events.get(parent_id)
     if parent is None or not parent.recurrence:
+        return None, None
+    parent_is_all_day = "date" in (parent.start or {})
+    if ("T" in stamp) == parent_is_all_day:
+        # Stamp shape contradicts the parent's shape: timed stamp on
+        # an all-day series, or date stamp on a timed series.
         return None, None
     if "T" in stamp:
         # Timed: YYYYMMDDTHHMMSSZ
