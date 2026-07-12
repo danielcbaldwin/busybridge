@@ -240,7 +240,15 @@ def test_present_full_payload_round_trips_through_ingest(row):
     assert fields["start_at"] == row["start_at"]
     assert fields["end_at"] == row["end_at"]
     assert fields["is_all_day"] == row["is_all_day"]
-    assert fields["show_as"] == row["show_as"]
+    # DECLINED-FREES-SLOT (default on): a declined row renders the main
+    # copy transparent regardless of its own show_as, so the read-back
+    # maps to 'free'.  The ledger row itself keeps the source's show_as
+    # — main-ingest compares the copy against this same canonical
+    # render, so the difference never reads as a user edit.
+    if row.get("user_rsvp_status") == "declined":
+        assert fields["show_as"] == "free"
+    else:
+        assert fields["show_as"] == row["show_as"]
     # An empty summary renders as the "(no title)" placeholder.
     assert fields["summary"] == (row["summary"] or "(no title)")
 
