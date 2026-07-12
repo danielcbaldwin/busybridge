@@ -260,15 +260,38 @@ async def _ingest_one_main_event(
                 # main.  CHURN-BREAKER + _R artifact guard: if the source
                 # instance row is still ACTIVE (client ingest runs first
                 # each pass, so this is the source's current view), the
-                # occurrence is LIVE and this cancelled exception is an
-                # _R-split artifact, not a real cancellation.  Cancelling
-                # it oscillated with client ingest forever (version 344)
-                # and deleted real source occurrences.  Re-assert (drift
-                # revert) instead — the diff re-creates the mirror copies.
+                # occurrence is LIVE on the source.  That alone is
+                # ambiguous between (a) an _R-split artifact — the shape
+                # that oscillated with client ingest forever (version
+                # 344) and deleted real source occurrences — and (b) the
+                # user genuinely deleting the moved copy on main.
+                # _series_covers resolves the ambiguity (tri-state):
+                #   * True  — the occurrence is still inside the managed
+                #     series' live range, so a split (which only cancels
+                #     occurrences BEYOND its truncation boundary) could
+                #     not have produced this cancellation → genuine user
+                #     intent.  Honor it exactly like the delete of an
+                #     unmodified occurrence: sticky-suppress the mirror
+                #     (never the authoritative source — the 2026-06-02
+                #     conservative fix stays in force).
+                #   * False — outside the (truncated) range: exactly the
+                #     _R-artifact shape.  Keep the revert that broke the
+                #     production loop.
+                #   * None  — indeterminate (parent gone/not recurring,
+                #     unparseable recurrence, probe miss): stay
+                #     conservative and revert.  A wrong revert merely
+                #     resurrects a copy; a wrong suppression silently
+                #     drops a live mirror.
                 if (
                     matched["status"] == "active"
                     and matched["source_type"] == "client"
                 ):
+                    covers = await _live_instance_delete_covered_by_series(
+                        db, user_id=user_id, ledger_event_id=ledger_id,
+                    )
+                    if covers is True:
+                        await _mark_managed_instance_cancelled(db, ledger_id)
+                        return "cancelled_instance", ledger_id
                     await _mark_main_drift_reverted(db, ledger_id)
                     return "main_drift_reverted", ledger_id
                 # Source occurrence not live → a genuine removal.  Cancel
@@ -557,12 +580,20 @@ async def _ingest_managed_recurring_instance(
         # Client ingest runs BEFORE main ingest in every reconcile pass, so
         # an ACTIVE source instance row for this occurrence reflects the
         # source's current view: the occurrence is LIVE.  A cancelled
-        # exception on main for a live source occurrence is therefore an
-        # artifact, not a real cancellation.  Don't cancel it (which would
-        # loop); instead re-assert the mirror — clear applied state on any
-        # non-present projection so the diff re-creates the BB-deleted
-        # copies (status=confirmed revive).  In steady state every
-        # projection is already present, so this is a no-op (no churn).
+        # exception on main for a live source occurrence used to be
+        # treated unconditionally as an artifact, but the ambiguity is
+        # resolvable with _series_covers (tri-state) — see the identical
+        # gate in _ingest_one_main_event's proj-matched branch:
+        #   * True  (occurrence still in the managed series' range): a
+        #     split artifact could not have cancelled it → the user
+        #     really deleted the copy on main → sticky-suppress the
+        #     mirror, exactly like the unmodified-occurrence delete
+        #     below (never the authoritative source).
+        #   * False / None (out of range, or uncertain): keep the
+        #     conservative revert — re-assert the mirror by clearing
+        #     applied state so the diff re-creates the BB-deleted
+        #     copies (status=confirmed revive).  In steady state every
+        #     projection is already present, so that is a no-op.
         original_start, _iad = _instance_original_start(event)
         inst_canonical = canonical_uid_for_instance(
             parent["canonical_uid"], original_start,
@@ -574,6 +605,16 @@ async def _ingest_managed_recurring_instance(
             (user_id, inst_canonical),
         )).fetchone()
         if live is not None:
+            covers = await _live_instance_delete_covered_by_series(
+                db, user_id=user_id, ledger_event_id=int(live["id"]),
+            )
+            if covers is True:
+                # In-range → genuine user delete of the moved copy on
+                # main.  Cancel the mirror only; the 2026-06-02
+                # conservative fix (no destructive source delete) stays
+                # in force.
+                await _mark_managed_instance_cancelled(db, int(live["id"]))
+                return "cancelled_instance", int(live["id"])
             # Re-assert (drift revert): bump the source row so the diff
             # re-creates the BB-deleted mirror copies (status=confirmed
             # revive), the same mechanism used for any reverted main-side
@@ -1167,6 +1208,63 @@ def _series_covers(parent_row, *, original_start: str, is_all_day: bool):
         ),
         parse_instant(original_start, is_all_day=is_all_day),
         is_all_day=is_all_day,
+    )
+
+
+async def _live_instance_delete_covered_by_series(
+    db: aiosqlite.Connection, *, user_id: int, ledger_event_id: int,
+):
+    """Tri-state: is this modified-instance row's occurrence still inside
+    its parent series' live RRULE range?
+
+    Disambiguates a cancelled exception on the managed MAIN copy of a
+    LIVE (active) modified instance — the case that is ambiguous between
+    a genuine user delete and an "_R" this-and-following split artifact:
+
+      * ``True``  — the parent series still generates this occurrence.
+        A split artifact could NOT have cancelled it (a split only
+        cancels occurrences beyond its truncation boundary, i.e. ones
+        the parent no longer covers), so the cancellation is genuine
+        user intent: honor the delete.
+      * ``False`` — the occurrence is outside the parent's (truncated)
+        range: exactly the shape the _R-split machinery produces.
+      * ``None``  — indeterminate (missing fields, parent gone or not
+        recurring, unparseable recurrence, probe miss).
+
+    Only ``True`` may be treated as user intent; ``False`` and ``None``
+    must keep the conservative churn-breaker revert — a wrong revert
+    merely resurrects a copy the user deletes again, while a wrong
+    suppression silently drops a live mirror.
+    """
+    inst = await (await db.execute(
+        """SELECT parent_canonical_uid, is_all_day,
+                  recurrence_instance_original_start
+             FROM ledger_events WHERE id = ?""",
+        (ledger_event_id,),
+    )).fetchone()
+    if (
+        inst is None
+        or not inst["parent_canonical_uid"]
+        or not inst["recurrence_instance_original_start"]
+    ):
+        return None
+    parent = await (await db.execute(
+        """SELECT recurrence_rule_json, start_at, start_timezone,
+                  is_recurring, status
+             FROM ledger_events
+            WHERE user_id = ? AND canonical_uid = ?""",
+        (user_id, inst["parent_canonical_uid"]),
+    )).fetchone()
+    if (
+        parent is None
+        or not parent["is_recurring"]
+        or parent["status"] != "active"
+    ):
+        return None
+    return _series_covers(
+        parent,
+        original_start=inst["recurrence_instance_original_start"],
+        is_all_day=bool(inst["is_all_day"]),
     )
 
 

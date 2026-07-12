@@ -77,12 +77,18 @@ async def plan_for_ledger_event(
         db, ledger,
     )
     main_native_redundant = await _main_native_is_redundant(db, ledger)
+    settings = get_settings()
     desired = _compute_desired_projections(
         ledger,
         parent_inactive=parent_inactive,
         no_live_occurrences=no_live_occurrences,
         main_native_redundant=main_native_redundant,
-        sync_personal_all_day=get_settings().sync_personal_all_day_events,
+        sync_personal_all_day=settings.sync_personal_all_day_events,
+        # getattr keeps stubbed settings objects (tests) working; the
+        # real Settings default is True.
+        declined_frees_slot=getattr(
+            settings, "declined_events_free_slot", True,
+        ),
     )
 
     active_clients = await _active_client_calendars(db, user_id)
@@ -275,6 +281,7 @@ def _compute_desired_projections(
     no_live_occurrences: bool = False,
     main_native_redundant: bool = False,
     sync_personal_all_day: bool = True,
+    declined_frees_slot: bool = True,
 ) -> dict[str, str]:
     """Return ``{role: desired_state}`` keys: 'main', 'peer_clients',
     'origin_client'.  The caller resolves 'peer_clients' against
@@ -303,11 +310,52 @@ def _compute_desired_projections(
 
     if source == "main_native":
         # Lives natively on main; just place busy blocks on clients.
-        peer = PRESENT_BUSY if show_as != "free" else ABSENT
+        # DECLINED-FREES-SLOT (declined_events_free_slot, default on): a
+        # meeting the user declined must not block their other calendars
+        # — its peer busy blocks go absent via the same mechanism as
+        # show_as == 'free'.  Personal sources are deliberately NOT
+        # given this treatment (README: personal always blocks), and
+        # webcal feeds have no RSVP concept.
+        declined = (
+            declined_frees_slot
+            and ledger["user_rsvp_status"] == "declined"
+        )
+        peer = PRESENT_BUSY if (show_as != "free" and not declined) else ABSENT
         return {"main": ABSENT, "peer_clients": peer, "origin_client": ABSENT}
 
     if source == "client":
-        peer = PRESENT_BUSY if show_as != "free" else ABSENT
+        # DECLINED-FREES-SLOT, client half (see the main_native branch
+        # above).  Granularity is per ledger row, which is exactly
+        # Google's own layering:
+        #   * a PARENT (series) row declined withdraws the whole peer
+        #     busy series at once — every generated occurrence frees;
+        #   * a MODIFIED-INSTANCE row is planned on its OWN
+        #     user_rsvp_status, so an instance-level decline frees only
+        #     that occurrence (its absent peer projection materialises
+        #     a cancelled exception on the busy series via the diff's
+        #     derived-instance delete), and an instance whose own
+        #     response is NOT declined keeps its occurrence blocking
+        #     even under a declined parent (instance response wins —
+        #     _replan_instance_children re-plans each child through
+        #     this same function with the child's own row).
+        # The MAIN full copy deliberately stays PRESENT_FULL: the user
+        # still sees the declined meeting on main; it renders with
+        # transparency=transparent (payload._render_full_copy) so it
+        # doesn't block.
+        # The ORIGIN-WRITEBACK projection below is unaffected: a
+        # decline is precisely something that must still reach the
+        # source (user_rsvp_status is truthy, so origin stays
+        # PRESENT_FULL_RSVP_ONLY and the events.patch fires).  Nor can
+        # the freed slot flap back busy mid-writeback: while
+        # origin_writeback_pending=1, client ingest preserves the local
+        # declined status against stale source re-reads (see
+        # _apply_event_to_ledger / _ingest_instance), so this row keeps
+        # planning peer=ABSENT until the patch lands.
+        declined = (
+            declined_frees_slot
+            and ledger["user_rsvp_status"] == "declined"
+        )
+        peer = PRESENT_BUSY if (show_as != "free" and not declined) else ABSENT
         # The origin client calendar holds the event natively, so it
         # gets no busy block.  It gets a "phantom" writeback
         # projection whenever there is something to push back to the

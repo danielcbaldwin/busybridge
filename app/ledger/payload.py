@@ -180,7 +180,21 @@ def _render_full_copy(
     color = row.get("calendar_color_id") or row.get("color_id")
     if color:
         body["colorId"] = color
-    if row.get("show_as") == "free":
+    # A show_as == 'free' source renders transparent — and so does a
+    # DECLINED event when declined_events_free_slot is on: the user
+    # still SEES the declined meeting on main, it just doesn't block
+    # their time (matching Google's own free/busy treatment of
+    # declines).  The peer busy blocks are withdrawn separately by the
+    # planner.  NOTE: adding "transparency" changes the rendered body
+    # and therefore the payload hash, so every already-declined event's
+    # main copy re-renders once (one update per copy) on the first
+    # reconcile after this deploys — expected, and a one-off.
+    declined_frees_slot = getattr(
+        get_settings(), "declined_events_free_slot", True,
+    )
+    if row.get("show_as") == "free" or (
+        declined_frees_slot and row.get("user_rsvp_status") == "declined"
+    ):
         body["transparency"] = "transparent"
     if row.get("recurrence_rule_json"):
         body["recurrence"] = json.loads(row["recurrence_rule_json"])

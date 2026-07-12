@@ -8,8 +8,12 @@ it can never silently regress:
   has exactly one main full copy and one peer busy block at its current time.
 * I2 no stale copy   — no mirror survives at the old time after a split.
 * I3 no dup/ghost    — never two main copies / two peer blocks for one date.
-* I4 derived ids resolve — a churn-deleted copy of a still-live MODIFIED
-  occurrence re-creates (no 404-forever).
+* I4 main-side delete of a moved copy resolves deterministically — an
+  IN-RANGE occurrence's delete is honored as user intent (sticky
+  suppression, mirror-only; see ingest/main's tri-state _series_covers
+  gate), while an out-of-range one (the _R artifact shape) still reverts
+  (covered in test_main_managed_instance_cancellation).  Either way: no
+  404-forever loops.
 * I5 convergence     — steady state is churn-free and the real source
   occurrence (client_a) is never destructively deleted.
 
@@ -87,8 +91,15 @@ async def test_time_change_split_pre_old_post_new_single_copies():
     await s.close()
 
 
-# --- I4: pre-boundary moved instance — main copy survives + re-creates ------
-async def test_preboundary_moved_instance_main_copy_recreates_after_churn():
+# --- I4: pre-boundary moved instance — main-side delete is honored ----------
+async def test_preboundary_moved_instance_main_delete_suppresses_in_range():
+    """BEHAVIOR CHANGE: a delete on main of a moved occurrence that is
+    still IN the truncated base's range cannot be an _R-split artifact
+    (splits only cancel occurrences beyond the boundary), so it is now
+    honored as user intent: the mirror is sticky-suppressed instead of
+    resurrected (the old I4 "re-creates after churn" expectation).  The
+    real source occurrence still survives (I5) and there is no
+    404-forever loop — the suppression converges churn-free."""
     s = Scenario()
     await _setup(s)
     series = s.given_recurring_event(
@@ -105,19 +116,30 @@ async def test_preboundary_moved_instance_main_copy_recreates_after_churn():
 
     main216 = _live(s, "main", "2026-02-16")
     assert len(main216) == 1 and _start(main216[0]).startswith("2026-02-16T14:00")
-    # Churn-delete the MAIN full copy; it must re-create at the moved time.
+    # Delete the MAIN full copy: 02-16 is pre-boundary (in range of the
+    # truncated base), so the delete is user intent — sticky suppression.
     s.google.delete_event(s.cal("main"), main216[0]["id"])
     await _q(s)
-    rec = _live(s, "main", "2026-02-16")
-    assert len(rec) == 1 and _start(rec[0]).startswith("2026-02-16T14:00"), (
-        "I4: moved-instance main copy not re-created at the moved time")
+    assert _live(s, "main", "2026-02-16") == [], (
+        "in-range main-side delete of a moved occurrence must suppress "
+        "the copy, not resurrect it")
+    assert _live(s, "client_b", "2026-02-16") == [], (
+        "the suppressed occurrence's peer busy block must go too")
     # The real source occurrence is untouched (I5).
     assert len(_live(s, "client_a", "2026-02-16")) == 1
+    # Sticky + churn-free (no 404-forever re-create loop).
+    await _q(s)
+    assert _live(s, "main", "2026-02-16") == []
+    await _assert_churn_free(s)
     await s.close()
 
 
-# --- I4: post-boundary modified instance under _R re-creates ----------------
-async def test_postboundary_segment_modify_recreates_under_segment():
+# --- I4: post-boundary modified instance under _R — delete is honored -------
+async def test_postboundary_segment_modify_main_delete_suppresses():
+    """BEHAVIOR CHANGE (same as the pre-boundary test above): the moved
+    occurrence is parented to the live _R SEGMENT and is inside the
+    segment's range, so a main-side delete of its copy is user intent —
+    sticky suppression, source untouched, no re-create loop."""
     s = Scenario()
     await _setup(s)
     series = s.given_recurring_event(
@@ -135,9 +157,13 @@ async def test_postboundary_segment_modify_recreates_under_segment():
     assert len(m) == 1 and _start(m[0]).startswith("2026-03-16T15:00")
     s.google.delete_event(s.cal("main"), m[0]["id"])
     await _q(s)
-    rec = _live(s, "main", "2026-03-16")
-    assert len(rec) == 1 and _start(rec[0]).startswith("2026-03-16T15:00"), (
-        "I4: post-boundary modified-instance main copy not re-created under _R")
+    assert _live(s, "main", "2026-03-16") == [], (
+        "in-range (segment) main-side delete must suppress the copy")
+    # The real source occurrence on the segment is untouched (I5).
+    assert len(_live(s, "client_a", "2026-03-16")) == 1
+    await _q(s)
+    assert _live(s, "main", "2026-03-16") == []
+    await _assert_churn_free(s)
     await s.close()
 
 

@@ -197,14 +197,21 @@ async def test_main_side_cancel_does_not_destructively_delete_source():
     await s.close()
 
 
-async def test_main_side_cancel_of_live_modified_instance_is_reverted():
-    """CHURN-BREAKER: a cancelled exception of a managed recurring copy on
-    main, for an occurrence still LIVE on the source (an active
-    modified-instance row), is an _R-split artifact — not a real
-    cancellation. BusyBridge must re-assert the occurrence (keep it
-    mirrored everywhere), not cancel it; cancelling oscillated with client
-    ingest forever (the production loop that hit version 344 and deleted
-    real source occurrences). No under-blocking: the peer busy block stays.
+async def test_main_side_cancel_of_live_modified_instance_in_range_is_suppressed():
+    """BEHAVIOR CHANGE (delete of a previously-moved occurrence on main):
+    a cancelled exception of a managed recurring copy on main, for a
+    modified instance that is still LIVE on the source AND still inside
+    the managed series' RRULE range, is now honored as user intent — an
+    "_R" this-and-following split artifact can only cancel occurrences
+    BEYOND the truncation boundary (out of range), so an in-range
+    cancellation cannot be an artifact (``_series_covers`` is True).
+
+    The delete is treated exactly like the delete of an unmodified
+    occurrence: the mirror is sticky-suppressed (main copy + peer busy
+    blocks gone), the authoritative SOURCE occurrence survives
+    (conservative 2026-06-02 fix), and the suppression is sticky across
+    further reconciles.  (Pre-fix, the copy was unconditionally reverted
+    and resurrected forever.)
     """
     s = Scenario()
     s.given_calendar("main")
@@ -227,8 +234,91 @@ async def test_main_side_cancel_of_live_modified_instance_is_reverted():
         "the modified instance should mirror to the peer"
     )
 
-    # Simulate the artifact: a cancelled exception of the managed copy on
-    # main while the source occurrence is still live.
+    # The user deletes the moved copy on main.  The occurrence is still
+    # inside the series' range, so this is genuine intent, not a split
+    # artifact.
+    main_occ = _instance_id_for(s, "main", "2026-02-16")
+    s.cancel_event("main", main_occ)
+    await s.run_reconciler_until_quiescent("alice", max_passes=6)
+
+    db = await s.setup_db()
+    inst = await (await db.execute(
+        """SELECT status, source_delete_pending FROM ledger_events
+            WHERE user_id = ? AND parent_canonical_uid IS NOT NULL""",
+        (user.user_id,),
+    )).fetchone()
+    assert inst["status"] == "cancelled", (
+        "an in-range main-side delete of a moved occurrence must "
+        "sticky-suppress the mirror, not resurrect it"
+    )
+    assert not inst["source_delete_pending"], (
+        "the conservative fix stands: never arm a destructive source delete"
+    )
+    # Mirror suppressed everywhere; the SOURCE occurrence survives.
+    assert "2026-02-16" in _occurrence_starts(s, "client_a"), (
+        "the authoritative source occurrence must survive"
+    )
+    assert "2026-02-16" not in _occurrence_starts(s, "main")
+    assert "2026-02-16" not in _occurrence_starts(s, "client_b")
+    # Other occurrences are untouched.
+    assert {"2026-02-09", "2026-02-23"} <= _occurrence_starts(s, "client_b")
+
+    # Sticky across another reconcile — the copy must not resurrect.
+    await s.run_reconciler_until_quiescent("alice", max_passes=4)
+    inst2 = await (await db.execute(
+        """SELECT status FROM ledger_events
+            WHERE user_id = ? AND parent_canonical_uid IS NOT NULL""",
+        (user.user_id,),
+    )).fetchone()
+    assert inst2["status"] == "cancelled", "suppression must be sticky"
+    assert "2026-02-16" not in _occurrence_starts(s, "main")
+    assert "2026-02-16" not in _occurrence_starts(s, "client_b")
+    assert "2026-02-16" in _occurrence_starts(s, "client_a")
+    await s.close()
+
+
+async def test_main_side_cancel_of_out_of_range_live_instance_still_reverts():
+    """CHURN-BREAKER floor: when the occurrence is OUTSIDE the managed
+    series' live range (``_series_covers`` False — the exact shape an
+    "_R" this-and-following split artifact produces), a cancelled
+    exception on main for a still-live modified instance is still
+    treated as an artifact and REVERTED, keeping the fix for the
+    production loop (version 344 / deleted source occurrences) intact.
+    """
+    s = Scenario()
+    s.given_calendar("main")
+    s.given_calendar("client_a")
+    s.given_calendar("client_b")
+    user = await s.given_user(
+        "alice", main="main", clients=["client_a", "client_b"],
+    )
+    series = s.given_recurring_event(
+        "client_a", summary="Team sync",
+        start="2026-02-02T09:00:00Z", rrule="RRULE:FREQ=WEEKLY;COUNT=6",
+    )
+    await s.run_reconciler_until_quiescent("alice", max_passes=6)
+
+    # Make 2026-02-16 a MODIFIED instance — live on the source.
+    occ = _instance_id_for(s, "client_a", "2026-02-16")
+    s.update_event("client_a", occ, start="2026-02-16T14:00:00Z")
+    await s.run_reconciler_until_quiescent("alice", max_passes=6)
+
+    # Truncate the series BEFORE the modified occurrence (a
+    # this-and-following-style truncation).  The fake keeps the
+    # out-of-range override alive on the source (documented gap), so
+    # the instance row stays ACTIVE while the parent's RRULE no longer
+    # covers 2026-02-16 — exactly the artifact-ambiguous state.
+    s.update_event(
+        "client_a", series["id"],
+        recurrence=["RRULE:FREQ=WEEKLY;UNTIL=20260209T235959Z"],
+    )
+    await s.run_reconciler_until_quiescent("alice", max_passes=6)
+    assert "2026-02-16" in _occurrence_starts(s, "main"), (
+        "precondition: the out-of-range override is still mirrored"
+    )
+
+    # The artifact: a cancelled exception of the managed copy on main
+    # for the (still-live, now out-of-range) occurrence.
     main_occ = _instance_id_for(s, "main", "2026-02-16")
     s.cancel_event("main", main_occ)
     await s.run_reconciler_until_quiescent("alice", max_passes=6)
@@ -240,10 +330,12 @@ async def test_main_side_cancel_of_live_modified_instance_is_reverted():
         (user.user_id,),
     )).fetchone()
     assert inst["status"] == "active", (
-        "a live occurrence must not be cancelled by a main-side artifact"
+        "an out-of-range cancellation is an _R-split artifact and must "
+        "be reverted, not honored"
     )
     # Re-asserted everywhere — no under-blocking on the peer.
     assert "2026-02-16" in _occurrence_starts(s, "client_a")
+    assert "2026-02-16" in _occurrence_starts(s, "main")
     assert "2026-02-16" in _occurrence_starts(s, "client_b")
     await s.close()
 
