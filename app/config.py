@@ -141,6 +141,20 @@ class Settings(BaseSettings):
     busy_block_title: str = "Busy"  # client busy block (a main/client source)
     personal_busy_block_title: str = "Busy (personal)"  # personal-source block
 
+    # A DECLINED meeting frees the slot: its busy blocks are withdrawn
+    # from the other calendars and the main copy renders transparent —
+    # matching Google's own free/busy treatment of declined events.
+    # Applies to client-sourced and main-native events (per occurrence
+    # or whole series); personal sources always block, unchanged.
+    declined_events_free_slot: bool = True
+
+    # Origin writebacks (RSVP / edits propagated from main back to the
+    # source event) send Google's standard notifications
+    # (sendUpdates=all): declining on main emails the organizer exactly
+    # as declining on the client calendar would.  Writes to OUR OWN
+    # managed copies are always silent regardless of this setting.
+    writeback_notifications: bool = True
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

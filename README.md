@@ -350,6 +350,8 @@ credentials and SMTP live in the database, not here.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `SYNC_PERSONAL_ALL_DAY_EVENTS` | Mirror all-day personal-calendar events as busy blocks. Off = suppress them everywhere (they only block the whole day with no info). | `false` |
+| `DECLINED_EVENTS_FREE_SLOT` | A declined meeting (series or single occurrence) stops casting busy blocks and its main copy renders transparent, matching Google free/busy. Personal sources always block. | `true` |
+| `WRITEBACK_NOTIFICATIONS` | RSVP/edit writebacks to the source event send Google's standard notifications (organizer gets the usual declined/accepted email). Managed-copy writes are always silent. | `true` |
 | `DELETE_PROPAGATION_MODE` | Propagate a delete of a managed non-recurring client copy back to the source: `off` / `shadow` (log only) / `on`. See `DELETE_PROPAGATION_PLAN.md`. | `off` |
 
 **Markers, titles & test mode**
