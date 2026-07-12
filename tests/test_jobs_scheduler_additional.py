@@ -40,6 +40,7 @@ def _settings(**overrides):
         "enable_webhooks": True,
         "webhook_renewal_hours": 6,
         "content_audit_minutes": 10,
+        "observation_audit_minutes": 10,
         "token_refresh_minutes": 30,
         "alert_process_minutes": 1,
         "enable_ledger_jobs": False,
@@ -146,5 +147,33 @@ def test_setup_scheduler_ledger_mode_uses_ledger_jobs_not_periodic_shim(
     assert sched.jobs["sync_health_checks"]["func"] == (
         "app.jobs.sync_job:run_sync_health_checks"
     )
+    assert sched.jobs["observation_audit"]["func"] == (
+        "app.jobs.ledger_jobs:run_observation_audit_job"
+    )
 
+    scheduler.shutdown_scheduler()
+
+
+def test_setup_scheduler_observation_audit_disabled_when_nonpositive(
+    monkeypatch,
+):
+    """OBSERVATION_AUDIT_MINUTES <= 0 must not schedule the job (and the
+    job never exists outside ledger mode)."""
+    import app.jobs.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "AsyncIOScheduler", _FakeScheduler)
+    monkeypatch.setattr(
+        scheduler, "get_settings",
+        lambda: _settings(enable_ledger_jobs=True, observation_audit_minutes=0),
+    )
+    sched = scheduler.setup_scheduler()
+    assert "observation_audit" not in sched.jobs
+    scheduler.shutdown_scheduler()
+
+    monkeypatch.setattr(
+        scheduler, "get_settings",
+        lambda: _settings(enable_ledger_jobs=False),
+    )
+    sched = scheduler.setup_scheduler()
+    assert "observation_audit" not in sched.jobs
     scheduler.shutdown_scheduler()

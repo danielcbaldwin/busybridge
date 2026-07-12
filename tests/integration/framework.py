@@ -864,6 +864,41 @@ async def _scenario_run_audit(
     )
 
 
+async def _scenario_run_observation(
+    self: Scenario,
+    user_nick: str,
+    *,
+    sample_size: int = 100,
+) -> dict:
+    """Drive one observation-audit pass for a user
+    (``observe.observe_user``): read converged projections back from
+    the fake Google and mark divergent ones for re-assertion.
+
+    The settle window is disabled (``min_quiet_seconds=0``): projection
+    timestamps are written with the real wall clock while the scenario
+    runs on the simulated one, so an age filter would be meaningless
+    here.
+    """
+    from app.ledger.observe import observe_user
+
+    user = self.user(user_nick)
+    db = await _scenario_setup_db(self)
+    google_id_for: dict[int, str] = {}
+    for nick, cid in user.client_calendar_ids.items():
+        google_id_for[cid] = self.cal(nick)
+    for nick, pid in user.personal_calendar_ids.items():
+        google_id_for[pid] = self.cal(nick)
+    return await observe_user(
+        db, self.google,
+        user_id=user.user_id,
+        main_google_calendar_id=user.main_google_calendar_id,
+        google_calendar_id_for=google_id_for,
+        sample_size=sample_size,
+        min_quiet_seconds=0,
+        now=self.clock.now(),
+    )
+
+
 def _scenario_user(self: Scenario, nickname: str) -> _LedgerUser:
     try:
         return self._users_by_nick[nickname]
@@ -891,6 +926,7 @@ Scenario.given_user = _scenario_given_user  # type: ignore[attr-defined]
 Scenario.given_webcal = _scenario_given_webcal  # type: ignore[attr-defined]
 Scenario.run_reconciler = _scenario_run_reconciler  # type: ignore[attr-defined]
 Scenario.run_audit = _scenario_run_audit  # type: ignore[attr-defined]
+Scenario.run_observation = _scenario_run_observation  # type: ignore[attr-defined]
 Scenario.run_reconciler_until_quiescent = (  # type: ignore[attr-defined]
     _scenario_run_reconciler_until_quiescent
 )

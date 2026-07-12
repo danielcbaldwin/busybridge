@@ -46,7 +46,10 @@ never see what a given client meeting actually is.
   (~5 s); a 30-second drain loop pushes pending writes promptly.
 - **Self-healing** — a 6-hourly orphan scan reclaims events that escaped
   tracking, a 10-minute content audit catches source edits that incremental sync
-  missed, and a per-user circuit breaker auto-pauses a user whose every calendar
+  missed, an observation audit continuously reads samples of managed copies
+  *back* from Google and re-asserts any that diverged from the ledger's
+  bookkeeping (lost copies, deletes that never landed, wrong recurring-instance
+  IDs), and a per-user circuit breaker auto-pauses a user whose every calendar
   is failing.
 - **ICS export** — full-calendar ICS export, plus a "clean" variant that strips
   BusyBridge-managed events (for migration or external backup).
@@ -322,6 +325,8 @@ credentials and SMTP live in the database, not here.
 |----------|-------------|---------|
 | `SYNC_INTERVAL_MINUTES` | Periodic enqueue + health-check interval | `5` |
 | `CONTENT_AUDIT_MINUTES` | Source content re-audit interval | `10` |
+| `OBSERVATION_AUDIT_MINUTES` | Observation-audit interval (verify converged projections against live Google; ≤ 0 disables) | `10` |
+| `OBSERVATION_AUDIT_SAMPLE_SIZE` | Projections verified per user per observation-audit cycle | `100` |
 | `TOKEN_REFRESH_MINUTES` | OAuth token refresh interval | `30` |
 | `WEBHOOK_RENEWAL_HOURS` | Push-channel renewal interval | `6` |
 | `ALERT_PROCESS_MINUTES` | Email-alert queue tick | `1` |
@@ -379,6 +384,7 @@ In the default ledger mode (`ENABLE_LEDGER_JOBS=true`):
 | Ledger periodic enqueue | every 5 min | Queue a reconcile for each active user |
 | Sync health checks | every 5 min | Circuit breaker + failing-calendar alerts |
 | Content audit | every 10 min | Re-verify source content vs the ledger (catches missed edits) |
+| Observation audit | every 10 min | Read a sample of managed copies back from Google and mark any that diverged from the applied bookkeeping for re-assertion |
 | Token refresh | every 30 min | Refresh OAuth tokens expiring within an hour |
 | Alert processing | every 1 min | Send queued email alerts |
 | Orphan scan | every 6 h | Reclaim Google events that escaped tracking |

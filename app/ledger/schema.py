@@ -124,6 +124,11 @@ CREATE TABLE IF NOT EXISTS ledger_projections (
     -- produce a fresh, still-deterministic id.
     google_id_generation INTEGER NOT NULL DEFAULT 0,
 
+    -- When the observation audit (observe.py) last read this
+    -- projection's Google state back and verified it.  Oldest-first
+    -- sampling sweeps the converged set in ceil(rows/sample) cycles.
+    last_observed_at TIMESTAMP,
+
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP,
 
@@ -283,6 +288,12 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
         # conferenceId awaiting a second confirming read).  See
         # client.py _resolve_conference.
         "ALTER TABLE ledger_events ADD COLUMN pending_conference_id TEXT",
+        # Rotation bookkeeping for the observation audit (observe.py):
+        # when this projection's Google state was last read back and
+        # verified.  Oldest-first sampling sweeps the converged set in
+        # ceil(rows / sample) cycles.  Written exclusively as UTC
+        # isoformat; NULL sorts first (never observed).
+        "ALTER TABLE ledger_projections ADD COLUMN last_observed_at TIMESTAMP",
     ):
         try:
             await db.execute(stmt)

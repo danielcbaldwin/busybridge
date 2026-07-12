@@ -155,6 +155,23 @@ def setup_scheduler() -> AsyncIOScheduler:
             name="Sync Health Checks",
             replace_existing=True,
         )
+        # Observation audit: read a sample of converged projections
+        # back from Google and verify the applied stamps against
+        # reality (the trust-but-verify backstop).  <= 0 disables.
+        if settings.observation_audit_minutes > 0:
+            _scheduler.add_job(
+                "app.jobs.ledger_jobs:run_observation_audit_job",
+                trigger=IntervalTrigger(
+                    minutes=settings.observation_audit_minutes,
+                ),
+                id="observation_audit",
+                name="Observation Audit",
+                replace_existing=True,
+            )
+        else:
+            logger.info(
+                "Observation audit disabled (OBSERVATION_AUDIT_MINUTES<=0)"
+            )
 
     _scheduler.start()
     logger.info("Background scheduler started")
