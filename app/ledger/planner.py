@@ -432,7 +432,12 @@ def _resolve_targets(
     out: list[tuple[str, Optional[int], str]] = []
 
     main_state = desired["main"]
-    out.append((TARGET_MAIN, None, main_state))
+    # MAIN_VIRTUAL: main is a purely-virtual calendar (SQLite ledger only).
+    # Skip emitting a main-target projection so nothing downstream ever
+    # tries to write to Google for main.  ``getattr`` with a default keeps
+    # partial ``SimpleNamespace`` settings mocks in existing tests working.
+    if not getattr(get_settings(), "main_virtual", False):
+        out.append((TARGET_MAIN, None, main_state))
 
     source_type = ledger["source_type"]
     origin_cal_id = (

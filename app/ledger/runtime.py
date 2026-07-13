@@ -228,6 +228,14 @@ async def _reconcile_user_once(
         {"id": int(r["id"]), "url": r["url"]} for r in webcal_rows
     ]
 
+    # MAIN_VIRTUAL: skip all main-calendar ingest.  The reconciler
+    # already respects include_main; force it False so no Google API
+    # call is ever made against a "main" calendar (there is no real
+    # one to call).  ``getattr`` with a default tolerates partial
+    # settings mocks in existing tests.
+    if getattr(_gs(), "main_virtual", False):
+        include_main = False
+
     return await reconcile_user(
         db, access["router"],
         user_id=user_id,

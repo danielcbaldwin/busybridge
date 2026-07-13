@@ -174,18 +174,21 @@ async def register_webhooks_for_user(user_id: int) -> None:
     if old_channels:
         logger.info(f"Cleaned up {len(old_channels)} old webhook channels for user {user_id}")
 
-    # Register for main calendar
-    try:
-        access_token = await get_valid_access_token(user_id, user["email"])
-        await register_webhook_channel(
-            user_id=user_id,
-            calendar_type="main",
-            calendar_id=user["main_calendar_id"],
-            access_token=access_token,
-        )
-        logger.info(f"Registered webhook for main calendar of user {user_id}")
-    except Exception as e:
-        logger.error(f"Failed to register main calendar webhook: {e}")
+    # Register for main calendar (skip when main is virtual — no real
+    # Google calendar to receive push notifications for)
+    from app.config import get_settings
+    if user["main_calendar_id"] and user["main_calendar_id"] != "main-virtual" and not getattr(get_settings(), "main_virtual", False):
+        try:
+            access_token = await get_valid_access_token(user_id, user["email"])
+            await register_webhook_channel(
+                user_id=user_id,
+                calendar_type="main",
+                calendar_id=user["main_calendar_id"],
+                access_token=access_token,
+            )
+            logger.info(f"Registered webhook for main calendar of user {user_id}")
+        except Exception as e:
+            logger.error(f"Failed to register main calendar webhook: {e}")
 
     # Register for client and personal calendars
     cursor = await db.execute(

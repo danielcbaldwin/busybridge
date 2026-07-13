@@ -24,6 +24,7 @@ from typing import Iterable, Optional
 
 import aiosqlite
 
+from app.config import get_settings
 from app.ledger.google_client import GoogleClient
 from app.ledger.identity import derive_instance_google_event_id
 from app.ledger.outbox import (
@@ -344,6 +345,14 @@ def _decide(
     desired = proj["desired_state"]
     current = proj["current_state"]
     target_kind = proj["target_kind"]
+
+    # MAIN_VIRTUAL safety net: the planner already suppresses main
+    # projections in this mode, but if a legacy row survives (e.g.
+    # from before the flag was flipped on) don't ever write to main.
+    # ``getattr`` with a default tolerates partial settings mocks in
+    # tests that pre-date this flag.
+    if target_kind == "main" and getattr(get_settings(), "main_virtual", False):
+        return None, None, ""
 
     if target_kind == "main":
         target_cal = main_calendar_id

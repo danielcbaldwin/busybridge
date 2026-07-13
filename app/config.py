@@ -67,6 +67,15 @@ class Settings(BaseSettings):
     # clients).
     sync_personal_all_day_events: bool = False
 
+    # Ghost Main: the "main" calendar is purely virtual (SQLite-only).
+    # The internal ledger still records everything, but no Google Calendar
+    # is designated as main and no writes flow to a main calendar.  Use
+    # this for peer-to-peer sync topologies where the aggregation view
+    # lives in an external client (e.g. Fantastical), not in Google.
+    # Requires TEST_MODE=true so admin login uses the email allowlist
+    # instead of a workspace-domain check.
+    main_virtual: bool = False
+
     # Test mode controls
     test_mode: bool = False
     test_mode_allowed_home_emails: str = ""

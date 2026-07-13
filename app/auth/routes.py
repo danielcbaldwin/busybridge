@@ -242,23 +242,37 @@ async def oauth_callback(
         # offloads the blocking Google call with asyncio.to_thread, so
         # the OAuth callback's event loop is not frozen during it.
         if not user.main_calendar_id:
-            try:
-                items = await fetch_calendar_list(user.id, email)
-                primary_cal = next((c for c in items if c.get("primary")), None)
-                if primary_cal:
-                    db = await get_database()
-                    await db.execute(
-                        "UPDATE users SET main_calendar_id = ? WHERE id = ?",
-                        (primary_cal["id"], user.id),
-                    )
-                    await db.commit()
-                    logger.info(
-                        f"Set main calendar for user {user.id}: {primary_cal['id']}"
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Could not initialize main calendar for user {user.id}: {e}"
+            if getattr(settings, "main_virtual", False):
+                # MAIN_VIRTUAL: no real Google calendar acts as main.
+                # Persist a sentinel so downstream checks
+                # (main_calendar_id IS NOT NULL) still admit this user
+                # into reconciliation, but no real Google ID is ever
+                # dereferenced.
+                db = await get_database()
+                await db.execute(
+                    "UPDATE users SET main_calendar_id = ? WHERE id = ?",
+                    ("main-virtual", user.id),
                 )
+                await db.commit()
+                logger.info(f"Set main_calendar_id sentinel for user {user.id} (MAIN_VIRTUAL)")
+            else:
+                try:
+                    items = await fetch_calendar_list(user.id, email)
+                    primary_cal = next((c for c in items if c.get("primary")), None)
+                    if primary_cal:
+                        db = await get_database()
+                        await db.execute(
+                            "UPDATE users SET main_calendar_id = ? WHERE id = ?",
+                            (primary_cal["id"], user.id),
+                        )
+                        await db.commit()
+                        logger.info(
+                            f"Set main calendar for user {user.id}: {primary_cal['id']}"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Could not initialize main calendar for user {user.id}: {e}"
+                    )
 
         # Update last login
         await update_user_last_login(user.id)
