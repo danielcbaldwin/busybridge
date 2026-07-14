@@ -21,6 +21,8 @@ os.environ["TEST_MODE"] = "false"
 os.environ["MAIN_VIRTUAL"] = "false"
 os.environ["TEST_MODE_ALLOWED_HOME_EMAILS"] = ""
 os.environ["TEST_MODE_ALLOWED_CLIENT_EMAILS"] = ""
+os.environ["BUSY_BLOCK_TITLE"] = "Busy"
+os.environ["PERSONAL_BUSY_BLOCK_TITLE"] = "Busy (personal)"
 
 
 @pytest.fixture(scope="session")

@@ -320,7 +320,14 @@ async def _ingest_one(
 
     new_hash = _content_hash(fields)
     old_hash = _content_hash_from_row(existing)
-    if new_hash == old_hash:
+    # A row resurrecting from 'cancelled' must be replanned even when
+    # the content hash matches — cleanup_one_calendar cancels every
+    # event and clears the sync token; the next incremental re-sees the
+    # same content and would otherwise 'skip' here, leaving the row
+    # cancelled forever.  client.py handles this via a ``resurrecting``
+    # flag in _apply_event_to_ledger; personal ingest needs the same.
+    resurrecting = existing["status"] == "cancelled"
+    if new_hash == old_hash and not resurrecting:
         await db.execute(
             "UPDATE ledger_events SET last_seen_at = ? WHERE id = ?",
             (when, int(existing["id"])),

@@ -990,7 +990,14 @@ async def _ingest_instance(
     new_hash = _content_hash(fields)
     old_hash = _content_hash_from_row(existing)
     conf_json, conf_pending, conf_changed = _resolve_conference(existing, fields)
-    if new_hash == old_hash and not conf_changed:
+    # A row resurrecting from 'cancelled' must be replanned even when
+    # content is unchanged — cleanup_one_calendar cancels every event
+    # and clears the sync token; the next full re-sync then sees the
+    # same content and would otherwise 'skip' here, leaving the
+    # instance cancelled forever.  Mirrors the same check in
+    # _apply_event_to_ledger.
+    resurrecting = existing["status"] == "cancelled"
+    if new_hash == old_hash and not conf_changed and not resurrecting:
         # No content change.  Record the conference debounce candidate so
         # a genuine, settled room swap can confirm on the next read.
         await db.execute(
