@@ -31,6 +31,12 @@ services:
       # Ghost Main: run without a real Google main calendar (SQLite ledger only).
       - MAIN_VIRTUAL=${MAIN_VIRTUAL:-false}
       - MANAGED_EVENT_PREFIX=${MANAGED_EVENT_PREFIX:-[BusyBridge]}
+      # Busy-block titles (rendered on placeholder events on peer calendars).
+      # Change either to override the default label; setting them to the
+      # same value makes personal-source blocks indistinguishable from
+      # client-source ones.
+      - BUSY_BLOCK_TITLE=${BUSY_BLOCK_TITLE:-Busy}
+      - PERSONAL_BUSY_BLOCK_TITLE=${PERSONAL_BUSY_BLOCK_TITLE:-Busy (personal)}
       # Phase-1 organizer-delete propagation: off (default) | shadow | on.
       # See DELETE_PROPAGATION_PLAN.md.
       - DELETE_PROPAGATION_MODE=${DELETE_PROPAGATION_MODE:-off}
