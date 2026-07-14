@@ -317,6 +317,23 @@ async def reconcile_user(
             db, row_ids=[rid for rid, _ in affected_rows],
         )
 
+    # 3b. Coalesce overlapping personal-source busy blocks into merged
+    #     intervals per target.  This runs AFTER per-event planning so
+    #     the coalescer sees the planner's up-to-date projection set;
+    #     it runs BEFORE the diff so the first outbox pass emits the
+    #     merged shape rather than individual per-event blocks that
+    #     would then get deleted on a follow-up pass.
+    from app.ledger.coalesce import apply_coalescing_for_user
+    try:
+        coalesced = await apply_coalescing_for_user(db, user_id=user_id)
+        out["coalesced"] = coalesced
+    except Exception as e:  # never break the reconcile on a coalesce failure
+        logger.exception(
+            "coalesce pass failed user_id=%s: %s (continuing without merge)",
+            user_id, e,
+        )
+        out.setdefault("errors", []).append({"stage": "coalesce", "err": str(e)})
+
     # 4. Diff + drain + replan fixed-point loop (see
     #    _diff_drain_until_quiescent for the convergence rationale).
     await _diff_drain_until_quiescent(

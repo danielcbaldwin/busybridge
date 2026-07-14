@@ -23,6 +23,7 @@ os.environ["TEST_MODE_ALLOWED_HOME_EMAILS"] = ""
 os.environ["TEST_MODE_ALLOWED_CLIENT_EMAILS"] = ""
 os.environ["BUSY_BLOCK_TITLE"] = "Busy"
 os.environ["PERSONAL_BUSY_BLOCK_TITLE"] = "Busy (personal)"
+os.environ["MANAGED_EVENT_PREFIX"] = "[BusyBridge]"
 
 
 @pytest.fixture(scope="session")

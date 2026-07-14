@@ -385,6 +385,23 @@ def _decide(
             )
         return None, None, ""
 
+    # A coalescing carrier projection carries a JSON override that
+    # replaces the source event's start/end (and drops recurrence) so
+    # the rendered payload spans the merged interval.  Non-carrier
+    # projections (and every non-coalesced row) leave this NULL.
+    override = None
+    override_raw = proj["payload_override_json"] if "payload_override_json" in proj.keys() else None
+    if override_raw:
+        try:
+            import json as _json
+            override = _json.loads(override_raw)
+        except (ValueError, TypeError):
+            logger.warning(
+                "projection %s has malformed payload_override_json; ignoring",
+                proj["id"],
+            )
+            override = None
+
     payload = render_payload(
         desired_state=desired,
         ledger_row=_proj_row_to_ledger_dict(proj),
@@ -398,6 +415,7 @@ def _decide(
         # applied_payload_hash is taken from the planner's stamped hash
         # — so the send body carrying the email never spuriously diverges.
         main_calendar_email=main_calendar_id,
+        payload_override=override,
     )
 
     # Origin writeback projection: the target is the user's real
