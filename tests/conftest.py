@@ -14,6 +14,13 @@ from httpx import AsyncClient
 os.environ["DATABASE_PATH"] = ":memory:"
 os.environ["ENCRYPTION_KEY_FILE"] = "/tmp/test_encryption.key"
 os.environ["PUBLIC_URL"] = "http://localhost:3000"
+# Force clean defaults so a runtime ``.env`` in the repo root does not
+# leak deployment-only settings (TEST_MODE, MAIN_VIRTUAL, allowlists)
+# into the test process via pydantic-settings' auto-loading behaviour.
+os.environ["TEST_MODE"] = "false"
+os.environ["MAIN_VIRTUAL"] = "false"
+os.environ["TEST_MODE_ALLOWED_HOME_EMAILS"] = ""
+os.environ["TEST_MODE_ALLOWED_CLIENT_EMAILS"] = ""
 
 
 @pytest.fixture(scope="session")

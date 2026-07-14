@@ -178,13 +178,23 @@ async def store_oauth_tokens(
     access_encrypted = encrypt_value(access_token)
     refresh_encrypted = encrypt_value(refresh_token)
 
+    # Preserve a 'home' account_type across upserts.  A user can
+    # (legitimately) connect the same Google account they use for admin
+    # login as a personal-source calendar; the UPSERT below would
+    # otherwise clobber account_type='home' with 'personal', and the
+    # reconciler's _resolve_home_email lookup (WHERE account_type='home')
+    # would then silently return None -> every reconcile no-ops with
+    # skipped=no_home_oauth_token.
     cursor = await db.execute(
         """INSERT INTO oauth_tokens
            (user_id, account_type, google_account_email,
             access_token_encrypted, refresh_token_encrypted, token_expiry, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(user_id, google_account_email) DO UPDATE SET
-           account_type = excluded.account_type,
+           account_type = CASE
+               WHEN oauth_tokens.account_type = 'home' THEN 'home'
+               ELSE excluded.account_type
+           END,
            access_token_encrypted = excluded.access_token_encrypted,
            refresh_token_encrypted = excluded.refresh_token_encrypted,
            token_expiry = excluded.token_expiry,
