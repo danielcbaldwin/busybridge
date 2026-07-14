@@ -82,6 +82,7 @@ def render_payload(
     ledger_version: Optional[int] = None,
     target_kind: Optional[str] = None,
     main_calendar_email: Optional[str] = None,
+    payload_override: Optional[dict] = None,
 ) -> Optional[dict]:
     """Render the body to send to Google for one projection.
 
@@ -97,6 +98,14 @@ def render_payload(
     not load-bearing — identity is via the deterministic Google ID
     on inserts and via the etag on updates — but they make
     bug-investigation grep-friendly.
+
+    ``payload_override`` is a shallow dict of field overrides applied
+    on top of ``ledger_row`` before rendering.  Used by the busy-block
+    coalescer: a "carrier" projection can span the union of several
+    source events by overriding start_at / end_at without touching
+    the underlying ledger rows.  Overrides never apply to full-detail
+    copies or origin writebacks — those must stay tied to the source
+    event exactly as ingested.
     """
     if desired_state == ABSENT:
         return None
@@ -109,12 +118,19 @@ def render_payload(
         # the writeback projection to it.
         return _render_origin_writeback(ledger_row)
 
+    # Coalescer overrides only make sense for opaque BUSY placeholders
+    # (client-source and personal-source blocks).  Full copies carry
+    # source-event detail and must not be re-timed under the caller.
+    effective_row = ledger_row
+    if payload_override and desired_state in (PRESENT_BUSY, PRESENT_PERSONAL_BUSY):
+        effective_row = {**ledger_row, **payload_override}
+
     if desired_state == PRESENT_FULL:
         body = _render_full_copy(ledger_row, target_kind, main_calendar_email)
     elif desired_state == PRESENT_BUSY:
-        body = _render_busy_block(ledger_row)
+        body = _render_busy_block(effective_row)
     elif desired_state == PRESENT_PERSONAL_BUSY:
-        body = _render_personal_busy(ledger_row)
+        body = _render_personal_busy(effective_row)
     else:
         raise ValueError(f"unknown desired_state: {desired_state!r}")
 

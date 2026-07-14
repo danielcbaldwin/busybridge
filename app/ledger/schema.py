@@ -283,6 +283,20 @@ async def init_ledger_schema(db: aiosqlite.Connection) -> None:
         # conferenceId awaiting a second confirming read).  See
         # client.py _resolve_conference.
         "ALTER TABLE ledger_events ADD COLUMN pending_conference_id TEXT",
+        # Interval coalescing: JSON blob of per-projection field overrides
+        # applied at payload render time.  Used by the busy-block
+        # coalescer so a "carrier" projection can render start/end times
+        # covering the union of several overlapping source events without
+        # touching the source ledger rows.  Keys mirror ledger_events
+        # columns (currently start_at, end_at, start_timezone,
+        # end_timezone, is_all_day); NULL means "no override".
+        "ALTER TABLE ledger_projections ADD COLUMN payload_override_json TEXT",
+        # Coalescing membership: the projection id of the CARRIER this
+        # projection is a member of, or NULL if the projection is itself
+        # the carrier (or not part of any coalesce group).  Enables a
+        # follow-up pass to invalidate a group cleanly when its carrier
+        # changes.
+        "ALTER TABLE ledger_projections ADD COLUMN coalesce_carrier_id INTEGER",
     ):
         try:
             await db.execute(stmt)
