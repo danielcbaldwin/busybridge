@@ -432,6 +432,16 @@ async def csrf_origin_check(request: Request, call_next):
     — the CSRF threat is browser-driven.
     """
     if request.method not in _SAFE_METHODS:
+        # Sec-Fetch-Site is set by the browser (JS can't forge it) and
+        # tells us definitively whether the request is same-origin.
+        # Prefer it: it distinguishes 'Origin: null' from an actual
+        # cross-site request in the case where Referrer-Policy strips
+        # the Referer and some browsers (Firefox, Safari) then send
+        # Origin: null even for a same-origin form POST.
+        sec_fetch_site = request.headers.get("sec-fetch-site")
+        if sec_fetch_site in ("same-origin", "none"):
+            return await call_next(request)
+
         check = request.headers.get("origin") or request.headers.get("referer")
         if check is not None and not _is_same_origin(check):
             return JSONResponse(
