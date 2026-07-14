@@ -251,6 +251,12 @@ async def _apply_coalescing_for_target(
     # coalesce_carrier_id set).  A group's constituent projections are
     # exactly what we need to re-evaluate against the current ledger
     # state.
+    # A recurring PARENT row (recurrence_rule_json is non-null) cannot
+    # be merged with a one-off — a coalesced group is a concrete time
+    # range with no RRULE, so folding the parent in would silently
+    # cancel every future occurrence.  Modified instances have
+    # recurrence_rule_json = NULL (instance-level, not series-level),
+    # so they still participate.
     rows = await (await db.execute(
         """SELECT p.id AS projection_id,
                   p.ledger_event_id,
@@ -272,6 +278,7 @@ async def _apply_coalescing_for_target(
               AND p.target_calendar_id = ?
               AND e.user_id = ?
               AND e.source_type = 'personal'
+              AND e.recurrence_rule_json IS NULL
               AND (
                    p.desired_state = ?
                 OR (p.desired_state = 'absent' AND p.coalesce_carrier_id IS NOT NULL)
