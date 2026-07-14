@@ -133,6 +133,7 @@
         {% endif %}
     </div>
 
+    {% if not main_virtual %}
     <!-- Main Calendar -->
     <div class="mb-8 bg-white shadow rounded-lg p-4 sm:p-6">
         <h2 class="text-lg font-medium text-gray-900 mb-4">Main Calendar</h2>
@@ -157,6 +158,7 @@
         </div>
         {% endif %}
     </div>
+    {% endif %}
 
     <!-- Personal Calendars -->
     <div class="mb-8 bg-white shadow rounded-lg">

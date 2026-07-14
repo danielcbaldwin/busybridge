@@ -189,6 +189,7 @@ async def dashboard(request: Request, error: Optional[str] = None):
         "user_paused": user_paused,
         "integrity": integrity,
         "error": error,
+        "main_virtual": getattr(get_settings(), "main_virtual", False),
     })
 
 
@@ -246,6 +247,7 @@ async def settings_page(request: Request):
     return templates.TemplateResponse(request, "settings.html", context={
         "user": user,
         "calendars": calendars,
+        "main_virtual": getattr(get_settings(), "main_virtual", False),
     })
 
 

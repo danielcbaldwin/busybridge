@@ -28,6 +28,8 @@ services:
       - TEST_MODE=${TEST_MODE:-false}
       - TEST_MODE_ALLOWED_HOME_EMAILS=${TEST_MODE_ALLOWED_HOME_EMAILS:-}
       - TEST_MODE_ALLOWED_CLIENT_EMAILS=${TEST_MODE_ALLOWED_CLIENT_EMAILS:-}
+      # Ghost Main: run without a real Google main calendar (SQLite ledger only).
+      - MAIN_VIRTUAL=${MAIN_VIRTUAL:-false}
       - MANAGED_EVENT_PREFIX=${MANAGED_EVENT_PREFIX:-[BusyBridge]}
       # Phase-1 organizer-delete propagation: off (default) | shadow | on.
       # See DELETE_PROPAGATION_PLAN.md.
