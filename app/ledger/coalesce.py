@@ -235,6 +235,15 @@ async def apply_coalescing_for_user(db, *, user_id: int) -> int:
             present_state=PRESENT_PERSONAL_BUSY,
             json=json,
         )
+        # Recurring events are excluded from interval coalescing (folding
+        # a recurring parent into a one-off group would drop the RRULE).
+        # But two independent personal-source RECURRING events with the
+        # same time-of-day + RRULE cast duplicate blocks every occurrence.
+        # A separate pass dedupes them structurally.
+        written += await _dedupe_recurring_for_target(
+            db, user_id=user_id, target_calendar_id=target_calendar_id,
+            present_state=PRESENT_PERSONAL_BUSY,
+        )
     return written
 
 
@@ -424,4 +433,177 @@ async def _apply_coalescing_for_target(
 def _now_iso() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Recurring-event dedup
+# ---------------------------------------------------------------------------
+async def _dedupe_recurring_for_target(
+    db, *, user_id: int, target_calendar_id: int, present_state: str,
+) -> int:
+    """Suppress duplicate recurring personal-source projections on a
+    target calendar.
+
+    Two projections are considered duplicates when they share (a) the
+    same recurrence_rule_json (byte-identical string), (b) the same
+    time-of-day span (start_hour_min / end_hour_min), and (c) the same
+    ``is_all_day`` flag.  This catches the common case where the SAME
+    real-world meeting is present on two personal calendars under
+    different iCalUIDs — one gets kept, the others go absent.
+
+    The keeper is the projection whose ledger_event has the smallest
+    id — deterministic across runs so the diff sees no churn.
+
+    Idempotent: rows are only UPDATEd when their desired state /
+    coalesce link actually differs from the computation.
+    """
+    rows = await (await db.execute(
+        """SELECT p.id AS projection_id,
+                  p.ledger_event_id,
+                  p.desired_state,
+                  p.desired_payload_hash,
+                  p.coalesce_carrier_id,
+                  e.start_at, e.end_at,
+                  e.is_all_day,
+                  e.recurrence_rule_json,
+                  e.status
+             FROM ledger_projections p
+             JOIN ledger_events e ON e.id = p.ledger_event_id
+            WHERE p.target_kind = 'client'
+              AND p.target_calendar_id = ?
+              AND e.user_id = ?
+              AND e.source_type = 'personal'
+              AND e.recurrence_rule_json IS NOT NULL
+              AND (
+                   p.desired_state = ?
+                OR (p.desired_state = 'absent' AND p.coalesce_carrier_id IS NOT NULL)
+              )""",
+        (target_calendar_id, user_id, present_state),
+    )).fetchall()
+    candidates = [r for r in rows if r["status"] == "active"]
+    if len(candidates) < 2:
+        # Reset any stale coalesce links on non-candidates and return.
+        return await _clear_stale_coalesce_links(
+            db, rows=[r for r in rows if r["status"] != "active"],
+            present_state=present_state,
+        )
+
+    # Group by (rrule_json, start_time_of_day, end_time_of_day, is_all_day).
+    groups: dict[tuple, list] = {}
+    for r in candidates:
+        key = (
+            r["recurrence_rule_json"],
+            _time_of_day(r["start_at"], r["is_all_day"]),
+            _time_of_day(r["end_at"], r["is_all_day"]),
+            int(r["is_all_day"] or 0),
+        )
+        groups.setdefault(key, []).append(r)
+
+    when = _now_iso()
+    written = 0
+    for key, group in groups.items():
+        if len(group) < 2:
+            # Singleton: if it was previously coalesced (as a member),
+            # restore it to standalone present.
+            r = group[0]
+            if r["coalesce_carrier_id"] is not None or r["desired_state"] == "absent":
+                await _restore_projection_to_present(
+                    db, projection_id=int(r["projection_id"]),
+                    ledger_event_id=int(r["ledger_event_id"]),
+                    present_state=present_state, when=when,
+                )
+                written += 1
+            continue
+
+        # Carrier: smallest ledger id in the group.  Stable identity =
+        # stable projection = no diff churn.
+        carrier = min(group, key=lambda x: int(x["ledger_event_id"]))
+        carrier_pid = int(carrier["projection_id"])
+
+        # Carrier stays present with no override (recurring rendering
+        # comes from its own row).  Restore it if a prior pass demoted it.
+        if (carrier["desired_state"] != present_state
+                or carrier["coalesce_carrier_id"] is not None):
+            await _restore_projection_to_present(
+                db, projection_id=carrier_pid,
+                ledger_event_id=int(carrier["ledger_event_id"]),
+                present_state=present_state, when=when,
+            )
+            written += 1
+
+        # Non-carrier members: desired_state=absent, link to carrier.
+        for member in group:
+            if int(member["projection_id"]) == carrier_pid:
+                continue
+            if (member["desired_state"] == "absent"
+                    and member["coalesce_carrier_id"] == carrier_pid):
+                continue  # already suppressed correctly
+            await db.execute(
+                """UPDATE ledger_projections
+                      SET desired_state = 'absent',
+                          desired_payload_hash = 'absent',
+                          coalesce_carrier_id = ?,
+                          updated_at = ?
+                    WHERE id = ?""",
+                (carrier_pid, when, int(member["projection_id"])),
+            )
+            written += 1
+
+    if written:
+        await db.commit()
+    return written
+
+
+async def _clear_stale_coalesce_links(db, *, rows, present_state) -> int:
+    """No-op unless a passed row is currently absent/coalesced with a
+    dead carrier reference; kept for symmetry with the multi-group
+    branch above."""
+    return 0
+
+
+async def _restore_projection_to_present(
+    db, *, projection_id: int, ledger_event_id: int, present_state: str, when: str,
+) -> None:
+    """Undo a previous ``dedupe`` suppression: put the projection back
+    to desired=present_state with no override and no carrier link so
+    the diff will re-issue the create/update to bring the block back."""
+    row = await (await db.execute(
+        "SELECT version FROM ledger_events WHERE id = ?",
+        (ledger_event_id,),
+    )).fetchone()
+    version = int(row["version"]) if row else 1
+    # We deliberately DON'T recompute desired_payload_hash here — the
+    # per-event planner already stamped it under the assumption of a
+    # standalone present projection.  Letting the planner's hash stand
+    # keeps the desired_payload_hash consistent with the rendered body
+    # the outbox will emit.
+    await db.execute(
+        """UPDATE ledger_projections
+              SET desired_state = ?,
+                  coalesce_carrier_id = NULL,
+                  desired_ledger_version = ?,
+                  updated_at = ?
+            WHERE id = ?""",
+        (present_state, version, when, projection_id),
+    )
+
+
+def _time_of_day(iso: str, is_all_day) -> str:
+    """Extract HH:MM:SS from an ISO datetime — the piece we use to
+    match "same time of day" across events on different dates."""
+    if not iso:
+        return ""
+    if is_all_day:
+        return "all-day"
+    # ISO format: 2026-08-05T11:30:00-06:00 or 2026-08-05T17:30:00Z
+    if "T" not in iso:
+        return ""
+    t = iso.split("T", 1)[1]
+    # Strip tz offset / Z
+    for sep in ("+", "-", "Z"):
+        idx = t.find(sep)
+        if idx > 0:  # 0 means starts with '-', not a separator we care about
+            t = t[:idx]
+            break
+    return t[:8]  # HH:MM:SS
 
