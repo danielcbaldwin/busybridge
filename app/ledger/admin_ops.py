@@ -413,6 +413,51 @@ async def full_resync(
     await db.commit()
 
 
+async def replan_all_active_events(
+    db: aiosqlite.Connection,
+    *,
+    user_id: int,
+) -> int:
+    """Queue every active source event for a fresh planner pass.
+
+    The planner emits projections against the CURRENT set of active
+    client-target calendars; when a new client calendar becomes active
+    (a user connects a second bidi work calendar mid-life), previously-
+    ingested events still hold their old projection set — no targets
+    for the new calendar, no busy blocks written to it.  ``full_resync``
+    doesn't fix this: it clears sync tokens, so ingest RE-FETCHES, but
+    ingest short-circuits on unchanged content — the planner is not
+    called and no new projections get created.
+
+    Enqueueing every active event into ``affected_ledger_events``
+    forces the reconciler's plan step to run each one against the
+    current target set, adding projections for the new calendar (and
+    dropping any that reference a since-disconnected one).
+
+    Returns the number of events queued.  Idempotent — enqueueing an
+    event already in the queue is a cheap no-op (the reconciler
+    dedupes).  Callers still need to trigger a reconcile after; the
+    connect flow already does this via ``enqueue_manual``.
+    """
+    rows = await (await db.execute(
+        """SELECT id FROM ledger_events
+            WHERE user_id = ?
+              AND status = 'active'
+              AND user_intentionally_deleted = 0""",
+        (user_id,),
+    )).fetchall()
+    if not rows:
+        return 0
+    now = datetime.now(UTC).isoformat()
+    for r in rows:
+        await db.execute(
+            "INSERT INTO affected_ledger_events (user_id, ledger_event_id, enqueued_at) VALUES (?, ?, ?)",
+            (user_id, int(r["id"]), now),
+        )
+    await db.commit()
+    return len(rows)
+
+
 async def resume_sync(
     db: aiosqlite.Connection, *, user_id: int,
 ) -> None:

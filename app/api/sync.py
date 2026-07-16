@@ -190,9 +190,18 @@ async def get_sync_log(
 # ---------------------------------------------------------------------------
 @router.post("/full")
 async def trigger_full_resync(user: User = Depends(get_current_user)):
-    """Wipe sync tokens and enqueue a manual reconcile."""
+    """Wipe sync tokens, replan every active event against the current
+    target set, and enqueue a manual reconcile.
+
+    The replan step matters when a user has connected/disconnected a
+    calendar since events were last planned: without it, previously-
+    ingested unchanged events keep their old projection set (targets
+    don't include a newly-connected calendar; still include a
+    disconnected one).  See admin_ops.replan_all_active_events.
+    """
     db = await get_database()
     await admin_ops.full_resync(db, user_id=user.id)
+    await admin_ops.replan_all_active_events(db, user_id=user.id)
     await enqueue_manual(db, user_id=user.id, source_hint="all")
     await db.execute(
         """INSERT INTO sync_log (user_id, action, status, details)

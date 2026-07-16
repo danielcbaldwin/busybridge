@@ -229,6 +229,27 @@ async def connect_client_calendar(
         db, user_id=user.id, source_hint=f"client:{calendar_id}",
     )
 
+    # Replan every existing active event against the CURRENT
+    # active-client-calendars set so the just-connected calendar
+    # receives busy-block projections from events already ingested.
+    # Without this, only NEW events after the connect would target
+    # this calendar; previously-ingested events keep their old
+    # projection set and cast nothing here.
+    from app.ledger import admin_ops as _admin
+    try:
+        queued = await _admin.replan_all_active_events(db, user_id=user.id)
+        logger.info(
+            "replanned %d active events for user %s after connecting client_calendar_id=%s",
+            queued, user.id, calendar_id,
+        )
+    except Exception as e:
+        # Non-fatal: initial sync will still ingest new events; the
+        # user can always click Full re-sync to force a replan later.
+        logger.warning(
+            "replan_all_active_events failed for user %s: %s (connect still succeeded)",
+            user.id, e,
+        )
+
     # Register a Google push channel for the new calendar so it gets
     # real-time webhook sync without waiting for a server restart.
     from app.jobs.webhook_renewal import schedule_webhook_registration
