@@ -30,6 +30,14 @@ services:
       - TEST_MODE_ALLOWED_CLIENT_EMAILS=${TEST_MODE_ALLOWED_CLIENT_EMAILS:-}
       # Ghost Main: run without a real Google main calendar (SQLite ledger only).
       - MAIN_VIRTUAL=${MAIN_VIRTUAL:-false}
+      # When True, Google eventType='outOfOffice' events are mirrored as
+      # normal busy blocks.  Default False: OOO is a per-calendar status
+      # signal and shouldn't block peer calendars.
+      - SYNC_OUT_OF_OFFICE_EVENTS=${SYNC_OUT_OF_OFFICE_EVENTS:-false}
+      # Per-event opt-out substring.  Any event whose description
+      # contains this string (case-insensitive) is skipped at ingest.
+      # Empty string disables the check.
+      - SKIP_EVENT_DESCRIPTION_TAG=${SKIP_EVENT_DESCRIPTION_TAG:-[nosync]}
       - MANAGED_EVENT_PREFIX=${MANAGED_EVENT_PREFIX:-[BusyBridge]}
       # Busy-block titles (rendered on placeholder events on peer calendars).
       # Change either to override the default label; setting them to the

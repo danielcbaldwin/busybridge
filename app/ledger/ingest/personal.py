@@ -195,6 +195,25 @@ async def _ingest_one(
     event_id = event["id"]
     status = event.get("status", "confirmed")
 
+    # Out-of-office events (Google eventType='outOfOffice') are a
+    # status signal on ONE calendar and must not fan out as busy on
+    # peers — a user OOO from Work A may still be working out of Work B.
+    # Toggle via ``SYNC_OUT_OF_OFFICE_EVENTS``.
+    if event.get("eventType") == "outOfOffice":
+        from app.config import get_settings as _gs
+        if not getattr(_gs(), "sync_out_of_office_events", False):
+            return "skipped", None
+
+    # Per-event opt-out: a user-controllable marker in the event
+    # description (default '[nosync]') suppresses the event across
+    # every peer calendar without touching Google's availability flag.
+    from app.config import get_settings as _gs
+    _tag = (getattr(_gs(), "skip_event_description_tag", "") or "").strip()
+    if _tag:
+        _desc = event.get("description") or ""
+        if _tag.lower() in _desc.lower():
+            return "skipped", None
+
     if is_managed_google_event_id(event_id):
         return "skipped", None
     proj_match = await (await db.execute(

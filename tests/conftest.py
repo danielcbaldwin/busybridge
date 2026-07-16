@@ -23,6 +23,12 @@ os.environ["TEST_MODE_ALLOWED_HOME_EMAILS"] = ""
 os.environ["TEST_MODE_ALLOWED_CLIENT_EMAILS"] = ""
 os.environ["BUSY_BLOCK_TITLE"] = "Busy"
 os.environ["PERSONAL_BUSY_BLOCK_TITLE"] = "Busy (personal)"
+os.environ["MANAGED_EVENT_PREFIX"] = "[BusyBridge]"
+os.environ["SYNC_OUT_OF_OFFICE_EVENTS"] = "false"
+# Empty tag disables the description-based skip so pre-existing tests
+# that put text in event descriptions (e.g. "[BusyBridge]") don't
+# accidentally get filtered by the default tag value.
+os.environ["SKIP_EVENT_DESCRIPTION_TAG"] = ""
 
 
 @pytest.fixture(scope="session")

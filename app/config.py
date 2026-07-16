@@ -67,6 +67,26 @@ class Settings(BaseSettings):
     # clients).
     sync_personal_all_day_events: bool = False
 
+    # Out-of-office events (Google eventType='outOfOffice').  Default
+    # False: skip these entirely at ingest so they never cast busy
+    # blocks on peer calendars.  Rationale: OOO on one calendar is a
+    # status signal, not a hard-busy signal — a user OOO from Work A
+    # may still be actively working out of Work B and needs to remain
+    # visibly available there.  Set True to restore the legacy
+    # behavior (OOO events mirrored as normal busy blocks).
+    sync_out_of_office_events: bool = False
+
+    # Per-event opt-out marker.  Any event whose description CONTAINS
+    # this substring (case-insensitive) is skipped at ingest so it
+    # never casts a busy block on peer calendars.  Google's own
+    # ``transparency=transparent`` (Availability: Free) is honoured
+    # regardless and remains the primary "this event doesn't block"
+    # mechanism; this tag is an alternate marker for people who don't
+    # want to use the availability flag (e.g. because their org tracks
+    # it separately) or who want a search-friendly text tag.  Set to
+    # empty string to disable.
+    skip_event_description_tag: str = "[nosync]"
+
     # Ghost Main: the "main" calendar is purely virtual (SQLite-only).
     # The internal ledger still records everything, but no Google Calendar
     # is designated as main and no writes flow to a main calendar.  Use
