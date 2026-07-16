@@ -34,6 +34,10 @@ def _personal_ledger(*, is_all_day: bool):
         "source_type": "personal",
         "show_as": "busy",
         "is_all_day": 1 if is_all_day else 0,
+        # Ghost-Main fork: the personal-source branch of the planner
+        # honours declined-frees-slot too, so the fixture needs a
+        # rsvp field (None = "no explicit response").
+        "user_rsvp_status": None,
     }
 
 

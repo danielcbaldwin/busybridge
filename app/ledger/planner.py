@@ -385,6 +385,22 @@ def _compute_desired_projections(
         # conveying anything, making the user look unavailable all day.
         if bool(ledger["is_all_day"]) and not sync_personal_all_day:
             return {"main": ABSENT, "peer_clients": ABSENT, "origin_client": ABSENT}
+        # DECLINED-FREES-SLOT: same rule as client sources.  A meeting
+        # the user declined on a personal calendar (Gmail invited to a
+        # work-adjacent event, work calendar connected as a personal
+        # source, family shared calendar, etc.) must not block their
+        # other calendars — matches Google's own free/busy treatment.
+        # Upstream busybridge deliberately excluded personal sources
+        # from this rule, on the theory that personal events represent
+        # the user's own genuine busy time.  The Ghost-Main fork treats
+        # ``personal`` as "any read-only source", including work calendars
+        # from other orgs, where decline semantics still apply.
+        declined = (
+            declined_frees_slot
+            and ledger["user_rsvp_status"] == "declined"
+        )
+        if declined:
+            return {"main": ABSENT, "peer_clients": ABSENT, "origin_client": ABSENT}
         return {
             "main": PRESENT_PERSONAL_BUSY,
             "peer_clients": PRESENT_PERSONAL_BUSY,

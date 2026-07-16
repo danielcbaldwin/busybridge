@@ -385,9 +385,10 @@ async def test_series_decline_frees_the_whole_series():
 
 
 # ---------------------------------------------------------------------------
-# Personal sources are exempt (README: personal always blocks)
+# Personal-source declined RSVPs also free the slot (Ghost-Main fork
+# behaviour — upstream busybridge kept personal always-blocks).
 # ---------------------------------------------------------------------------
-async def test_personal_event_with_declined_rsvp_still_blocks():
+async def test_personal_event_with_declined_rsvp_frees_slot():
     async with scenario() as s:
         s.given_calendar("main")
         s.given_calendar("client_a")
@@ -411,9 +412,9 @@ async def test_personal_event_with_declined_rsvp_still_blocks():
         })
         await s.run_reconciler_until_quiescent("alice", max_passes=5)
 
-        # Personal always blocks, declined or not.
-        s.assert_event_exists("main", summary="Busy (personal)")
-        s.assert_event_exists("client_a", summary="Busy (personal)")
+        # Declined personal-source event: no busy block anywhere.
+        s.assert_no_event_with_summary("main", "Busy (personal)")
+        s.assert_no_event_with_summary("client_a", "Busy (personal)")
 
 
 # ---------------------------------------------------------------------------
