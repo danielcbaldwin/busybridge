@@ -292,6 +292,53 @@ async def _audit_user_once(user_id: int) -> dict:
     )
 
 
+async def observe_user_by_id(user_id: int) -> dict:
+    """Run one observation-audit pass for a user, under the per-user lock.
+
+    The observation audit (``observe.observe_user``) reads a sample of
+    converged projections BACK from Google and verifies the applied
+    stamps against reality — the trust-but-verify backstop for writes
+    that recorded success without delivering (404-as-success deletes,
+    wrong derived instance ids, copies Google lost).  Shares the
+    per-user reconcile lock so it never interleaves with a reconcile's
+    ingest/diff/drain.  Skipped during maintenance (a DB restore).
+    """
+    from app.config import get_settings
+    from app.maintenance import in_maintenance, track_reconcile
+    if in_maintenance():
+        return {"skipped": "maintenance"}
+    with track_reconcile():
+        async with _user_lock(user_id):
+            return await _observe_user_once(
+                user_id,
+                sample_size=get_settings().observation_audit_sample_size,
+            )
+
+
+async def _observe_user_once(user_id: int, *, sample_size: int) -> dict:
+    """Load this user's calendars + tokens, build a router, run one
+    observation pass.  Always invoked under the per-user lock."""
+    from app.ledger.observe import observe_user
+
+    db = await get_database()
+    user = await _load_user(db, user_id)
+    if user is None or user["main_calendar_id"] is None:
+        return {"skipped": "no_main_calendar"}
+    access = await build_user_google_access(db, user_id)
+    if access is None:
+        return {"skipped": "no_home_oauth_token"}
+    return await observe_user(
+        db, access["router"],
+        user_id=user_id,
+        main_google_calendar_id=user["main_calendar_id"],
+        google_calendar_id_for={
+            int(c["id"]): c["google_calendar_id"]
+            for c in access["all_known"]
+        },
+        sample_size=sample_size,
+    )
+
+
 async def _alert_if_token_revoked(
     user_id: int, email: str, exc: Exception,
 ) -> bool:

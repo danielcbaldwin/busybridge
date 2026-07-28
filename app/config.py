@@ -135,6 +135,19 @@ class Settings(BaseSettings):
     # the create-then-rename race).  Cheap (a few list calls/run), so it
     # runs every 10 minutes by default.
     content_audit_minutes: int = 10
+    # Observation audit (app/ledger/observe.py): how often to read a
+    # sample of converged projections BACK from Google and verify the
+    # applied_* stamps against reality (existence, status, etag),
+    # marking divergent rows for re-assertion.  This is the backstop
+    # for every "bookkeeping says converged but Google disagrees"
+    # class (404-as-success deletes, lost copies, wrong derived
+    # instance ids).  <= 0 disables the job.
+    observation_audit_minutes: int = 10
+    # Converged projections verified per user per observation-audit
+    # cycle.  At the defaults (100 every 10 minutes ≈ 0.17 GET/s) a
+    # 20k-projection user is fully swept in ~1.4 days; the calls share
+    # the process-wide Google rate limiter.
+    observation_audit_sample_size: int = 100
     token_refresh_minutes: int = 30
     alert_process_minutes: int = 1
 

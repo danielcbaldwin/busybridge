@@ -668,6 +668,10 @@ async def _ingest_managed_recurring_instance(
             source_calendar_id=parent["source_calendar_id"],
             source_event_id=source_event_id,
         )
+        if ledger_id is not None:
+            await _record_observed_main_instance_id(
+                db, ledger_event_id=ledger_id, observed_id=event.get("id"),
+            )
         return outcome, ledger_id
 
     # Move / edit.  The dragged copy is opaque about edit-rights: its
@@ -804,6 +808,10 @@ async def _ingest_managed_recurring_instance(
         source_event_id=source_event_id,
         fields=fields,
     )
+    if ledger_id is not None:
+        await _record_observed_main_instance_id(
+            db, ledger_event_id=ledger_id, observed_id=event.get("id"),
+        )
 
     # Disallowed drift on an EXISTING row stores values identical to
     # the baseline — a content-identical replan the planner now skips
@@ -1169,6 +1177,46 @@ async def _maybe_arm_organizer_source_delete(
             "deleted on main); set DELETE_PROPAGATION_MODE=on to enable.",
             ledger_event_id,
         )
+
+
+async def _record_observed_main_instance_id(
+    db: aiosqlite.Connection, *, ledger_event_id: int, observed_id: Optional[str],
+) -> None:
+    """Record the OBSERVED Google id of a managed main-copy exception on
+    the instance row's main projection.
+
+    The event Google just delivered carries the exception's real id;
+    the projection may hold a *derived* one
+    (``identity.derive_instance_google_event_id``), which is computed
+    and never confirmed — the residual wrong-derived-id class (every
+    UPDATE 404s into a replan loop; every DELETE false-succeeds).
+    Observation is truth, derivation stays the fallback: the diff only
+    derives when ``google_event_id`` is NULL, so a recorded id wins.
+
+    A projection that claimed convergence against a DIFFERENT id never
+    delivered to the real exception — null its applied version (the
+    explicit unconverge signal) so the diff re-asserts there.  A
+    NULL stored id (an outbox 404 reset awaiting re-derivation) is
+    also recorded over: that is precisely the state whose re-derived
+    id would repeat the 404.  The healthy case (observed == stored,
+    the overwhelming majority) is a no-op.  Update-only: a brand-new
+    instance row has no projections yet (the planner creates them
+    later), and those diverge on their own.
+    """
+    if not observed_id:
+        return
+    await db.execute(
+        """UPDATE ledger_projections
+              SET google_event_id = ?,
+                  google_etag = NULL,
+                  applied_ledger_version = CASE
+                      WHEN applied_ledger_version IS NOT NULL THEN NULL
+                      ELSE applied_ledger_version END
+            WHERE ledger_event_id = ?
+              AND target_kind = 'main'
+              AND COALESCE(google_event_id, '') != ?""",
+        (observed_id, int(ledger_event_id), observed_id),
+    )
 
 
 async def _mark_main_drift_reverted(
