@@ -187,7 +187,21 @@ async def diff_and_enqueue_for_user(
             )
             # Pre-set google_event_id on the instance projection so
             # the outbox's update/delete code path can find it.
-            if not proj["google_event_id"]:
+            #
+            # Re-stamped whenever it disagrees with the derivation, not
+            # only when NULL.  A parent series whose deterministic id was
+            # burned by a cancelled tombstone comes back under a fresh id
+            # (``google_id_generation``), and instance rows planned before
+            # that bump still carry the DEAD parent's prefix: every UPDATE
+            # 404s and every DELETE is a 404-treated-as-success, so the
+            # occurrence override is never actually written.
+            # ``outbox._invalidate_instances_on_parent_id_change`` clears
+            # these ids at the moment of the bump, but rows stranded by an
+            # earlier build still hold one — repointing here heals them as
+            # soon as anything re-diverges them.  It cannot leak the old
+            # event: burning a parent id means the whole previous series
+            # was cancelled, taking its instance overrides with it.
+            if proj["google_event_id"] != derived:
                 await db.execute(
                     """UPDATE ledger_projections
                           SET google_event_id = ?

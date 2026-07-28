@@ -46,7 +46,10 @@ import aiosqlite
 from app.config import get_settings
 from app.ledger.async_google import as_async_google
 from app.ledger.google_client import GoogleClient
-from app.ledger.identity import derive_google_event_id
+from app.ledger.identity import (
+    derive_google_event_id,
+    derive_instance_google_event_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1046,6 +1049,9 @@ async def _record_success(
     now: datetime,
 ) -> None:
     when = now.isoformat()
+    await _invalidate_instances_on_parent_id_change(
+        db, op, new_google_event_id=google_event_id, now=now,
+    )
     await db.execute(
         """UPDATE ledger_projections
               SET current_state = 'present',
@@ -1074,6 +1080,125 @@ async def _record_success(
         (STATUS_DONE, when, op["id"]),
     )
     await db.commit()
+
+
+async def _invalidate_instances_on_parent_id_change(
+    db: aiosqlite.Connection,
+    op: aiosqlite.Row,
+    *,
+    new_google_event_id: str,
+    now: datetime,
+) -> None:
+    """Repoint a recurring parent's instance projections at the id the
+    parent series actually landed on.
+
+    ``_do_create`` burns a deterministic id whenever it collides with a
+    cancelled tombstone (the user deleted our managed copy, so Google
+    keeps the id reserved) and retries under a bumped
+    ``google_id_generation``.  A mirrored series therefore legitimately
+    changes Google id over its lifetime.  Instance projections address
+    their occurrence as ``<parent_google_event_id>_<stamp>``, and nothing
+    used to tell them the prefix had moved:
+
+    * A *present* occurrence override kept pointing at the burned
+      parent's stamp, so every subsequent UPDATE 404s.
+    * A *cancelled* occurrence was worse.  Its projection is
+      ``desired_state='absent'`` and quiescent — ``applied`` equals
+      ``desired`` — so the diff never re-selects it.  The recreated
+      series carries the source RRULE verbatim (no EXDATE), Google
+      expands the very occurrence the source had cancelled, and the
+      resulting busy block is owned by nobody: no reconcile, drain,
+      drift-revert or content-audit pass revisits it (the audit is
+      source-side and skips cancelled rows).
+
+    Live regression: a personal-source "Bi-Weekly All-Hands" series
+    reached ``google_id_generation = 3``; its cancelled 2026-07-28
+    occurrence stayed converged with a cleared ``google_event_id`` while
+    the recreated series cast a permanent 2pm "Busy" block on a client
+    calendar.
+
+    Keyed off the DERIVED id per instance rather than off the parent's
+    previous ``google_event_id``: the drift path that notices our copy
+    was deleted clears the parent's id *before* the recreate, so an
+    old-vs-new comparison sees NULL and misses the very case this exists
+    for.  Deriving is also self-correcting for rows stranded by an
+    earlier build.
+
+    The new id is *stamped* (not cleared): ``diff._decide`` treats an
+    absent projection with no ``google_event_id`` as "nothing to delete"
+    and would converge it again.  ``current_state`` becomes ``unknown``
+    because what we knew about the old id says nothing about the new
+    series.  Scoped to the SAME target as the parent — a sibling
+    calendar's copy has its own, unaffected id.  Instances whose derived
+    id is already correct are left completely alone, so a routine
+    same-id update never churns occurrence overrides.
+    """
+    # Deliberately not _get_projection: that raises when the row is
+    # gone, and this runs AFTER the Google write has landed — a
+    # vanished projection (cascade delete mid-drain) must not turn a
+    # successful write into a drain error.
+    proj = await (await db.execute(
+        """SELECT id, ledger_event_id, target_kind, target_calendar_id
+             FROM ledger_projections WHERE id = ?""",
+        (int(op["projection_id"]),),
+    )).fetchone()
+    if proj is None or not new_google_event_id:
+        return
+    parent = await (await db.execute(
+        """SELECT canonical_uid, user_id, parent_canonical_uid,
+                  recurrence_rule_json
+             FROM ledger_events WHERE id = ?""",
+        (int(proj["ledger_event_id"]),),
+    )).fetchone()
+    # Only a recurring series MASTER has instance overrides hanging off it.
+    if parent is None or parent["parent_canonical_uid"]:
+        return
+    if not parent["recurrence_rule_json"]:
+        return
+    instances = await (await db.execute(
+        """SELECT p.id, p.google_event_id,
+                  e.recurrence_instance_original_start, e.is_all_day
+             FROM ledger_projections p
+             JOIN ledger_events e ON e.id = p.ledger_event_id
+            WHERE p.target_kind = ?
+              AND COALESCE(p.target_calendar_id, -1) = COALESCE(?, -1)
+              AND e.user_id = ?
+              AND e.parent_canonical_uid = ?""",
+        (
+            proj["target_kind"], proj["target_calendar_id"],
+            int(parent["user_id"]), parent["canonical_uid"],
+        ),
+    )).fetchall()
+    repointed = 0
+    for inst in instances:
+        derived = derive_instance_google_event_id(
+            new_google_event_id,
+            inst["recurrence_instance_original_start"] or "",
+            is_all_day=bool(inst["is_all_day"]),
+        )
+        if inst["google_event_id"] == derived:
+            continue
+        await db.execute(
+            """UPDATE ledger_projections
+                  SET google_event_id = ?,
+                      google_etag = NULL,
+                      current_state = 'unknown',
+                      applied_ledger_version = NULL,
+                      applied_payload_hash = NULL,
+                      next_attempt_at = NULL,
+                      updated_at = ?
+                WHERE id = ?""",
+            (derived, now.isoformat(), int(inst["id"])),
+        )
+        repointed += 1
+    if repointed:
+        logger.info(
+            "outbox: parent projection %s landed on google_event_id %s — "
+            "repointed and re-diverged %s instance projection(s) on the same "
+            "target so their occurrence overrides are re-asserted against the "
+            "new series",
+            int(proj["id"]), new_google_event_id, repointed,
+        )
 
 
 async def _record_absent(
