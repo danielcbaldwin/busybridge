@@ -190,18 +190,29 @@ async def diff_and_enqueue_for_user(
             #
             # Re-stamped whenever it disagrees with the derivation, not
             # only when NULL.  A parent series whose deterministic id was
-            # burned by a cancelled tombstone comes back under a fresh id
-            # (``google_id_generation``), and instance rows planned before
-            # that bump still carry the DEAD parent's prefix: every UPDATE
-            # 404s and every DELETE is a 404-treated-as-success, so the
-            # occurrence override is never actually written.
-            # ``outbox._invalidate_instances_on_parent_id_change`` clears
-            # these ids at the moment of the bump, but rows stranded by an
-            # earlier build still hold one — repointing here heals them as
-            # soon as anything re-diverges them.  It cannot leak the old
-            # event: burning a parent id means the whole previous series
-            # was cancelled, taking its instance overrides with it.
-            if proj["google_event_id"] != derived:
+            # DERIVE ONLY WHEN NULL — never re-derive over a stored id.
+            #
+            # ``observe._reconcile_observed_instance`` records the id
+            # ``events.instances`` actually returns for an occurrence, which
+            # is the only *confirmed* value in the system; derivation is a
+            # guess that has been wrong (see the all-day/timed stamp history
+            # in ``identity.derive_instance_google_event_id``, and the
+            # degenerate ``parent_Z`` fallback for an empty original-start).
+            # The observation audit's "observation beats derivation" contract
+            # rests on this branch staying NULL-only: a mismatch check here
+            # overwrites the observed id with the guess, the write lands on
+            # the wrong occurrence, the next audit sweep corrects it again —
+            # one wasted write per sweep, forever.  Verified by hand against
+            # the merged tree; the suite CANNOT catch it, because the fake
+            # builds instance ids with this same function, so observed and
+            # derived never disagree in tests.
+            #
+            # A parent whose id was burned and regenerated is handled at the
+            # authoritative moment instead — ``outbox.
+            # _invalidate_instances_on_parent_id_change`` re-stamps its
+            # instances when Google tells us the new parent id — so nothing
+            # is lost by keeping this conservative.
+            if not proj["google_event_id"]:
                 await db.execute(
                     """UPDATE ledger_projections
                           SET google_event_id = ?
