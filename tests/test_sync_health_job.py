@@ -25,6 +25,9 @@ async def test_run_sync_health_checks_calls_breaker_and_calendar_alerts(
     async def fake_release_job_lock(name, owner):
         calls.append(f"release:{name}:{owner}")
 
+    async def fake_probe_circuit_breaker_pauses():
+        calls.append("probe")
+
     async def fake_check_circuit_breaker():
         calls.append("breaker")
 
@@ -34,6 +37,10 @@ async def test_run_sync_health_checks_calls_breaker_and_calendar_alerts(
     monkeypatch.setattr(sync_job, "get_setting", fake_get_setting)
     monkeypatch.setattr(sync_job, "acquire_job_lock", fake_acquire_job_lock)
     monkeypatch.setattr(sync_job, "release_job_lock", fake_release_job_lock)
+    monkeypatch.setattr(
+        sync_job, "_probe_circuit_breaker_pauses",
+        fake_probe_circuit_breaker_pauses,
+    )
     monkeypatch.setattr(
         sync_job, "_check_circuit_breaker", fake_check_circuit_breaker,
     )
@@ -45,6 +52,7 @@ async def test_run_sync_health_checks_calls_breaker_and_calendar_alerts(
 
     assert calls == [
         "lock:sync_health_checks",
+        "probe",
         "breaker",
         "alerts",
         "release:sync_health_checks:owner-token",

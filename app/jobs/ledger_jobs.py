@@ -41,10 +41,19 @@ async def ledger_drain_due() -> None:
         logger.exception("ledger_drain_due crashed: %s", e)
         return
     if out:
-        succeeded = sum(1 for v in out.values() if not isinstance(v, dict) or "error" not in v)
-        logger.info(
-            "ledger drain processed %d users (%d succeeded, %d failed)",
-            len(out), succeeded, len(out) - succeeded,
+        failed = sum(1 for v in out.values() if isinstance(v, dict) and "error" in v)
+        # A pass whose ingest failed still "succeeds" as a pass, but
+        # nothing new was read from Google — count it separately so an
+        # outage doesn't log as a run of clean successes.
+        degraded = sum(
+            1 for v in out.values()
+            if isinstance(v, dict) and "error" not in v and v.get("ingest_errors")
+        )
+        logger.log(
+            logging.WARNING if (failed or degraded) else logging.INFO,
+            "ledger drain processed %d users (%d succeeded, %d with ingest "
+            "errors, %d failed)",
+            len(out), len(out) - failed - degraded, degraded, failed,
         )
 
 

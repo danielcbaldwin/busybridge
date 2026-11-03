@@ -212,8 +212,11 @@ async def cleanup_and_pause(
         (when, user_id),
     )
     await db.execute(
-        "UPDATE users SET sync_paused = 1 WHERE id = ?",
-        (user_id,),
+        """UPDATE users
+              SET sync_paused = 1, sync_pause_reason = 'cleanup',
+                  sync_paused_at = ?
+            WHERE id = ?""",
+        (when, user_id),
     )
     affected = await (await db.execute(
         "SELECT id FROM ledger_events WHERE user_id = ?",
@@ -459,14 +462,35 @@ async def replan_all_active_events(
 
 
 async def resume_sync(
-    db: aiosqlite.Connection, *, user_id: int,
+    db: aiosqlite.Connection,
+    *,
+    user_id: int,
+    now: Optional[datetime] = None,
+    reset_trips: bool = True,
 ) -> None:
-    """Un-pause a previously paused user."""
+    """Un-pause a previously paused user and reconcile right away.
+
+    ``sync_resumed_at`` tells the circuit breaker to ignore failures
+    recorded before this moment, and the immediate reconcile request
+    makes sure fresh ingest results exist before the next health
+    check looks.  ``reset_trips`` is False only for the breaker's own
+    automatic retry, which keeps its backoff growing.
+    """
+    from app.ledger.triggers import enqueue_periodic
+
+    now = now or datetime.now(UTC)
     await db.execute(
-        "UPDATE users SET sync_paused = 0 WHERE id = ?",
-        (user_id,),
+        f"""UPDATE users
+               SET sync_paused = 0,
+                   sync_pause_reason = NULL,
+                   sync_paused_at = NULL,
+                   sync_resumed_at = ?
+                   {", breaker_trips = 0" if reset_trips else ""}
+             WHERE id = ?""",
+        (now.isoformat(), user_id),
     )
     await db.commit()
+    await enqueue_periodic(db, user_id=user_id, now=now)
 
 
 # ---------------------------------------------------------------------------

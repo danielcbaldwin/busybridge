@@ -228,7 +228,7 @@ async def reconcile_user(
                 "client ingest failed user_id=%s client=%s: %s",
                 user_id, cal["id"], e,
             )
-            await _bump_failure(db, client_calendar_id=int(cal["id"]), error=str(e))
+            await _bump_failure(db, client_calendar_id=int(cal["id"]), error=e)
             out["ingest_errors"][f"client:{cal['id']}"] = str(e)
 
     # 1b. Ingest each personal calendar (same Google API surface).
@@ -247,7 +247,7 @@ async def reconcile_user(
                 "personal ingest failed user_id=%s personal=%s: %s",
                 user_id, cal["id"], e,
             )
-            await _bump_failure(db, client_calendar_id=int(cal["id"]), error=str(e))
+            await _bump_failure(db, client_calendar_id=int(cal["id"]), error=e)
             out["ingest_errors"][f"personal:{cal['id']}"] = str(e)
 
     # 1c. Poll each webcal subscription (no Google API; uses the
@@ -286,7 +286,7 @@ async def reconcile_user(
             )
         except Exception as e:
             logger.warning("main ingest failed user_id=%s: %s", user_id, e)
-            await _bump_failure(db, user_id=user_id, error=str(e))
+            await _bump_failure(db, user_id=user_id, error=e)
             out["ingest_errors"]["main"] = str(e)
 
     # 2b. Discovery / orphan scan (caller-controlled cadence).
@@ -672,12 +672,44 @@ async def _discard_dry_run_outbox(
     return preview
 
 
+# HTTP statuses that say "Google is having a moment", not "this
+# calendar is broken".
+_TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def is_transient_ingest_error(error: BaseException) -> bool:
+    """True for a failure an unchanged retry can plausibly fix:
+    transport errors (DNS, refused/reset connections, timeouts),
+    5xx / 408, and quota or rate-limit responses.
+
+    Anything else — 401/403/404, a revoked refresh token, a bug in
+    ingest — is treated as real.  Unknown is NOT transient: the
+    breaker must still catch a calendar that is genuinely dead.
+    """
+    import httplib2
+    from google.auth.exceptions import TransportError
+
+    from app.ledger.outbox import _is_rate_limited
+
+    status = getattr(error, "status", None)
+    if status is not None:
+        return status in _TRANSIENT_HTTP_STATUSES or _is_rate_limited(error)
+    # OSError covers ConnectionError, socket.gaierror and
+    # socket.timeout; httplib2 raises ServerNotFoundError (not an
+    # OSError) when DNS resolution fails, and google-auth wraps a
+    # network failure during token refresh in TransportError.
+    return isinstance(
+        error,
+        (OSError, TimeoutError, httplib2.HttpLib2Error, TransportError),
+    )
+
+
 async def _bump_failure(
     db: aiosqlite.Connection,
     *,
     client_calendar_id: Optional[int] = None,
     user_id: Optional[int] = None,
-    error: str,
+    error: BaseException,
 ) -> None:
     """Record an ingest failure on the matching sync_state row.
 
@@ -685,14 +717,16 @@ async def _bump_failure(
     (main-calendar state) must be supplied.
     """
     when = datetime.now(UTC).isoformat()
+    message = str(error)[:1000]
     if client_calendar_id is not None:
         await db.execute(
             """UPDATE calendar_sync_state
                   SET consecutive_failures = consecutive_failures + 1,
                       last_error = ?,
+                      last_error_transient = ?,
                       last_incremental_sync = ?
                 WHERE client_calendar_id = ?""",
-            (error[:1000], when, client_calendar_id),
+            (message, is_transient_ingest_error(error), when, client_calendar_id),
         )
     elif user_id is not None:
         await db.execute(
@@ -701,7 +735,7 @@ async def _bump_failure(
                       last_error = ?,
                       last_incremental_sync = ?
                 WHERE user_id = ?""",
-            (error[:1000], when, user_id),
+            (message, when, user_id),
         )
     await db.commit()
 

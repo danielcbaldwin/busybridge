@@ -284,6 +284,19 @@ async def init_schema(db: aiosqlite.Connection) -> None:
         # eventless VCALENDAR) from mass-cancelling every busy block it
         # produced.  Constant DEFAULT → O(1) add, no table rewrite.
         "ALTER TABLE webcal_subscriptions ADD COLUMN consecutive_empty_polls INTEGER NOT NULL DEFAULT 0",
+        # Circuit-breaker bookkeeping.  A breaker pause records its
+        # reason so it can self-heal (a manual pause never does), and
+        # ``sync_resumed_at`` scopes the breaker to failures observed
+        # after the last resume — stale counters must not re-trip it.
+        "ALTER TABLE users ADD COLUMN sync_pause_reason TEXT NULL",
+        "ALTER TABLE users ADD COLUMN sync_paused_at TIMESTAMP NULL",
+        "ALTER TABLE users ADD COLUMN sync_resumed_at TIMESTAMP NULL",
+        "ALTER TABLE users ADD COLUMN breaker_trips INTEGER NOT NULL DEFAULT 0",
+        # Whether the most recent ingest failure was a transport /
+        # 5xx / quota error.  Transient failures still count (the UI
+        # and failing-calendar alerts see them) but never trip the
+        # circuit breaker — a DNS blip is not a dead calendar.
+        "ALTER TABLE calendar_sync_state ADD COLUMN last_error_transient BOOLEAN NOT NULL DEFAULT 0",
     ]
     for stmt in migrations:
         try:

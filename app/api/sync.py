@@ -245,7 +245,11 @@ async def pause_my_sync(user: User = Depends(get_current_user)):
     """Pause sync for the current user only."""
     db = await get_database()
     await db.execute(
-        "UPDATE users SET sync_paused = TRUE WHERE id = ?", (user.id,),
+        """UPDATE users
+              SET sync_paused = TRUE, sync_pause_reason = 'user',
+                  sync_paused_at = CURRENT_TIMESTAMP
+            WHERE id = ?""",
+        (user.id,),
     )
     await db.execute(
         """INSERT INTO sync_log (user_id, action, status, details)

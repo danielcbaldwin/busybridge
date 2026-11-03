@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.database import get_database, get_setting
@@ -20,6 +20,17 @@ logger = logging.getLogger(__name__)
 
 # Auto-pause when every active calendar has this many consecutive failures.
 _CIRCUIT_BREAKER_THRESHOLD = 3
+
+# Marks a ``users.sync_paused`` set by the breaker (as opposed to the
+# user or an admin) — only these pauses self-heal.
+CIRCUIT_BREAKER_PAUSE_REASON = "circuit_breaker"
+
+# A breaker pause is lifted for a probe sync after this delay, doubling
+# per consecutive trip up to the cap.  A probe that fails re-trips the
+# breaker on the next health check; one that succeeds resets the
+# failure counters and sync carries on.
+_BREAKER_PROBE_BASE = timedelta(minutes=15)
+_BREAKER_PROBE_MAX = timedelta(hours=6)
 
 
 async def run_periodic_sync() -> None:
@@ -65,6 +76,7 @@ async def run_sync_health_checks() -> None:
 
 
 async def _run_sync_health_checks_unlocked() -> None:
+    await _probe_circuit_breaker_pauses()
     await _check_circuit_breaker()
     await _alert_failing_calendars()
 
@@ -118,7 +130,86 @@ async def _alert_failing_calendars() -> None:
         )
 
 
-async def _check_circuit_breaker() -> None:
+def _breaker_probe_delay(trips: int) -> timedelta:
+    """Backoff before the breaker lets a paused user try again."""
+    delay = _BREAKER_PROBE_BASE * (2 ** max(trips - 1, 0))
+    return min(delay, _BREAKER_PROBE_MAX)
+
+
+def _parse_ts(value) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+async def _probe_circuit_breaker_pauses(now: Optional[datetime] = None) -> None:
+    """Self-heal breaker pauses.
+
+    A breaker pause used to be permanent until someone noticed and
+    clicked resume — a five-minute DNS outage once froze sync for
+    days.  Once the backoff for a user's trip count has elapsed the
+    user is resumed and a reconcile is queued immediately.  If every
+    calendar still fails, the next health check re-trips the breaker
+    (with a longer backoff); if anything succeeds, sync just continues.
+
+    Also forgets the trip count for users whose sync has recovered,
+    and logs a WARNING for every user still held by the breaker so the
+    state is visible in the log rather than only at DEBUG.
+    """
+    now = now or datetime.now(timezone.utc)
+    db = await get_database()
+
+    await db.execute(
+        """UPDATE users SET breaker_trips = 0
+            WHERE breaker_trips > 0
+              AND COALESCE(sync_paused, 0) = 0
+              AND EXISTS (
+                  SELECT 1 FROM client_calendars cc
+                    JOIN calendar_sync_state css
+                      ON css.client_calendar_id = cc.id
+                   WHERE cc.user_id = users.id AND cc.is_active = TRUE
+                     AND COALESCE(css.consecutive_failures, 0) = 0
+              )""",
+    )
+    await db.commit()
+
+    rows = await (await db.execute(
+        """SELECT id, sync_paused_at, breaker_trips FROM users
+            WHERE COALESCE(sync_paused, 0) = 1 AND sync_pause_reason = ?""",
+        (CIRCUIT_BREAKER_PAUSE_REASON,),
+    )).fetchall()
+    for row in rows:
+        user_id = int(row["id"])
+        trips = int(row["breaker_trips"] or 0)
+        paused_at = _parse_ts(row["sync_paused_at"]) or now
+        probe_at = paused_at + _breaker_probe_delay(trips)
+        if now < probe_at:
+            logger.warning(
+                "Circuit breaker: sync for user %d paused since %s "
+                "(trip %d); next automatic retry at %s",
+                user_id, paused_at.isoformat(), trips, probe_at.isoformat(),
+            )
+            continue
+        logger.warning(
+            "Circuit breaker: retrying sync for user %d after %s pause "
+            "(trip %d)",
+            user_id, now - paused_at, trips,
+        )
+        from app.ledger.admin_ops import resume_sync
+        await resume_sync(db, user_id=user_id, now=now, reset_trips=False)
+        await db.execute(
+            """INSERT INTO sync_log (user_id, action, status, details)
+               VALUES (?, 'sync_resume_user', 'success', ?)""",
+            (user_id, f"Circuit breaker automatic retry (trip {trips})"),
+        )
+        await db.commit()
+
+
+async def _check_circuit_breaker(now: Optional[datetime] = None) -> None:
     """Auto-pause an individual user's sync when every one of their
     active sync sources is consistently failing.
 
@@ -133,10 +224,21 @@ async def _check_circuit_breaker() -> None:
     their own ``consecutive_failures`` counter; counting only the
     Google calendars would let a user whose every webcal feed is dead
     (or who has only webcal feeds) slip past the breaker entirely.
+
+    A Google calendar only counts as failing when its latest failure
+    was not transient (see ``is_transient_ingest_error``) and was
+    recorded after the user's last resume — otherwise the stale
+    counters re-trip the breaker before the resumed sync has had a
+    chance to run.
+
+    The pause is tagged ``sync_pause_reason = 'circuit_breaker'`` so
+    :func:`_probe_circuit_breaker_pauses` can lift it later.
     """
+    now = now or datetime.now(timezone.utc)
     db = await get_database()
     cursor = await db.execute(
-        """SELECT DISTINCT u.id AS user_id
+        """SELECT DISTINCT u.id AS user_id, u.sync_resumed_at,
+                  u.breaker_trips
              FROM users u
             WHERE COALESCE(u.sync_paused, 0) = 0
               AND (
@@ -146,17 +248,25 @@ async def _check_circuit_breaker() -> None:
                            WHERE ws.user_id = u.id AND ws.is_active = TRUE)
               )""",
     )
-    user_ids = [row["user_id"] for row in await cursor.fetchall()]
+    users = await cursor.fetchall()
 
-    for user_id in user_ids:
+    for user in users:
+        user_id = int(user["user_id"])
         cal_row = await (await db.execute(
             """SELECT COUNT(*) as total,
                       SUM(CASE WHEN COALESCE(css.consecutive_failures, 0) >= ?
+                                AND COALESCE(css.last_error_transient, 0) = 0
+                                AND (? IS NULL
+                                     OR css.last_incremental_sync > ?)
                                THEN 1 ELSE 0 END) as failing
                FROM client_calendars cc
                LEFT JOIN calendar_sync_state css ON cc.id = css.client_calendar_id
                WHERE cc.user_id = ? AND cc.is_active = TRUE""",
-            (_CIRCUIT_BREAKER_THRESHOLD, user_id),
+            (
+                _CIRCUIT_BREAKER_THRESHOLD,
+                user["sync_resumed_at"], user["sync_resumed_at"],
+                user_id,
+            ),
         )).fetchone()
         webcal_row = await (await db.execute(
             """SELECT COUNT(*) as total,
@@ -170,15 +280,33 @@ async def _check_circuit_breaker() -> None:
         failing = (cal_row["failing"] or 0) + (webcal_row["failing"] or 0)
         if total == 0 or failing < total:
             continue
+        trips = int(user["breaker_trips"] or 0) + 1
         logger.error(
             "Circuit breaker: all %d calendars for user %d have %d+ "
-            "consecutive failures — pausing this user's sync.",
-            total, user_id, _CIRCUIT_BREAKER_THRESHOLD,
+            "consecutive failures — pausing this user's sync (trip %d, "
+            "automatic retry in %s).",
+            total, user_id, _CIRCUIT_BREAKER_THRESHOLD, trips,
+            _breaker_probe_delay(trips),
         )
         await db.execute(
-            "UPDATE users SET sync_paused = 1 WHERE id = ?", (user_id,),
+            """UPDATE users
+                  SET sync_paused = 1,
+                      sync_pause_reason = ?,
+                      sync_paused_at = ?,
+                      breaker_trips = ?
+                WHERE id = ?""",
+            (CIRCUIT_BREAKER_PAUSE_REASON, now.isoformat(), trips, user_id),
+        )
+        await db.execute(
+            """INSERT INTO sync_log (user_id, action, status, details)
+               VALUES (?, 'sync_pause_user', 'success', ?)""",
+            (user_id, f"Circuit breaker tripped (trip {trips})"),
         )
         await db.commit()
+        if trips > 1:
+            # Already alerted on the first trip; a failed automatic
+            # retry is not news.
+            continue
         from app.alerts.email import queue_alert
         await queue_alert(
             alert_type="circuit_breaker",
@@ -187,8 +315,9 @@ async def _check_circuit_breaker() -> None:
                 f"Sync has been automatically paused for your account "
                 f"because all {total} of your connected calendars and "
                 f"feeds have failed {_CIRCUIT_BREAKER_THRESHOLD}+ times "
-                f"in a row. Check your connected accounts and resume sync "
-                f"from the settings page."
+                f"in a row. BusyBridge will retry automatically; check "
+                f"your connected accounts, or resume sync from the "
+                f"settings page."
             ),
         )
         # Do NOT return — pause every affected user, not just the first.

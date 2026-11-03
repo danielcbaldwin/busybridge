@@ -547,6 +547,10 @@ async def _scenario_setup_db(self: Scenario) -> aiosqlite.Connection:
             email TEXT NOT NULL UNIQUE,
             display_name TEXT,
             sync_paused BOOLEAN DEFAULT FALSE,
+            sync_pause_reason TEXT,
+            sync_paused_at TIMESTAMP,
+            sync_resumed_at TIMESTAMP,
+            breaker_trips INTEGER NOT NULL DEFAULT 0,
             main_calendar_id TEXT
         );
         CREATE TABLE settings (
@@ -586,6 +590,7 @@ async def _scenario_setup_db(self: Scenario) -> aiosqlite.Connection:
             last_incremental_sync TIMESTAMP,
             consecutive_failures INTEGER DEFAULT 0,
             last_error TEXT,
+            last_error_transient BOOLEAN NOT NULL DEFAULT 0,
             UNIQUE(client_calendar_id)
         );
         CREATE TABLE main_calendar_sync_state (
