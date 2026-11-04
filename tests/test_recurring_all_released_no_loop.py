@@ -123,3 +123,33 @@ async def test_child_without_projections_is_not_presumed_dead(test_db):
         ("cancelled", "absent"),
     ])
     assert not await _recurring_parent_has_no_live_occurrences(db, parent)
+
+
+async def test_origin_rsvp_writeback_does_not_keep_the_mirror_live(test_db):
+    """The 'Doug - Daniel' shape: a client-sourced occurrence absent on
+    the peer but carrying an origin RSVP-writeback projection on its
+    own source calendar.  The writeback patches the source in place and
+    puts nothing on a mirror, so the occurrence is still dead to the
+    mirrored series."""
+    from app.ledger.payload import PRESENT_FULL_RSVP_ONLY
+
+    db = await get_database()
+    parent = await _seed(db, [
+        ("cancelled", "absent"),
+        ("released", "absent"),
+        ("active", "absent"),
+    ])
+    child = await (await db.execute(
+        """SELECT id FROM ledger_events
+            WHERE parent_canonical_uid = ? AND status = 'active'""",
+        (PARENT_UID,),
+    )).fetchone()
+    await db.execute(
+        """INSERT INTO ledger_projections
+              (ledger_event_id, target_kind, target_calendar_id,
+               desired_state, desired_ledger_version)
+           VALUES (?, 'client', 5, ?, 1)""",
+        (child["id"], PRESENT_FULL_RSVP_ONLY),
+    )
+    await db.commit()
+    assert await _recurring_parent_has_no_live_occurrences(db, parent)

@@ -249,7 +249,10 @@ async def _recurring_parent_has_no_live_occurrences(
     # (declined, free): the outbox deletes each such occurrence from
     # the mirrored series, and once the last one goes Google cancels
     # the whole series — the same self-loop as an all-cancelled
-    # series.  Observed in production: nine finite series whose
+    # series.  The origin-writeback projection (PRESENT_FULL_RSVP_ONLY)
+    # does not count as present: it patches the source event in place
+    # and never puts an occurrence on a mirror.  Observed in
+    # production: nine finite series whose
     # remaining occurrences were all released were recreated every
     # reconcile for weeks (google_id_generation ~27000).
     child_rows = await (await db.execute(
@@ -259,11 +262,14 @@ async def _recurring_parent_has_no_live_occurrences(
                     WHERE p.ledger_event_id = e.id) AS projections,
                   (SELECT COUNT(*) FROM ledger_projections p
                     WHERE p.ledger_event_id = e.id
-                      AND p.desired_state != 'absent') AS present
+                      AND p.desired_state NOT IN (?, ?)) AS present
              FROM ledger_events e
             WHERE e.user_id = ?
               AND e.parent_canonical_uid = ?""",
-        (int(ledger["user_id"]), ledger["canonical_uid"]),
+        (
+            ABSENT, PRESENT_FULL_RSVP_ONLY,
+            int(ledger["user_id"]), ledger["canonical_uid"],
+        ),
     )).fetchall()
     inactive_by_key: dict[str, bool] = {}
     for child in child_rows:
