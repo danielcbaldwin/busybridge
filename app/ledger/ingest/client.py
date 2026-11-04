@@ -416,7 +416,19 @@ async def _ingest_one_event(
     # silently corrupting the ledger.
     tampered_base = await _managed_series_instance_base(db, event)
     if tampered_base is not None:
-        logger.warning(
+        # A cancelled occurrence of a series no projection still wants
+        # present is the echo of a series WE retired (deleted, or
+        # abandoned under a burned id generation) — not tampering.
+        # Google can surface such tombstones for days; warning on each
+        # one buried every real warning during the 2026-11 recreate
+        # loop (12k+ lines a day).
+        retired = status == "cancelled" and await (await db.execute(
+            """SELECT 1 FROM ledger_projections
+                WHERE google_event_id = ? AND desired_state != 'absent'
+                LIMIT 1""",
+            (tampered_base,),
+        )).fetchone() is None
+        (logger.debug if retired else logger.warning)(
             "client ingest: occurrence %s of managed series %s on "
             "client_calendar_id=%s was tampered with on the client "
             "calendar (status=%s) — skipping without minting a ledger "

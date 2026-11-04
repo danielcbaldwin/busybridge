@@ -472,6 +472,52 @@ async def test_tampered_delete_of_busy_occurrence_never_mints_phantom(caplog):
         assert not violations, violations
 
 
+async def test_cancelled_occurrence_of_retired_series_is_not_a_warning(caplog):
+    """A cancelled occurrence of a series we already RETIRED is the
+    echo of our own delete, not tampering: still counted and skipped,
+    but logged below WARNING.  Google surfaces these tombstones for
+    days; during the 2026-11 recreate loop they produced 12k+ WARNING
+    lines a day and buried every real one."""
+    async with scenario() as s:
+        user = await _three_cal_alice(s)
+        s.given_recurring_event(
+            "client_a", summary="Retire probe",
+            start="2026-02-02T09:00:00Z",
+            rrule="RRULE:FREQ=WEEKLY;COUNT=4",
+            event_id="retireseries01",
+        )
+        await s.run_reconciler_until_quiescent("alice", max_passes=5)
+        bb_id = _managed_series_id(s, "client_b")
+
+        # The source series goes away → we retire our mirror.
+        s.google.delete_event(s.cal("client_a"), "retireseries01")
+        await s.run_reconciler_until_quiescent("alice", max_passes=8)
+        db = await s.setup_db()
+        live = await (await db.execute(
+            """SELECT COUNT(*) AS n FROM ledger_projections
+                WHERE google_event_id = ? AND desired_state != 'absent'""",
+            (bb_id,),
+        )).fetchone()
+        assert int(live["n"]) == 0, "precondition: the mirror is retired"
+
+        # A tombstone for one of its occurrences surfaces later.
+        s.google.delete_event(
+            s.cal("client_b"), f"{bb_id}_20260216T090000Z",
+        )
+        with caplog.at_level(
+            logging.WARNING, logger="app.ledger.ingest.client",
+        ):
+            out = await s.run_reconciler("alice")
+
+        cid_b = user.client_calendar_ids["client_b"]
+        assert out["ingest"][f"client:{cid_b}"].get(
+            "tampered_managed_instance"
+        ) == 1, out["ingest"]
+        assert f"{bb_id}_20260216T090000Z" not in caplog.text, (
+            "a retired series' tombstone must not log a WARNING"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Bug 2 — the client MOVES one occurrence of OUR busy series.
 # ---------------------------------------------------------------------------
