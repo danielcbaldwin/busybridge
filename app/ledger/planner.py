@@ -242,12 +242,27 @@ async def _recurring_parent_has_no_live_occurrences(
         # still-live so we never prune a parent we cannot fully account for.
         return False
 
+    # An occurrence is dead when its child row is cancelled or deleted,
+    # OR when the child has projections and every one of them is
+    # desired absent.  The latter covers occurrences released by
+    # retention and occurrences planned absent for any other reason
+    # (declined, free): the outbox deletes each such occurrence from
+    # the mirrored series, and once the last one goes Google cancels
+    # the whole series — the same self-loop as an all-cancelled
+    # series.  Observed in production: nine finite series whose
+    # remaining occurrences were all released were recreated every
+    # reconcile for weeks (google_id_generation ~27000).
     child_rows = await (await db.execute(
-        """SELECT recurrence_instance_original_start,
-                  status, user_intentionally_deleted
-             FROM ledger_events
-            WHERE user_id = ?
-              AND parent_canonical_uid = ?""",
+        """SELECT e.recurrence_instance_original_start,
+                  e.status, e.user_intentionally_deleted,
+                  (SELECT COUNT(*) FROM ledger_projections p
+                    WHERE p.ledger_event_id = e.id) AS projections,
+                  (SELECT COUNT(*) FROM ledger_projections p
+                    WHERE p.ledger_event_id = e.id
+                      AND p.desired_state != 'absent') AS present
+             FROM ledger_events e
+            WHERE e.user_id = ?
+              AND e.parent_canonical_uid = ?""",
         (int(ledger["user_id"]), ledger["canonical_uid"]),
     )).fetchall()
     inactive_by_key: dict[str, bool] = {}
@@ -261,6 +276,7 @@ async def _recurring_parent_has_no_live_occurrences(
         inactive = (
             child["status"] == "cancelled"
             or bool(child["user_intentionally_deleted"])
+            or (child["projections"] > 0 and child["present"] == 0)
         )
         inactive_by_key[key] = inactive_by_key.get(key, True) and inactive
 
