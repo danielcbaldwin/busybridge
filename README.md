@@ -10,6 +10,10 @@ mirrored to your main calendar in full detail; everything on your main calendar
 is reflected back to each client as an opaque **"Busy"** block. Other clients
 never see what a given client meeting actually is.
 
+BusyBridge was originally created by [Andrew Gruen](https://github.com/agruen).
+The original repository is no longer available; this repository continues the
+project, with its full history preserved.
+
 ---
 
 ## Features
